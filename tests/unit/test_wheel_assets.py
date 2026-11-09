@@ -59,6 +59,8 @@ def test_wheel_keeps_real_build_helpers_and_one_public_python_copy(
     assert set((package / "_toolchain").rglob("*.py")) == set(helpers)
     launcher = (package / "_toolchain/bin/pycircuit").read_text(encoding="utf-8")
     assert "from pycircuit.cli import main" in launcher
+    assert "os.execv" in launcher
+    assert "pycircuit requires Python 3.11 or newer" in launcher
 
 
 def test_wheel_setup_packages_python_verilator_policy() -> None:

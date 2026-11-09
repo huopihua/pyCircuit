@@ -61,7 +61,8 @@ setup(
         exclude=["pycircuit._toolchain*"],
     ),
     package_data={
-        "pycircuit": package_files(PACKAGE_ROOT / "_toolchain", PACKAGE_ROOT),
+        "pycircuit": ["verilator_policy.json"]
+        + package_files(PACKAGE_ROOT / "_toolchain", PACKAGE_ROOT),
     },
     # Toolchain files are enumerated explicitly in package_data above.
     include_package_data=False,

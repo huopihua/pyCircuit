@@ -21,11 +21,11 @@ SOURCES = ("child.py", "module_loop.py")
 BUILD_HELPERS = {
     "share/pycircuit/cmake/prepare_output.py",
     "share/pycircuit/cmake/verify_example.py",
-    "share/pycircuit/cmake/verilator_policy.json",
 }
 ACTIVE_EXPORTS = {
     "module",
     "rule",
+    "method",
     "system",
     "dff",
     "dffe",
@@ -47,6 +47,9 @@ ACTIVE_EXPORTS = {
     "count_trailing_zeros",
     "priority_encode",
     "onehot_encode",
+    "four_state",
+    "case_eq",
+    "is_known",
 } | {f"u{width}" for width in range(1, 65)}
 RETIRED_MODULES = (
     "agentic_circuit",
@@ -203,6 +206,7 @@ def test_wheel_compiler_prefix_runs_outside_venv_and_builds_module_loop(
     assert {
         path.relative_to(prefix).as_posix() for path in prefix.rglob("*.py")
     } == BUILD_HELPERS, "wheel toolchain has unexpected or missing build utilities"
+    assert (prefix / "share/pycircuit/cmake/verilator_policy.json").is_file()
     assert (prefix / "include/gfsim/dff.h").is_file()
     for retired in RETIRED_COMMANDS:
         assert not (prefix / "bin" / retired).exists()

@@ -61,6 +61,11 @@ def test_wheel_keeps_real_build_helpers_and_one_public_python_copy(
     assert "from pycircuit.cli import main" in launcher
 
 
+def test_wheel_setup_packages_python_verilator_policy() -> None:
+    setup = (ROOT / "packaging/wheel/setup.py").read_text(encoding="utf-8")
+    assert '"pycircuit": ["verilator_policy.json"]' in setup
+
+
 @pytest.mark.parametrize(
     "relative",
     [

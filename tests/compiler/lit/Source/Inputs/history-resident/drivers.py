@@ -26,15 +26,24 @@ WIDTHS = {"rob": [51] * 10, "isq": [39, 7, 39, 7, 39, 39]}
 
 
 def instances(header, kind):
-    section = header.split(f"class pyc_family_dual_{kind}", 1)[1].split("public:", 1)[
-        -1
-    ]
-    names = re.findall(
-        rf"std::shared_ptr<[^;\n]*pyc_family_{kind}<pyc_count>> (pyc_instance_\w+);",
-        section,
+    classes = dict(
+        re.findall(
+            r"class (pyc_\w+) final : public gfsim::SimModule \{(.*?)\n\};",
+            header,
+            re.S,
+        )
     )
+    decoded = {
+        typ: bytes.fromhex(typ[4:].split("__h", 1)[0]).decode().rsplit(".", 1)[-1]
+        for typ in classes
+    }
+    root_type = next(typ for typ, name in decoded.items() if name == f"dual_{kind}")
+    members = re.findall(r"^\s*(pyc_\w+)\s+(pyc_\w+);$", classes[root_type], re.M)
+    names = [name for typ, name in members if decoded.get(typ) == kind]
     assert len(names) == 2, names
-    return names
+    rtl = [f"pyc_instance_{index}" for index, (typ, _name) in enumerate(members) if decoded.get(typ) == kind]
+    assert len(rtl) == 2, rtl
+    return {"cpp": names, "rtl": rtl}
 
 
 def ports(kind):
@@ -115,6 +124,7 @@ def result_effects(kind, lang):
 
 
 def cpp(kind, names):
+    names = names["cpp"]
     width = 974 if kind == "rob" else 616
     qcount = len(QUEUES[kind])
     snapshot = []
@@ -122,22 +132,22 @@ def cpp(kind, names):
         for name in names:
             for field in ("head", "tail", "count", "epoch"):
                 snapshot.append(
-                    f"out += bits(dut.root_->pyc_implementation->{name}->pyc_instance_{field}_state->current(0).q.packed());"
+                    f"out += bits(dut.root().{name}.pyc_{field}.currentState().q.packed());"
                 )
     for name in names:
         snapshot.append(
-            f"for (int i=0;i<4;++i) out += bits(dut.root_->pyc_implementation->{name}->pyc_instance_entries_state->current(i).q.packed());"
+            "".join(f"out += bits(dut.root().{name}.pyc_entries_{i}.currentState().q.packed());" for i in range(4))
         )
     if kind == "isq":
         for name in names:
             snapshot.append(
-                f"for (int i=0;i<64;++i) out += bits(dut.root_->pyc_implementation->{name}->pyc_instance_ready_tags_state->current(i).q.packed());"
+                "".join(f"out += bits(dut.root().{name}.pyc_ready_tags_{i}.currentState().q.packed());" for i in range(64))
             )
     assignments = "\n".join(
         f"input.{name} = known<decltype(input.{name})>({expr});"
         for name, _, expr in ports(kind)
     )
-    return f"""#include "pycircuit_system.hpp"
+    return f"""#include "design.hpp"
 #include <array>
 #include <iostream>
 #include <stdexcept>
@@ -182,6 +192,7 @@ int main(int argc,char**argv) {{
 
 
 def verilog(kind, names):
+    names = names["rtl"]
     width = 974 if kind == "rob" else 616
     result_width = 214 if kind == "rob" else 84
     qcount = len(QUEUES[kind])

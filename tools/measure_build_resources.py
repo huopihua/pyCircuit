@@ -20,7 +20,7 @@ import platform
 import shutil
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -1094,7 +1094,7 @@ def main() -> int:
     report: dict[str, Any] = {
         "status": "running",
         "metadata": {
-            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "created_utc": datetime.now(UTC).isoformat(),
             "repository": str(REPO),
             "head": head,
             "git_ref": git_ref,

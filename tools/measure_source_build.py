@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -860,7 +860,7 @@ def main() -> int:
         )
     report: dict[str, Any] = {
         "metadata": {
-            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "created_utc": datetime.now(UTC).isoformat(),
             "repository": str(REPO),
             "head": head,
             "prefix": str(prefix),

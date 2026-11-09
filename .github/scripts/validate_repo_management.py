@@ -359,6 +359,11 @@ def main() -> int:
         "development dependencies must declare wheel used by packaging checks",
         errors,
     )
+    require(
+        '"setuptools>=' in project,
+        "development dependencies must declare setuptools used by packaging checks",
+        errors,
+    )
 
     contributing = read("CONTRIBUTING.md")
     require(

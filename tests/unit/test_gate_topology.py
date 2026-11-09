@@ -31,6 +31,11 @@ def test_python_metadata_matches_the_311_tooling_contract() -> None:
         dependency.lower().startswith("pyyaml")
         for dependency in metadata["optional-dependencies"]["dev"]
     )
+    dev_dependencies = {
+        dependency.partition(">=")[0].lower()
+        for dependency in metadata["optional-dependencies"]["dev"]
+    }
+    assert {"types-pyyaml", "types-setuptools", "wheel"} <= dev_dependencies
 
     assert 'python_requires=">=3.11"' in _read("packaging/wheel/setup.py")
     assert "Python 3.11 or newer" in _read("CONTRIBUTING.md")

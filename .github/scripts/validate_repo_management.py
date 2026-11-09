@@ -349,6 +349,16 @@ def main() -> int:
         "development dependencies must declare PyYAML used by unit checks",
         errors,
     )
+    require(
+        "types-PyYAML" in project and "types-setuptools" in project,
+        "development dependencies must declare the type stubs used by mypy checks",
+        errors,
+    )
+    require(
+        '"wheel>=' in project,
+        "development dependencies must declare wheel used by packaging checks",
+        errors,
+    )
 
     contributing = read("CONTRIBUTING.md")
     require(

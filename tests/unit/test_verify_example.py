@@ -391,7 +391,7 @@ def test_module_and_system_bundle_cmake_share_versioned_policy(tmp_path: Path) -
                 assert token in cmake
 
 
-@pytest.mark.parametrize("timeout", [None, 0.75])
+@pytest.mark.parametrize("timeout", [None, 5.0])
 def test_success_preserves_trace_contract_and_uses_configured_timeout(
     helper: ModuleType,
     case: dict[str, Path],

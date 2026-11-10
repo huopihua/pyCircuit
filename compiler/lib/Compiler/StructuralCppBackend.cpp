@@ -587,8 +587,36 @@ emitPlan(const ConcreteDesignPlan &plan, raw_ostream &out,
             pin = plan.modules[*child.moduleIndex]
                       .outputs[*step.portIndex]
                       .cppName;
-            if (step.kind == ConcreteScheduleStepKind::ReadChildOutputField)
+            if (step.kind == ConcreteScheduleStepKind::ReadChildOutputField) {
+              for (const ConcreteRefreshInput &refresh : step.refreshInputs) {
+                if (refresh.port >=
+                    plan.modules[*child.moduleIndex].inputs.size())
+                  return step.operation->emitOpError()
+                         << "structural C++ child refresh input is absent from "
+                            "the plan";
+                StringRef inputPin = plan.modules[*child.moduleIndex]
+                                         .inputs[refresh.port]
+                                         .cppName;
+                const auto &source = module.values[refresh.source];
+                if (!refresh.targetLow) {
+                  out << "    " << child.cppName << "." << inputPin << " = "
+                      << source.cppName << ";\n";
+                  continue;
+                }
+                out << "    " << child.cppName << "." << inputPin
+                    << ".assignSlice(" << *refresh.targetLow << ", ";
+                if (refresh.sourceLow == 0 &&
+                    refresh.width == source.type.packedWidth) {
+                  out << source.cppName << ".packed()";
+                } else {
+                  out << "gfsim::extract<" << refresh.width << ", "
+                      << source.type.packedWidth << ">(" << source.cppName
+                      << ".packed(), " << refresh.sourceLow << ")";
+                }
+                out << ");\n";
+              }
               out << "    " << child.cppName << ".RefreshPureOutputs();\n";
+            }
           }
           if (step.kind == ConcreteScheduleStepKind::ReadChildOutputField) {
             const auto &value = module.values[step.outputs.front()];

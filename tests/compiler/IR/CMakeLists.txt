@@ -120,6 +120,8 @@ target_compile_definitions(ACIRConcreteDesignPlanTests PRIVATE
   PYCIRCUIT_TEST_STRUCTURAL_CPP_UNKNOWN_PRIMITIVE="${PYCIRCUIT_REPO_ROOT}/tests/compiler/lit/CodeGen/Inputs/structural-cpp-unknown-primitive.mlir"
   PYCIRCUIT_TEST_STRUCTURAL_CPP_CYCLE="${PYCIRCUIT_REPO_ROOT}/tests/compiler/lit/CodeGen/Inputs/structural-cpp-cycle.mlir"
   PYCIRCUIT_TEST_STRUCTURAL_CPP_MODULE_CHILD="${PYCIRCUIT_REPO_ROOT}/tests/compiler/lit/CodeGen/Inputs/shared-input.mlir"
+  PYCIRCUIT_TEST_STRUCTURAL_CPP_NESTED_INTERLEAVE="${PYCIRCUIT_REPO_ROOT}/tests/compiler/lit/CodeGen/Inputs/nested-interleave.mlir"
+  PYCIRCUIT_TEST_COLLECTION_COMPOSITE="${PYCIRCUIT_REPO_ROOT}/tests/compiler/lit/CodeGen/Inputs/collection_composite_64.mlir"
   PYCIRCUIT_TEST_STRUCTURAL_CPP_SPECIALIZATION="${PYCIRCUIT_REPO_ROOT}/tests/compiler/lit/CodeGen/Inputs/generic-forward.mlir"
   PYCIRCUIT_TEST_STRUCTURAL_CPP_DEDUP="${PYCIRCUIT_REPO_ROOT}/tests/compiler/lit/CodeGen/Inputs/structural-cpp-dedup.mlir"
   PYCIRCUIT_TEST_STRUCTURAL_CPP_DEDUP_CHAIN="${PYCIRCUIT_REPO_ROOT}/tests/compiler/lit/CodeGen/Inputs/structural-cpp-dedup-chain.mlir"

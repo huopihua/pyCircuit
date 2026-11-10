@@ -3,9 +3,9 @@
 #include "FinalEmissionNames.h"
 #include "pycircuit/Dialect/HWIR/HWIRVerification.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Format.h"
-#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/JSON.h"
 
 #include <functional>
@@ -37,8 +37,7 @@ std::string laneExpression(const ConcreteModulePlan &module,
   return valueName(module, *value.availabilityParent) + "[" +
          std::to_string((lanes - 1 - *value.tableLane) *
                         value.type.packedWidth) +
-         " +: " +
-         std::to_string(value.type.packedWidth) + "]";
+         " +: " + std::to_string(value.type.packedWidth) + "]";
 }
 
 uint64_t physicalObservationWidth(const ConcreteDesignPlan &plan) {
@@ -107,15 +106,13 @@ void emitConstant(raw_ostream &out, const ConcreteValuePlan &output,
 }
 
 void emitConstant4(raw_ostream &out, const ConcreteValuePlan &output,
-                   ArrayRef<uint64_t> valueWords,
-                   ArrayRef<uint64_t> knownWords,
+                   ArrayRef<uint64_t> valueWords, ArrayRef<uint64_t> knownWords,
                    ArrayRef<uint64_t> zWords) {
   const uint64_t width = output.type.packedWidth;
   out << width << "'b";
   for (uint64_t bit = width; bit-- > 0;) {
     auto planeBit = [bit](ArrayRef<uint64_t> words) {
-      return bit / 64 < words.size() &&
-             ((words[bit / 64] >> (bit % 64)) & 1);
+      return bit / 64 < words.size() && ((words[bit / 64] >> (bit % 64)) & 1);
     };
     out << (planeBit(knownWords) ? (planeBit(valueWords) ? '1' : '0')
                                  : (planeBit(zWords) ? 'z' : 'x'));
@@ -174,8 +171,7 @@ evaluatePhysicalInitializer(const ConcreteModulePlan &module,
       auto parent = evaluate(*valuePlan.availabilityParent);
       if (failed(parent))
         return failure();
-      const auto &parentPlan =
-          module.values[*valuePlan.availabilityParent];
+      const auto &parentPlan = module.values[*valuePlan.availabilityParent];
       const uint64_t lanes =
           parentPlan.type.packedWidth / valuePlan.type.packedWidth;
       const unsigned low =
@@ -198,14 +194,17 @@ evaluatePhysicalInitializer(const ConcreteModulePlan &module,
       return evaluate(step.inputs[index]);
     };
     const unsigned width = valuePlan.type.packedWidth;
-    FourStateConstant result{llvm::APInt(width, 0), llvm::APInt::getAllOnes(width),
+    FourStateConstant result{llvm::APInt(width, 0),
+                             llvm::APInt::getAllOnes(width),
                              llvm::APInt(width, 0)};
     switch (compute.kind) {
     case ConcreteComputeKind::BitsConstant:
-      result.value = llvm::APInt(width, compute.constantWords).zextOrTrunc(width);
+      result.value =
+          llvm::APInt(width, compute.constantWords).zextOrTrunc(width);
       break;
     case ConcreteComputeKind::BitsConstant4:
-      result.value = llvm::APInt(width, compute.constantWords).zextOrTrunc(width);
+      result.value =
+          llvm::APInt(width, compute.constantWords).zextOrTrunc(width);
       result.known = llvm::APInt(width, compute.knownWords).zextOrTrunc(width);
       result.z = llvm::APInt(width, compute.zWords).zextOrTrunc(width);
       break;
@@ -309,7 +308,9 @@ evaluatePhysicalInitializer(const ConcreteModulePlan &module,
 FailureOr<std::string> computeExpression(const ConcreteModulePlan &module,
                                          const ConcreteScheduleStep &step) {
   const ConcreteComputePlan &compute = *step.compute;
-  auto input = [&](unsigned index) { return laneExpression(module, step.inputs[index]); };
+  auto input = [&](unsigned index) {
+    return laneExpression(module, step.inputs[index]);
+  };
   std::string text;
   llvm::raw_string_ostream out(text);
   switch (compute.kind) {
@@ -358,13 +359,12 @@ FailureOr<std::string> computeExpression(const ConcreteModulePlan &module,
     if (opcode.empty())
       return failure();
     const bool isSigned = compute.opcode.starts_with("S");
-    out << (isSigned ? "$signed(" : "(") << input(0) << ") " << opcode
-        << " " << (isSigned ? "$signed(" : "(") << input(1) << ")";
+    out << (isSigned ? "$signed(" : "(") << input(0) << ") " << opcode << " "
+        << (isSigned ? "$signed(" : "(") << input(1) << ")";
     break;
   }
   case ConcreteComputeKind::BitsSelect:
-    out << "(" << input(0) << ") ? (" << input(1) << ") : (" << input(2)
-        << ")";
+    out << "(" << input(0) << ") ? (" << input(1) << ") : (" << input(2) << ")";
     break;
   case ConcreteComputeKind::BitsConcat:
     if (step.compute->opcode == "splat") {
@@ -385,21 +385,20 @@ FailureOr<std::string> computeExpression(const ConcreteModulePlan &module,
     if (const ConcreteValuePlan &source = module.values[step.inputs[0]];
         source.availabilityParent && source.tableLane) {
       const auto &parent = module.values[*source.availabilityParent];
-      const uint64_t lanes =
-          parent.type.packedWidth / source.type.packedWidth;
+      const uint64_t lanes = parent.type.packedWidth / source.type.packedWidth;
       out << valueName(module, *source.availabilityParent) << "["
           << ((lanes - 1 - *source.tableLane) * source.type.packedWidth +
               *compute.immediate)
           << " +: " << module.values[step.outputs[0]].type.packedWidth << "]";
     } else {
-      out << input(0) << "[" << *compute.immediate << " +: "
-          << module.values[step.outputs[0]].type.packedWidth << "]";
+      out << input(0) << "[" << *compute.immediate
+          << " +: " << module.values[step.outputs[0]].type.packedWidth << "]";
     }
     break;
   case ConcreteComputeKind::BitsResize:
     if (compute.opcode == "trunc")
-      out << input(0) << "[" << module.values[step.outputs[0]].type.packedWidth - 1
-          << ":0]";
+      out << input(0) << "["
+          << module.values[step.outputs[0]].type.packedWidth - 1 << ":0]";
     else if (compute.opcode == "sext")
       out << "$signed(" << input(0) << ")";
     else
@@ -492,13 +491,14 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
   if (verilog.mode == VerilogExportMode::Physical) {
     const uint64_t observationWidth = physicalObservationWidth(plan);
     for (auto [siteIndex, site] : llvm::enumerate(module.observationSites)) {
-      out << "  assign pyc_observation_path_raw[" << siteIndex << "] = "
-          << laneExpression(module, site.path) << ";\n  assign "
-             "pyc_observation_value_raw[" << (siteIndex * observationWidth)
-          << " +: " << observationWidth << "] = ";
+      out << "  assign pyc_observation_path_raw[" << siteIndex
+          << "] = " << laneExpression(module, site.path)
+          << ";\n  assign "
+             "pyc_observation_value_raw["
+          << (siteIndex * observationWidth) << " +: " << observationWidth
+          << "] = ";
       if (site.payloadWidth < observationWidth)
-        out << "{{" << (observationWidth - site.payloadWidth)
-            << "{1'b0}}, ";
+        out << "{{" << (observationWidth - site.payloadWidth) << "{1'b0}}, ";
       out << laneExpression(module, site.value);
       if (site.payloadWidth < observationWidth)
         out << "}";
@@ -532,7 +532,9 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
 
   llvm::SmallVector<std::string> childErrors, childCompletions,
       childSamplingErrors;
-  for (auto [childIndex, child] : llvm::enumerate(module.children)) {
+  uint64_t childObservationBase = module.observationSites.size();
+  for (unsigned childIndex = 0; childIndex < module.children.size();) {
+    const ConcreteChildPlan &child = module.children[childIndex];
     if (!child.primitive || child.kind == ConcreteChildKind::Module) {
       if (child.kind != ConcreteChildKind::Module || !child.moduleIndex)
         return fail(child.occurrence, "Verilog child plan is incomplete");
@@ -540,32 +542,79 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
                child.primitive->outputMembers.size() != child.outputs.size()) {
       return fail(child.occurrence, "Verilog primitive pin plan is incomplete");
     }
-    const bool lifecycle = managed || verilog.mode == VerilogExportMode::Physical;
+    // Concrete execution retains one child per collection lane.  RTL can
+    // preserve the exact same independently connected instances with a
+    // generate-for block, avoiding source text proportional to a uniform
+    // collection's lane count.  Keep primitive collections expanded for now:
+    // physical state initializers can legitimately differ by lane.
+    uint64_t lanes = 1;
+    if (child.kind == ConcreteChildKind::Module && child.laneIndex == 0) {
+      auto sameLaneFamily = [&](const ConcreteChildPlan &candidate,
+                                uint64_t lane) {
+        if (candidate.kind != ConcreteChildKind::Module ||
+            candidate.occurrence != child.occurrence ||
+            candidate.moduleIndex != child.moduleIndex ||
+            candidate.laneIndex != lane ||
+            candidate.inputs.size() != child.inputs.size() ||
+            candidate.outputs.size() != child.outputs.size())
+          return false;
+        auto sameBindings = [&](ArrayRef<ConcretePortBinding> first,
+                                ArrayRef<ConcretePortBinding> current) {
+          return llvm::all_of(llvm::zip_equal(first, current), [&](auto item) {
+            const auto &[base, value] = item;
+            const auto &basePlan = module.values[base.value];
+            const auto &valuePlan = module.values[value.value];
+            return base.port == value.port &&
+                   basePlan.availabilityParent ==
+                       valuePlan.availabilityParent &&
+                   valuePlan.tableLane == lane &&
+                   basePlan.type.packedWidth == valuePlan.type.packedWidth;
+          });
+        };
+        return sameBindings(child.inputs, candidate.inputs) &&
+               sameBindings(child.outputs, candidate.outputs);
+      };
+      while (childIndex + lanes < module.children.size() &&
+             sameLaneFamily(module.children[childIndex + lanes], lanes))
+        ++lanes;
+    }
+    const bool generatedCollection = lanes > 1;
+    const bool lifecycle =
+        managed || verilog.mode == VerilogExportMode::Physical;
     const std::string error = "pyc_child_error_" + std::to_string(childIndex);
     if (lifecycle) {
-      out << "  wire " << error << ";\n";
-      childErrors.push_back(error);
-    }
-    uint64_t childObservationBase = module.observationSites.size();
-    for (unsigned prior = 0; prior < childIndex; ++prior) {
-      const auto &sibling = module.children[prior];
-      if (sibling.kind == ConcreteChildKind::Module && sibling.moduleIndex)
-        childObservationBase +=
-            plan.modules[*sibling.moduleIndex].observationSubtreeWidth;
+      if (generatedCollection) {
+        out << "  wire [" << (lanes - 1) << ":0] " << error << ";\n";
+        childErrors.push_back("(|" + error + ")");
+      } else {
+        out << "  wire " << error << ";\n";
+        childErrors.push_back(error);
+      }
     }
     std::string complete, sampling;
-    if (child.kind == ConcreteChildKind::Module &&
-        managed) {
+    if (child.kind == ConcreteChildKind::Module && managed) {
       complete = "pyc_child_complete_" + std::to_string(childIndex);
       sampling = "pyc_child_sampling_" + std::to_string(childIndex);
-      out << "  wire " << complete << ";\n  wire " << sampling << ";\n";
-      childCompletions.push_back(complete);
-      childSamplingErrors.push_back(sampling);
+      if (generatedCollection) {
+        out << "  wire [" << (lanes - 1) << ":0] " << complete << ";\n  wire ["
+            << (lanes - 1) << ":0] " << sampling << ";\n";
+        childCompletions.push_back("(&" + complete + ")");
+        childSamplingErrors.push_back("(|" + sampling + ")");
+      } else {
+        out << "  wire " << complete << ";\n  wire " << sampling << ";\n";
+        childCompletions.push_back(complete);
+        childSamplingErrors.push_back(sampling);
+      }
     }
     std::string moduleKind =
         child.kind == ConcreteChildKind::Module
             ? rtlModuleName(plan.modules[*child.moduleIndex])
             : child.primitiveKind.getValue().str();
+    const std::string laneName = "pyc_lane_" + std::to_string(childIndex);
+    if (generatedCollection)
+      out << "  genvar " << laneName << ";\n  for (" << laneName << " = 0; "
+          << laneName << " < " << lanes << "; " << laneName << " = " << laneName
+          << " + 1) begin : pyc_collection_" << childIndex << "\n  ";
     out << "  " << moduleKind;
     if (child.kind != ConcreteChildKind::Module) {
       const ConcretePrimitiveConfig &primitive = *child.primitive;
@@ -584,7 +633,9 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
               << integer.canonicalValue << ")";
       if (child.kind == ConcreteChildKind::Queue && child.queue)
         out << ", .DEPTH(" << child.queue->depth << "), .READY_POLICY("
-            << (child.queue->readyPolicy == ac::QueueReadyPolicy::LocalOccupancy ? 0 : 1)
+            << (child.queue->readyPolicy == ac::QueueReadyPolicy::LocalOccupancy
+                    ? 0
+                    : 1)
             << "), .AVAILABILITY_LATENCY(" << child.queue->availabilityLatency
             << ")";
       if (managed)
@@ -607,58 +658,87 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
       }
       out << " )";
     }
-    out << " pyc_instance_" << childIndex << " (\n";
+    out << (generatedCollection
+                ? " pyc_instance (\n"
+                : " pyc_instance_" + std::to_string(childIndex) + " (\n");
     bool connectionFirst = true;
     auto connect = [&](StringRef name, StringRef expression) {
       if (!connectionFirst)
         out << ",\n";
-      out << "    ." << name << "(" << expression << ")";
+      out << (generatedCollection ? "      ." : "    .") << name << "("
+          << expression << ")";
       connectionFirst = false;
     };
+    auto connection = [&](const ConcretePortBinding &binding) {
+      if (!generatedCollection)
+        return laneExpression(module, binding.value);
+      const ConcreteValuePlan &lane = module.values[binding.value];
+      const ConcreteValuePlan &parent = module.values[*lane.availabilityParent];
+      return valueName(module, parent.id) + "[((" + std::to_string(lanes) +
+             " - 1 - " + laneName + ") * " +
+             std::to_string(lane.type.packedWidth) +
+             ") +: " + std::to_string(lane.type.packedWidth) + "]";
+    };
     for (auto [index, binding] : llvm::enumerate(child.inputs)) {
-      StringRef pin = child.kind == ConcreteChildKind::Module
-                          ? plan.modules[*child.moduleIndex].inputs[index].cppName
-                          : StringRef(child.primitive->inputMembers[index]);
-      connect(pin, laneExpression(module, binding.value));
+      StringRef pin =
+          child.kind == ConcreteChildKind::Module
+              ? plan.modules[*child.moduleIndex].inputs[index].cppName
+              : StringRef(child.primitive->inputMembers[index]);
+      connect(pin, connection(binding));
     }
     for (auto [index, binding] : llvm::enumerate(child.outputs)) {
-      StringRef pin = child.kind == ConcreteChildKind::Module
-                          ? plan.modules[*child.moduleIndex].outputs[index].cppName
-                          : StringRef(child.primitive->outputMembers[index]);
-      connect(pin, laneExpression(module, binding.value));
+      StringRef pin =
+          child.kind == ConcreteChildKind::Module
+              ? plan.modules[*child.moduleIndex].outputs[index].cppName
+              : StringRef(child.primitive->outputMembers[index]);
+      connect(pin, connection(binding));
     }
     if (managed) {
       connect("pyc_phase", "pyc_phase");
       connect("pyc_root_commit_ok", "pyc_root_commit_ok");
       if (child.kind == ConcreteChildKind::Module) {
         connect("pyc_reset_active", "pyc_reset_active");
-        connect("pyc_check_complete", complete);
-        connect("pyc_sampling_error", sampling);
+        connect("pyc_check_complete", generatedCollection
+                                          ? complete + "[" + laneName + "]"
+                                          : complete);
+        connect("pyc_sampling_error", generatedCollection
+                                          ? sampling + "[" + laneName + "]"
+                                          : sampling);
       }
-      connect("pyc_local_error", error);
+      connect("pyc_local_error",
+              generatedCollection ? error + "[" + laneName + "]" : error);
     } else if (verilog.mode == VerilogExportMode::Physical) {
       connect("pyc_root_commit_ok", "pyc_root_commit_ok");
       if (child.kind == ConcreteChildKind::Module)
         connect("pyc_reset_active", "pyc_reset_active");
-      connect("pyc_local_error", error);
+      connect("pyc_local_error",
+              generatedCollection ? error + "[" + laneName + "]" : error);
       if (child.kind == ConcreteChildKind::Module) {
         const uint64_t slots =
             plan.modules[*child.moduleIndex].observationSubtreeWidth;
         if (slots != 0) {
           const uint64_t width = physicalObservationWidth(plan);
+          std::string pathLow = std::to_string(childObservationBase);
+          std::string valueLow = std::to_string(childObservationBase * width);
+          if (generatedCollection) {
+            pathLow += " + " + laneName + " * " + std::to_string(slots);
+            valueLow +=
+                " + " + laneName + " * " + std::to_string(slots * width);
+          }
           connect("pyc_observation_path_raw",
-                  (Twine("pyc_observation_path_raw[") +
-                   Twine(childObservationBase) + " +: " + Twine(slots) + "]")
-                      .str());
+                  "pyc_observation_path_raw[" + pathLow +
+                      " +: " + std::to_string(slots) + "]");
           connect("pyc_observation_value_raw",
-                  (Twine("pyc_observation_value_raw[") +
-                   Twine(childObservationBase * width) + " +: " +
-                   Twine(slots * width) + "]")
-                      .str());
+                  "pyc_observation_value_raw[" + valueLow +
+                      " +: " + std::to_string(slots * width) + "]");
         }
       }
     }
-    out << "\n  );\n";
+    out << (generatedCollection ? "\n    );\n  end\n" : "\n  );\n");
+    if (child.kind == ConcreteChildKind::Module)
+      childObservationBase +=
+          lanes * plan.modules[*child.moduleIndex].observationSubtreeWidth;
+    childIndex += lanes;
   }
 
   for (const ConcreteScheduleStep &step : module.concreteSchedule.steps) {
@@ -670,8 +750,8 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
         const auto &value = module.values[step.outputs[0]];
         const uint64_t lanes = table.type.packedWidth / value.type.packedWidth;
         out << "  assign " << laneExpression(module, step.outputs[0]) << " = ("
-            << laneExpression(module, step.inputs[1]) << " < " << lanes << ") ? "
-            << valueName(module, step.inputs[0]) << "[((" << lanes
+            << laneExpression(module, step.inputs[1]) << " < " << lanes
+            << ") ? " << valueName(module, step.inputs[0]) << "[((" << lanes
             << " - 1 - " << laneExpression(module, step.inputs[1]) << ") * "
             << value.type.packedWidth << ") +: " << value.type.packedWidth
             << "] : 'x;\n  assign " << laneExpression(module, step.outputs[1])
@@ -692,12 +772,12 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
       } else if (step.compute->kind == ConcreteComputeKind::TableView) {
         const auto &input = module.values[step.inputs[0]];
         const auto &output = module.values[step.outputs[0]];
-        const uint64_t width = output.type.packedWidth / step.compute->laneMap.size();
+        const uint64_t width =
+            output.type.packedWidth / step.compute->laneMap.size();
         for (auto [lane, source] : llvm::enumerate(step.compute->laneMap))
           out << "  assign " << valueName(module, output.id) << "["
               << (step.compute->laneMap.size() - 1 - lane) * width
-              << " +: " << width << "] = "
-              << valueName(module, input.id) << "["
+              << " +: " << width << "] = " << valueName(module, input.id) << "["
               << (input.type.packedWidth / width - 1 - source) * width
               << " +: " << width << "];\n";
       } else if (step.compute->kind == ConcreteComputeKind::TableIndex) {
@@ -710,13 +790,15 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
         }
         out << "  assign " << valueName(module, output.id) << " = (";
         for (auto [i, inputId] : llvm::enumerate(step.inputs)) {
-          if (i) out << " && ";
+          if (i)
+            out << " && ";
           out << "($unsigned(" << laneExpression(module, inputId) << ") < "
               << step.compute->laneMap[i] << ")";
         }
         out << ") ? ";
         for (auto [i, inputId] : llvm::enumerate(step.inputs)) {
-          if (i) out << " + ";
+          if (i)
+            out << " + ";
           out << "$unsigned(" << laneExpression(module, inputId) << ") * "
               << strides[i];
         }
@@ -725,7 +807,8 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
         // the flattened ordinal unknown.
         out << " : (";
         for (auto [i, inputId] : llvm::enumerate(step.inputs)) {
-          if (i) out << " || ";
+          if (i)
+            out << " || ";
           out << "(!$isunknown(" << laneExpression(module, inputId)
               << ") && ($unsigned(" << laneExpression(module, inputId)
               << ") >= " << step.compute->laneMap[i] << "))";
@@ -734,14 +817,17 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
       } else if (step.compute->kind == ConcreteComputeKind::TableMatch) {
         out << "  assign " << laneExpression(module, step.outputs[0]) << " = {";
         for (auto [i, id] : llvm::enumerate(llvm::reverse(step.inputs))) {
-          if (i) out << ", ";
+          if (i)
+            out << ", ";
           out << laneExpression(module, id);
         }
         out << "};\n";
       } else if (step.compute->kind == ConcreteComputeKind::TableChoose) {
         const uint64_t count = *step.compute->immediate;
-        const uint64_t maskWidth = module.values[step.inputs[1]].type.packedWidth;
-        const uint64_t indexWidth = module.values[step.outputs[0]].type.packedWidth;
+        const uint64_t maskWidth =
+            module.values[step.inputs[1]].type.packedWidth;
+        const uint64_t indexWidth =
+            module.values[step.outputs[0]].type.packedWidth;
         std::string prefix = "pyc_choice_" + std::to_string(step.outputs[0]);
         out << "  wire [" << (maskWidth - 1) << ":0] " << prefix
             << "_mask [0:" << count << "];\n  wire [" << (indexWidth - 1)
@@ -751,25 +837,28 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
             << "_mask[0] = " << laneExpression(module, step.inputs[1]) << ";\n";
         for (uint64_t rank = 0; rank < count; ++rank) {
           out << "  assign " << prefix << "_index[" << rank << "][0] = '0;\n"
-              << "  assign " << prefix << "_valid[" << rank << "] = |"
-              << prefix << "_mask[" << rank << "];\n";
+              << "  assign " << prefix << "_valid[" << rank << "] = |" << prefix
+              << "_mask[" << rank << "];\n";
           for (uint64_t scan = 0; scan < maskWidth; ++scan) {
-            uint64_t bit = step.compute->opcode == "low" ? maskWidth - 1 - scan : scan;
-            out << "  assign " << prefix << "_index[" << rank << "][" << (scan + 1)
-                << "] = " << prefix << "_mask[" << rank << "][" << bit << "] ? "
-                << indexWidth << "'d" << bit << " : " << prefix << "_index["
-                << rank << "][" << scan << "];\n";
+            uint64_t bit =
+                step.compute->opcode == "low" ? maskWidth - 1 - scan : scan;
+            out << "  assign " << prefix << "_index[" << rank << "]["
+                << (scan + 1) << "] = " << prefix << "_mask[" << rank << "]["
+                << bit << "] ? " << indexWidth << "'d" << bit << " : " << prefix
+                << "_index[" << rank << "][" << scan << "];\n";
           }
           for (uint64_t bit = 0; bit < maskWidth; ++bit)
-            out << "  assign " << prefix << "_mask[" << (rank + 1) << "][" << bit
-                << "] = " << prefix << "_mask[" << rank << "][" << bit
-                << "] & ~(" << prefix << "_valid[" << rank << "] & ("
-                << prefix << "_index[" << rank << "][" << maskWidth << "] == "
-                << indexWidth << "'d" << bit << "));\n";
-          out << "  assign " << laneExpression(module, step.outputs[rank]) << " = "
-              << prefix << "_index[" << rank << "][" << maskWidth << "];\n"
-              << "  assign " << laneExpression(module, step.outputs[count + rank])
-              << " = " << prefix << "_valid[" << rank << "];\n";
+            out << "  assign " << prefix << "_mask[" << (rank + 1) << "]["
+                << bit << "] = " << prefix << "_mask[" << rank << "][" << bit
+                << "] & ~(" << prefix << "_valid[" << rank << "] & (" << prefix
+                << "_index[" << rank << "][" << maskWidth
+                << "] == " << indexWidth << "'d" << bit << "));\n";
+          out << "  assign " << laneExpression(module, step.outputs[rank])
+              << " = " << prefix << "_index[" << rank << "][" << maskWidth
+              << "];\n"
+              << "  assign "
+              << laneExpression(module, step.outputs[count + rank]) << " = "
+              << prefix << "_valid[" << rank << "];\n";
         }
       } else if (step.compute->kind == ConcreteComputeKind::TableFold) {
         const auto &input = module.values[step.inputs[0]];
@@ -779,37 +868,60 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
         out << "  wire [" << (output.type.packedWidth - 1) << ":0] " << prefix
             << " [0:" << (lanes - 1) << "];\n";
         for (uint64_t lane = 0; lane < lanes; ++lane)
-          out << "  assign " << prefix << "[" << lane << "] = "
-              << valueName(module, input.id) << "["
+          out << "  assign " << prefix << "[" << lane
+              << "] = " << valueName(module, input.id) << "["
               << (lanes - 1 - lane) * output.type.packedWidth
               << " +: " << output.type.packedWidth << "];\n";
         uint64_t nodes = lanes, base = 0, next = lanes;
         while (nodes > 1) {
           for (uint64_t pair = 0; pair < nodes / 2; ++pair) {
-            out << "  wire [" << (output.type.packedWidth - 1) << ":0] " << prefix
-                << "_n" << next << " = ";
-            std::string a = prefix + (base ? "_n" + std::to_string(base + 2 * pair) : "[" + std::to_string(2 * pair) + "]");
-            std::string b = prefix + (base ? "_n" + std::to_string(base + 2 * pair + 1) : "[" + std::to_string(2 * pair + 1) + "]");
+            out << "  wire [" << (output.type.packedWidth - 1) << ":0] "
+                << prefix << "_n" << next << " = ";
+            std::string a =
+                prefix + (base ? "_n" + std::to_string(base + 2 * pair)
+                               : "[" + std::to_string(2 * pair) + "]");
+            std::string b =
+                prefix + (base ? "_n" + std::to_string(base + 2 * pair + 1)
+                               : "[" + std::to_string(2 * pair + 1) + "]");
             if (step.compute->opcode == "min" || step.compute->opcode == "max")
-              out << "(" << a << (step.compute->opcode == "min" ? " <= " : " >= ") << b << ") ? " << a << " : " << b;
+              out << "(" << a
+                  << (step.compute->opcode == "min" ? " <= " : " >= ") << b
+                  << ") ? " << a << " : " << b;
             else
-              out << a << " " << llvm::StringSwitch<StringRef>(step.compute->opcode).Case("add", "+").Case("mul", "*").Case("and", "&").Case("or", "|").Case("xor", "^").Default("") << " " << b;
-            out << ";\n"; ++next;
+              out << a << " "
+                  << llvm::StringSwitch<StringRef>(step.compute->opcode)
+                         .Case("add", "+")
+                         .Case("mul", "*")
+                         .Case("and", "&")
+                         .Case("or", "|")
+                         .Case("xor", "^")
+                         .Default("")
+                  << " " << b;
+            out << ";\n";
+            ++next;
           }
           if (nodes % 2) {
-            std::string a = prefix + (base ? "_n" + std::to_string(base + nodes - 1) : "[" + std::to_string(nodes - 1) + "]");
-            out << "  wire [" << (output.type.packedWidth - 1) << ":0] " << prefix
-                << "_n" << next++ << " = " << a << ";\n";
+            std::string a =
+                prefix + (base ? "_n" + std::to_string(base + nodes - 1)
+                               : "[" + std::to_string(nodes - 1) + "]");
+            out << "  wire [" << (output.type.packedWidth - 1) << ":0] "
+                << prefix << "_n" << next++ << " = " << a << ";\n";
           }
-          base = next - ((nodes + 1) / 2); nodes = (nodes + 1) / 2;
+          base = next - ((nodes + 1) / 2);
+          nodes = (nodes + 1) / 2;
         }
-        std::string root = lanes == 1 ? prefix + "[0]" : prefix + "_n" + std::to_string(base);
-        out << "  assign " << valueName(module, output.id) << " = " << root << ";\n";
+        std::string root =
+            lanes == 1 ? prefix + "[0]" : prefix + "_n" + std::to_string(base);
+        out << "  assign " << valueName(module, output.id) << " = " << root
+            << ";\n";
       } else if (step.compute->kind == ConcreteComputeKind::ValueMerge) {
         const auto &base = module.values[step.inputs[0]];
         const auto &output = module.values[step.outputs[0]];
         const uint64_t writes = (step.inputs.size() - 1) / 2;
-        struct Segment { uint64_t low, width; int write; };
+        struct Segment {
+          uint64_t low, width;
+          int write;
+        };
         llvm::SmallVector<Segment> segments;
         llvm::SmallVector<Segment> writeSegments;
         writeSegments.reserve(writes);
@@ -839,15 +951,20 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
           segments.push_back(write);
           cursor = write.low + write.width;
         }
-        if (cursor < output.type.packedWidth) segments.push_back({cursor, output.type.packedWidth - cursor, -1});
-        llvm::sort(segments, [](const Segment &a, const Segment &b) { return a.low > b.low; });
+        if (cursor < output.type.packedWidth)
+          segments.push_back({cursor, output.type.packedWidth - cursor, -1});
+        llvm::sort(segments, [](const Segment &a, const Segment &b) {
+          return a.low > b.low;
+        });
         out << "  assign " << laneExpression(module, output.id) << " = {";
         for (auto [i, segment] : llvm::enumerate(segments)) {
-          if (i) out << ", ";
+          if (i)
+            out << ", ";
           if (segment.write < 0) {
             if (base.availabilityParent && base.tableLane)
               out << valueName(module, *base.availabilityParent) << "["
-                  << ((module.values[*base.availabilityParent].type.packedWidth /
+                  << ((module.values[*base.availabilityParent]
+                               .type.packedWidth /
                            base.type.packedWidth -
                        1 - *base.tableLane) *
                           base.type.packedWidth +
@@ -856,15 +973,15 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
             else
               out << laneExpression(module, base.id) << "[" << segment.low
                   << " +: " << segment.width << "]";
-          }
-          else {
+          } else {
             const uint64_t write = segment.write;
             out << laneExpression(module, step.inputs[1 + write]) << " ? "
                 << laneExpression(module, step.inputs[1 + writes + write])
                 << " : ";
             if (base.availabilityParent && base.tableLane)
               out << valueName(module, *base.availabilityParent) << "["
-                  << ((module.values[*base.availabilityParent].type.packedWidth /
+                  << ((module.values[*base.availabilityParent]
+                               .type.packedWidth /
                            base.type.packedWidth -
                        1 - *base.tableLane) *
                           base.type.packedWidth +
@@ -875,7 +992,8 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
                   << " +: " << segment.width << "]";
           }
         }
-        out << "};\n  assign " << laneExpression(module, step.outputs[1]) << " = ";
+        out << "};\n  assign " << laneExpression(module, step.outputs[1])
+            << " = ";
         out << "1'b0";
         for (uint64_t i = 0; i < writes; ++i) {
           out << " | ";
@@ -886,7 +1004,8 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
       } else {
         auto expression = computeExpression(module, step);
         if (failed(expression))
-          return fail(step.operation, "Verilog renderer lacks a planned compute mapping");
+          return fail(step.operation,
+                      "Verilog renderer lacks a planned compute mapping");
         out << "  assign " << laneExpression(module, step.outputs[0]) << " = "
             << *expression << ";\n";
       }
@@ -902,6 +1021,10 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
       const ConcreteValuePlan &aggregate =
           module.values[child.outputs[*step.portIndex].value];
       const ConcreteValuePlan &field = module.values[step.outputs.front()];
+      // The dependency-authorized refresh inputs order the imperative C++
+      // projection. Verilog already connects the complete child port as a
+      // continuous dataflow net, so emitting those refreshes again would add
+      // duplicate drivers.
       out << "  assign " << laneExpression(module, field.id) << " = "
           << laneExpression(module, aggregate.id) << "[" << *step.fieldLow
           << " +: " << field.type.packedWidth << "];\n";
@@ -917,7 +1040,8 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
           << laneExpression(module, step.inputs[0]) << ";\n";
     } else if (step.kind == ConcreteScheduleStepKind::AvailabilityBarrier) {
       if (step.outputs.size() != 1 || step.inputs.empty())
-        return fail(step.operation, "Verilog availability barrier is malformed");
+        return fail(step.operation,
+                    "Verilog availability barrier is malformed");
       const auto &output = module.values[step.outputs.front()];
       const auto &first = module.values[step.inputs.front()];
       // Collection/table-map lane IDs already denote slices of the parent
@@ -939,13 +1063,14 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
     const std::string condition = laneExpression(module, check.condition);
     const std::string path = laneExpression(module, check.path);
     const std::string reset =
-        module.resetInput ? laneExpression(module, module.inputs[*module.resetInput].value)
-                          : "pyc_reset_active";
+        module.resetInput
+            ? laneExpression(module, module.inputs[*module.resetInput].value)
+            : "pyc_reset_active";
     if (verilog.mode == VerilogExportMode::Physical) {
-      out << "`ifndef SYNTHESIS\n  wire " << error << " = $isunknown("
-          << path << ") || ((pyc_reset_active === 1'b0) && (" << path
-          << " === 1'b1) && $isunknown(" << condition
-          << "));\n`else\n  wire " << error << " = 1'b0;\n`endif\n";
+      out << "`ifndef SYNTHESIS\n  wire " << error << " = $isunknown(" << path
+          << ") || ((pyc_reset_active === 1'b0) && (" << path
+          << " === 1'b1) && $isunknown(" << condition << "));\n`else\n  wire "
+          << error << " = 1'b0;\n`endif\n";
       localErrors.push_back(error);
       continue;
     }
@@ -986,8 +1111,9 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
           << "          else begin\n            " << prefix
           << "_reset_active = " << prefix << "_rising && ("
           << laneExpression(module, check.sampling[1]) << " === 1'b1);\n"
-          << "            " << prefix << "_pending_clock = "
-          << laneExpression(module, check.sampling[0]) << ";\n"
+          << "            " << prefix
+          << "_pending_clock = " << laneExpression(module, check.sampling[0])
+          << ";\n"
           << "            " << prefix << "_pending_valid = 1'b1;\n"
           << "          end\n        end\n        " << complete
           << " = 1'b1;\n      end\n"
@@ -1004,27 +1130,25 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
           << "_pending_clock = 1'b0;\n        " << prefix
           << "_pending_valid = (pyc_phase == 3'd4);\n      end\n"
           << "      default: begin end\n    endcase\n  end\n"
-          << "  wire " << error << " = $isunknown(" << error
-          << "_path) || (" << prefix << "_rising && !" << prefix
-          << "_reset_active && (" << error
+          << "  wire " << error << " = $isunknown(" << error << "_path) || ("
+          << prefix << "_rising && !" << prefix << "_reset_active && (" << error
           << "_path === 1'b1) && $isunknown(" << error
           << "_condition));\n`else\n  wire " << complete
-          << " = 1'b1;\n  wire [1:0] " << prefix
-          << "_fault = 2'd0;\n  wire " << error << " = 1'b0;\n`endif\n";
+          << " = 1'b1;\n  wire [1:0] " << prefix << "_fault = 2'd0;\n  wire "
+          << error << " = 1'b0;\n`endif\n";
       localComplete.push_back(complete);
       localSampling.push_back("(" + prefix + "_fault != 2'd0)");
       localErrors.push_back(error);
       continue;
     }
     out << "`ifndef SYNTHESIS\n  logic " << error
-        << "_condition = 1'b0;\n  logic " << error
-        << "_path = 1'b0;\n  logic " << error
-        << "_reset = 1'b0;\n  logic " << complete
+        << "_condition = 1'b0;\n  logic " << error << "_path = 1'b0;\n  logic "
+        << error << "_reset = 1'b0;\n  logic " << complete
         << " = 1'b0;\n  always @(pyc_phase) begin\n    case (pyc_phase)\n"
         << "      3'd1: begin\n        " << complete << " = 1'b0;\n        "
         << error << "_condition = " << condition << ";\n        " << error
-        << "_path = " << path << ";\n        " << error << "_reset = "
-        << reset << ";\n        " << complete << " = 1'b1;\n      end\n"
+        << "_path = " << path << ";\n        " << error << "_reset = " << reset
+        << ";\n        " << complete << " = 1'b1;\n      end\n"
         << "      3'd2: if (pyc_root_commit_ok === 1'b1) " << complete
         << " = 1'b0;\n      3'd3, 3'd4: begin\n        " << complete
         << " = 1'b0;\n        " << error << "_condition = 1'b0;\n        "
@@ -1054,7 +1178,8 @@ LogicalResult emitModule(const VerilogDesignPlan &verilog, unsigned moduleIndex,
     reduction(localComplete, "&", "1'b1");
     out << ";\n  assign pyc_sampling_error = ";
     reduction(localSampling, "|", "1'b0");
-    out << ";\n  assign pyc_local_error = (pyc_check_complete !== 1'b1) | pyc_sampling_error";
+    out << ";\n  assign pyc_local_error = (pyc_check_complete !== 1'b1) | "
+           "pyc_sampling_error";
     for (const std::string &error : localErrors)
       out << " | " << error;
     out << ";\n";
@@ -1095,7 +1220,8 @@ LogicalResult emitWrapper(const VerilogDesignPlan &verilog, raw_ostream &out) {
       port("input", root.inputs[index]);
   for (unsigned index = 0; index < root.publicOutputCount; ++index)
     port("output", root.outputs[index]);
-  auto scalarPort = [&](StringRef direction, StringRef name, unsigned width = 1) {
+  auto scalarPort = [&](StringRef direction, StringRef name,
+                        unsigned width = 1) {
     if (!first)
       out << ",\n";
     out << "  " << direction << " wire ";
@@ -1132,8 +1258,7 @@ LogicalResult emitWrapper(const VerilogDesignPlan &verilog, raw_ostream &out) {
           << ":0] pyc_observation_path_raw;\n  wire ["
           << (plan.observations.size() * maximumWidth - 1)
           << ":0] pyc_observation_value_raw;\n";
-    out <<
-           "`ifndef SYNTHESIS\n  bit pyc_physical_fault = 1'b0;\n"
+    out << "`ifndef SYNTHESIS\n  bit pyc_physical_fault = 1'b0;\n"
            "  wire pyc_observation_error = ";
     if (plan.observations.empty()) {
       out << "1'b0";
@@ -1145,16 +1270,17 @@ LogicalResult emitWrapper(const VerilogDesignPlan &verilog, raw_ostream &out) {
             "pyc_observation_path_raw[" + std::to_string(index) + "]";
         const std::string value =
             "pyc_observation_value_raw[" +
-            std::to_string(index * maximumWidth) + " +: " +
-            std::to_string(observation.payloadWidth) + "]";
+            std::to_string(index * maximumWidth) +
+            " +: " + std::to_string(observation.payloadWidth) + "]";
         out << "(($isunknown(" << path << "))";
         if (observation.kind == ConcreteObservationKind::Gauge)
-          out << " | ((" << path << " === 1'b1) && $isunknown(" << value << "))";
+          out << " | ((" << path << " === 1'b1) && $isunknown(" << value
+              << "))";
         if (observation.groupIndex != 0) {
           const auto &first = plan.observations[index - observation.groupIndex];
           out << " | (!$isunknown(" << path << ") && (" << path << " !== "
-              << "pyc_observation_path_raw["
-              << (index - observation.groupIndex) << "]))";
+              << "pyc_observation_path_raw[" << (index - observation.groupIndex)
+              << "]))";
         }
         out << ")";
       }
@@ -1162,13 +1288,16 @@ LogicalResult emitWrapper(const VerilogDesignPlan &verilog, raw_ostream &out) {
     out << ";\n  wire pyc_physical_error = pyc_local_error | "
            "pyc_observation_error | $isunknown("
         << root.inputs[*root.resetInput].cppName
-        << ");\n  assign pyc_root_commit_ok = !pyc_physical_fault && !pyc_physical_error;\n"
+        << ");\n  assign pyc_root_commit_ok = !pyc_physical_fault && "
+           "!pyc_physical_error;\n"
            "  always @("
-        << root.inputs[*root.clockInput].cppName << ") begin\n    if ($isunknown("
+        << root.inputs[*root.clockInput].cppName
+        << ") begin\n    if ($isunknown("
         << root.inputs[*root.clockInput].cppName << ") || (("
         << root.inputs[*root.clockInput].cppName
         << " === 1'b1) && pyc_physical_error)) begin\n"
-           "      if (!pyc_physical_fault) $display(\"PYCIRCUIT_PHYSICAL_FAULT\");\n"
+           "      if (!pyc_physical_fault) "
+           "$display(\"PYCIRCUIT_PHYSICAL_FAULT\");\n"
            "      pyc_physical_fault = 1'b1;\n    end\n  end\n"
            "`else\n  assign pyc_root_commit_ok = 1'b1;\n`endif\n";
     if (!plan.observations.empty()) {
@@ -1177,45 +1306,58 @@ LogicalResult emitWrapper(const VerilogDesignPlan &verilog, raw_ostream &out) {
       const std::string &reset = root.inputs[*root.resetInput].cppName;
       out << "  logic [" << (count - 1)
           << ":0] pyc_observation_valid_reg = '0;\n"
-             "  logic [" << (count - 1)
+             "  logic ["
+          << (count - 1)
           << ":0] pyc_observation_path_reg = '0;\n"
-             "  logic [" << (count * maximumWidth - 1)
+             "  logic ["
+          << (count * maximumWidth - 1)
           << ":0] pyc_observation_value_reg = '0;\n"
-             "  logic [" << (count * maximumWidth - 1)
+             "  logic ["
+          << (count * maximumWidth - 1)
           << ":0] pyc_observation_known_reg = '0;\n"
-             "  logic [" << (count * maximumWidth - 1)
+             "  logic ["
+          << (count * maximumWidth - 1)
           << ":0] pyc_observation_z_reg = '0;\n"
              "  assign pyc_observation_valid = pyc_observation_valid_reg;\n"
              "  assign pyc_observation_path = pyc_observation_path_reg;\n"
              "  assign pyc_observation_value = pyc_observation_value_reg;\n"
              "  assign pyc_observation_known = pyc_observation_known_reg;\n"
              "  assign pyc_observation_z = pyc_observation_z_reg;\n"
-             "  always @(posedge " << clock << ") begin\n"
+             "  always @(posedge "
+          << clock
+          << ") begin\n"
              "    pyc_observation_valid_reg <= '0;\n"
              "    pyc_observation_path_reg <= '0;\n"
              "    pyc_observation_value_reg <= '0;\n"
              "    pyc_observation_known_reg <= '0;\n"
              "    pyc_observation_z_reg <= '0;\n"
-             "    if ((pyc_root_commit_ok === 1'b1) && (" << reset
-          << " === 1'b0)) begin\n";
+             "    if ((pyc_root_commit_ok === 1'b1) && ("
+          << reset << " === 1'b0)) begin\n";
       for (auto [index, observation] : llvm::enumerate(plan.observations)) {
         const std::string path =
             "pyc_observation_path_raw[" + std::to_string(index) + "]";
         const std::string value = "pyc_observation_value_raw";
-        out << "      pyc_observation_path_reg[" << index << "] <= ("
-            << path << " === 1'b1);\n"
-               "      if (" << path << " === 1'b1) begin\n"
-               "        pyc_observation_valid_reg[" << index << "] <= 1'b1;\n";
+        out << "      pyc_observation_path_reg[" << index << "] <= (" << path
+            << " === 1'b1);\n"
+               "      if ("
+            << path
+            << " === 1'b1) begin\n"
+               "        pyc_observation_valid_reg["
+            << index << "] <= 1'b1;\n";
         for (uint64_t bit = 0; bit < observation.payloadWidth; ++bit) {
           uint64_t outputBit = index * maximumWidth + bit;
           out << "        case (" << value << "["
-              << (index * maximumWidth + bit) << "])\n"
-                 "          1'b0: pyc_observation_known_reg[" << outputBit
+              << (index * maximumWidth + bit)
+              << "])\n"
+                 "          1'b0: pyc_observation_known_reg["
+              << outputBit
               << "] <= 1'b1;\n"
-                 "          1'b1: begin pyc_observation_value_reg[" << outputBit
-              << "] <= 1'b1; pyc_observation_known_reg[" << outputBit
+                 "          1'b1: begin pyc_observation_value_reg["
+              << outputBit << "] <= 1'b1; pyc_observation_known_reg["
+              << outputBit
               << "] <= 1'b1; end\n"
-                 "          1'bz: pyc_observation_z_reg[" << outputBit
+                 "          1'bz: pyc_observation_z_reg["
+              << outputBit
               << "] <= 1'b1;\n"
                  "          default: begin end\n"
                  "        endcase\n";
@@ -1312,14 +1454,17 @@ std::string systemSimulationTop(const VerilogDesignPlan &verilog) {
       << " = 1'b0;\n  logic [2:0] pyc_phase = 3'd0;\n"
          "  logic pyc_root_commit_ok = 1'b0;\n  wire pyc_check_complete;\n"
          "  wire pyc_sampling_error;\n  wire pyc_local_error;\n"
-         "  localparam longint unsigned pyc_max_cycles = 64'd4611686018427387903;\n"
-         "  longint unsigned pyc_cycles = 64'd10;\n  longint unsigned pyc_epoch = 0;\n"
+         "  localparam longint unsigned pyc_max_cycles = "
+         "64'd4611686018427387903;\n"
+         "  longint unsigned pyc_cycles = 64'd10;\n  longint unsigned "
+         "pyc_epoch = 0;\n"
          "  longint unsigned pyc_cycle;\n  string pyc_cycles_text;\n"
          "  bit pyc_cycles_valid;\n  pyc_root dut (."
-      << clock.cppName << "(" << clock.cppName << "), ." << reset.cppName
-      << "(" << reset.cppName
+      << clock.cppName << "(" << clock.cppName << "), ." << reset.cppName << "("
+      << reset.cppName
       << "), .pyc_phase(pyc_phase), .pyc_root_commit_ok(pyc_root_commit_ok), "
-         ".pyc_check_complete(pyc_check_complete), .pyc_sampling_error(pyc_sampling_error), "
+         ".pyc_check_complete(pyc_check_complete), "
+         ".pyc_sampling_error(pyc_sampling_error), "
          ".pyc_local_error(pyc_local_error));\n";
   out << "  bit pyc_observation_groups_ok;\n";
   for (const auto &group : groups) {
@@ -1327,12 +1472,12 @@ std::string systemSimulationTop(const VerilogDesignPlan &verilog) {
     out << "  bit pyc_observation_active_" << observation.stableOrdinal
         << " = 1'b0;\n";
     if (observation.kind == ConcreteObservationKind::Gauge)
-      out << "  longint unsigned pyc_report_value_"
-          << observation.stableOrdinal
+      out << "  longint unsigned pyc_report_value_" << observation.stableOrdinal
           << " = 0;\n  longint unsigned pyc_report_update_"
           << observation.stableOrdinal << " = 0;\n";
   }
-  out << "  task automatic pyc_validate_observations(output bit accepted); begin\n"
+  out << "  task automatic pyc_validate_observations(output bit accepted); "
+         "begin\n"
          "    accepted = 1'b1;\n";
   auto signal = [&](const ConcreteObservationPlan &observation,
                     StringRef field) {
@@ -1341,34 +1486,30 @@ std::string systemSimulationTop(const VerilogDesignPlan &verilog) {
   };
   for (const auto &group : groups) {
     const auto &first = plan.observations[group.begin];
-    out << "    pyc_observation_active_" << first.stableOrdinal
-        << " = 1'b0;\n";
+    out << "    pyc_observation_active_" << first.stableOrdinal << " = 1'b0;\n";
     for (std::size_t index = 0; index < group.size; ++index) {
       const auto &observation = plan.observations[group.begin + index];
-      out << "    if ((" << signal(observation, "pending")
-          << " !== 1'b0) && (" << signal(observation, "pending")
-          << " !== 1'b1)) accepted = 1'b0;\n";
+      out << "    if ((" << signal(observation, "pending") << " !== 1'b0) && ("
+          << signal(observation, "pending") << " !== 1'b1)) accepted = 1'b0;\n";
       if (index != 0)
-        out << "    if (" << signal(observation, "pending") << " !== "
-            << signal(first, "pending") << ") accepted = 1'b0;\n";
+        out << "    if (" << signal(observation, "pending")
+            << " !== " << signal(first, "pending") << ") accepted = 1'b0;\n";
     }
     out << "    if (" << signal(first, "pending") << " === 1'b1) begin\n";
     for (std::size_t index = 0; index < group.size; ++index) {
       const auto &observation = plan.observations[group.begin + index];
       for (StringRef field : {"path", "valid"})
-        out << "      if ((" << signal(observation, field)
-            << " !== 1'b0) && (" << signal(observation, field)
-            << " !== 1'b1)) accepted = 1'b0;\n";
+        out << "      if ((" << signal(observation, field) << " !== 1'b0) && ("
+            << signal(observation, field) << " !== 1'b1)) accepted = 1'b0;\n";
       if (index != 0)
-        out << "      if (" << signal(observation, "path") << " !== "
-            << signal(first, "path") << ") accepted = 1'b0;\n";
+        out << "      if (" << signal(observation, "path")
+            << " !== " << signal(first, "path") << ") accepted = 1'b0;\n";
     }
     out << "      if (" << signal(first, "path") << " === 1'b1) begin\n";
     for (std::size_t index = 1; index < group.size; ++index)
       out << "        if ("
           << signal(plan.observations[group.begin + index], "valid")
-          << " !== " << signal(first, "valid")
-          << ") accepted = 1'b0;\n";
+          << " !== " << signal(first, "valid") << ") accepted = 1'b0;\n";
     if (first.kind == ConcreteObservationKind::Gauge)
       out << "        if ($isunknown(" << signal(first, "value")
           << ")) accepted = 1'b0;\n";
@@ -1399,7 +1540,9 @@ std::string systemSimulationTop(const VerilogDesignPlan &verilog) {
              "\"{\\\"kind\\\":\\\"bool\\\",\\\"value\\\":false}\";\n"
              "        else pyc_observation_json_"
           << width
-          << " = $sformatf(\"{\\\"kind\\\":\\\"integer\\\",\\\"value\\\":\\\"%0d\\\"}\", $unsigned(raw));\n"
+          << " = "
+             "$sformatf(\"{\\\"kind\\\":\\\"integer\\\",\\\"value\\\":\\\"%"
+             "0d\\\"}\", $unsigned(raw));\n"
              "      end else begin\n";
     out << "      value_plane = '0; known_plane = '0; z_plane = '0;\n"
            "      for (index = 0; index < "
@@ -1407,27 +1550,31 @@ std::string systemSimulationTop(const VerilogDesignPlan &verilog) {
         << "; index = index + 1) begin\n"
            "        case (raw[index])\n"
            "          1'b0: known_plane[index] = 1'b1;\n"
-           "          1'b1: begin value_plane[index] = 1'b1; known_plane[index] = 1'b1; end\n"
+           "          1'b1: begin value_plane[index] = 1'b1; "
+           "known_plane[index] = 1'b1; end\n"
            "          1'bz: z_plane[index] = 1'b1;\n"
            "          default: begin end\n"
            "        endcase\n      end\n"
            "      pyc_observation_json_"
         << width
-        << " = $sformatf(\"{\\\"kind\\\":\\\"bits4\\\",\\\"width\\\":"
-        << width
-        << ",\\\"value\\\":\\\"%h\\\",\\\"known\\\":\\\"%h\\\",\\\"z\\\":\\\"%h\\\"}\", value_plane, known_plane, z_plane);\n";
+        << " = $sformatf(\"{\\\"kind\\\":\\\"bits4\\\",\\\"width\\\":" << width
+        << ",\\\"value\\\":\\\"%h\\\",\\\"known\\\":\\\"%h\\\",\\\"z\\\":\\\"%"
+           "h\\\"}\", value_plane, known_plane, z_plane);\n";
     if (width <= 64)
       out << "      end\n";
     out << "    end\n  endfunction\n";
   }
-  out << "  task automatic pyc_parse_cycles(input string text, output bit accepted, output longint unsigned value);\n"
+  out << "  task automatic pyc_parse_cycles(input string text, output bit "
+         "accepted, output longint unsigned value);\n"
          "    integer index; integer character; longint unsigned digit;\n"
          "    begin value = 0; accepted = text.len() != 0;\n"
-         "      for (index = 0; accepted && index < text.len(); index = index + 1) begin\n"
+         "      for (index = 0; accepted && index < text.len(); index = index "
+         "+ 1) begin\n"
          "        character = text[index];\n"
          "        if (character < 48 || character > 57) accepted = 1'b0;\n"
          "        else begin digit = character - 48;\n"
-         "          if (value > (pyc_max_cycles - digit) / 10) accepted = 1'b0;\n"
+         "          if (value > (pyc_max_cycles - digit) / 10) accepted = "
+         "1'b0;\n"
          "          else value = value * 10 + digit;\n"
          "        end\n      end\n"
          "      accepted = accepted && value != 0;\n"
@@ -1436,14 +1583,15 @@ std::string systemSimulationTop(const VerilogDesignPlan &verilog) {
   for (const auto &group : groups) {
     const auto &observation = plan.observations[group.begin];
     out << "    if (pyc_observation_active_" << observation.stableOrdinal
-        << ") begin\n      $write(\"{\\\"kind\\\":\\\""
-        << observation.kindName << "\\\",\\\"instance\\\":\\\""
-        << observation.instancePath
+        << ") begin\n      $write(\"{\\\"kind\\\":\\\"" << observation.kindName
+        << "\\\",\\\"instance\\\":\\\"" << observation.instancePath
         << "\\\",\\\"registration\\\":\");\n      $write("
         << svString(svString(observation.registrationJson))
         << ");\n      $write(\",\\\"site\\\":\"); $write("
         << svString(svString(observation.siteJson))
-        << ");\n      $write(\",\\\"evaluation_epoch\\\":\\\"%0d\\\",\\\"commit_epoch\\\":\\\"%0d\\\",\\\"spec\\\":\", pyc_epoch, pyc_epoch + 1);\n"
+        << ");\n      "
+           "$write(\",\\\"evaluation_epoch\\\":\\\"%0d\\\",\\\"commit_"
+           "epoch\\\":\\\"%0d\\\",\\\"spec\\\":\", pyc_epoch, pyc_epoch + 1);\n"
         << "      $write(" << svString(observation.specJson)
         << ");\n      $write(\",\\\"values\\\":[\");\n";
     for (std::size_t index = 0; index < group.size; ++index) {
@@ -1452,8 +1600,8 @@ std::string systemSimulationTop(const VerilogDesignPlan &verilog) {
         continue;
       if (index != 0)
         out << "      $write(\",\");\n";
-      out << "      $write(\"%s\", pyc_observation_json_"
-          << member.payloadWidth << "(" << signal(member, "value") << ", "
+      out << "      $write(\"%s\", pyc_observation_json_" << member.payloadWidth
+          << "(" << signal(member, "value") << ", "
           << (member.kind == ConcreteObservationKind::Event &&
                       member.payloadWidth == 1
                   ? "1'b1"
@@ -1472,29 +1620,49 @@ std::string systemSimulationTop(const VerilogDesignPlan &verilog) {
          "  task automatic pyc_step(input logic level); begin\n    "
       << clock.cppName
       << " = level; pyc_root_commit_ok = 1'b0; #1; pyc_phase = 3'd1; #1;\n"
-         "    if (pyc_check_complete !== 1'b1 || pyc_sampling_error !== 1'b0 || "
+         "    if (pyc_check_complete !== 1'b1 || pyc_sampling_error !== 1'b0 "
+         "|| "
          "pyc_local_error !== 1'b0) begin pyc_phase = 3'd3; #1; "
-         "$fatal(1, \"pycircuit_sim: hardware check failed at epoch %0d\", pyc_epoch); end\n"
+         "$fatal(1, \"pycircuit_sim: hardware check failed at epoch %0d\", "
+         "pyc_epoch); end\n"
          "    pyc_validate_observations(pyc_observation_groups_ok);\n"
          "    if (!pyc_observation_groups_ok) begin pyc_phase = 3'd3; #1; "
          "$fatal(1, \"pycircuit_sim: inconsistent observation group\"); end\n"
          "    pyc_root_commit_ok = 1'b1; pyc_phase = 3'd2; #1;\n"
          "    pyc_publish_observations();\n"
-         "    pyc_phase = 3'd0; pyc_root_commit_ok = 1'b0; pyc_epoch++;\n  end endtask\n"
+         "    pyc_phase = 3'd0; pyc_root_commit_ok = 1'b0; pyc_epoch++;\n  end "
+         "endtask\n"
          "  initial begin\n"
          "    if ($value$plusargs(\"cycles=%s\", pyc_cycles_text)) begin\n"
-         "      pyc_parse_cycles(pyc_cycles_text, pyc_cycles_valid, pyc_cycles);\n"
-         "      if (!pyc_cycles_valid) $fatal(1, \"pycircuit_sim: +cycles requires a positive decimal value no greater than 4611686018427387903\");\n"
+         "      pyc_parse_cycles(pyc_cycles_text, pyc_cycles_valid, "
+         "pyc_cycles);\n"
+         "      if (!pyc_cycles_valid) $fatal(1, \"pycircuit_sim: +cycles "
+         "requires a positive decimal value no greater than "
+         "4611686018427387903\");\n"
          "    end else if ($test$plusargs(\"cycles\"))\n"
-         "      $fatal(1, \"pycircuit_sim: +cycles requires a positive decimal value no greater than 4611686018427387903\");\n    "
+         "      $fatal(1, \"pycircuit_sim: +cycles requires a positive decimal "
+         "value no greater than 4611686018427387903\");\n    "
       << reset.cppName
       << " = 1'b0; #1; pyc_root_commit_ok = 1'b1; pyc_phase = 3'd4; #1; "
          "pyc_phase = 3'd2; #1; pyc_phase = 3'd0; pyc_root_commit_ok = 1'b0;\n"
          "    for (pyc_cycle = 0; pyc_cycle < pyc_cycles; pyc_cycle++) begin "
          "pyc_step(1'b0); pyc_step(1'b1); end\n"
-         "    $write(\"{\\\"kind\\\":\\\"result\\\",\\\"status\\\":\\\"TERMINATED\\\",\\\"epoch_time\\\":\\\"%0d\\\",\\\"statistics\\\":[\", pyc_epoch);\n"
-         "    $write(\"{\\\"buckets\\\":[],\\\"count\\\":0,\\\"kind\\\":\\\"counter\\\",\\\"last_update\\\":{\\\"delta\\\":0,\\\"time\\\":%0d},\\\"maximum\\\":0,\\\"minimum\\\":0,\\\"name\\\":\\\"cycles\\\",\\\"object_path\\\":\\\"@runtime\\\",\\\"sum\\\":0,\\\"value\\\":%0d}\", pyc_epoch, pyc_epoch);\n"
-         "    $write(\",{\\\"buckets\\\":[],\\\"count\\\":0,\\\"kind\\\":\\\"gauge\\\",\\\"last_update\\\":{\\\"delta\\\":0,\\\"time\\\":0},\\\"maximum\\\":0,\\\"minimum\\\":0,\\\"name\\\":\\\"stop_reason\\\",\\\"object_path\\\":\\\"@runtime\\\",\\\"sum\\\":0,\\\"value\\\":0}\");\n";
+         "    "
+         "$write(\"{\\\"kind\\\":\\\"result\\\",\\\"status\\\":"
+         "\\\"TERMINATED\\\",\\\"epoch_time\\\":\\\"%0d\\\",\\\"statistics\\\":"
+         "[\", pyc_epoch);\n"
+         "    "
+         "$write(\"{\\\"buckets\\\":[],\\\"count\\\":0,\\\"kind\\\":"
+         "\\\"counter\\\",\\\"last_update\\\":{\\\"delta\\\":0,\\\"time\\\":%"
+         "0d},\\\"maximum\\\":0,\\\"minimum\\\":0,\\\"name\\\":\\\"cycles\\\","
+         "\\\"object_path\\\":\\\"@runtime\\\",\\\"sum\\\":0,\\\"value\\\":%0d}"
+         "\", pyc_epoch, pyc_epoch);\n"
+         "    "
+         "$write(\",{\\\"buckets\\\":[],\\\"count\\\":0,\\\"kind\\\":"
+         "\\\"gauge\\\",\\\"last_update\\\":{\\\"delta\\\":0,\\\"time\\\":0},"
+         "\\\"maximum\\\":0,\\\"minimum\\\":0,\\\"name\\\":\\\"stop_reason\\\","
+         "\\\"object_path\\\":\\\"@runtime\\\",\\\"sum\\\":0,\\\"value\\\":0}"
+         "\");\n";
   for (const auto &group : groups) {
     const auto &observation = plan.observations[group.begin];
     if (observation.kind != ConcreteObservationKind::Gauge)
@@ -1508,9 +1676,8 @@ std::string systemSimulationTop(const VerilogDesignPlan &verilog) {
         jsonString(svFormatPayload(observation.instancePath)) +
         ",\"sum\":0,\"value\":%0d}";
     out << "    $write(" << svString(row, /*trustedFormat=*/true)
-        << ", pyc_report_update_"
-        << observation.stableOrdinal << ", pyc_report_value_"
-        << observation.stableOrdinal << ");\n";
+        << ", pyc_report_update_" << observation.stableOrdinal
+        << ", pyc_report_value_" << observation.stableOrdinal << ");\n";
   }
   out << "    $display(\"],\\\"error\\\":null}\");\n"
          "    $finish;\n  end\nendmodule\n";
@@ -1524,7 +1691,8 @@ FailureOr<VerilogDesignPlan> prepareVerilog(ModuleOp package,
                                             VerilogExportMode mode) {
   if (!package || !package->hasAttr("hwir.contract")) {
     if (package)
-      package.emitOpError() << "Verilog requires independent HWIR; run ac-final-to-hwir first";
+      package.emitOpError()
+          << "Verilog requires independent HWIR; run ac-final-to-hwir first";
     return failure();
   }
   if (failed(hwir::verifyHWIRPackage(package)))
@@ -1565,8 +1733,8 @@ FailureOr<VerilogDesignPlan> prepareVerilog(ModuleOp package,
         if (llvm::is_contained(step.inputs, clock) &&
             step.kind != ConcreteScheduleStepKind::DriveChildInput &&
             step.kind != ConcreteScheduleStepKind::DrivePrimitiveInput) {
-          step.operation->emitOpError()
-              << "physical RTL forbids clock use as data or combinational control";
+          step.operation->emitOpError() << "physical RTL forbids clock use as "
+                                           "data or combinational control";
           return failure();
         }
         if ((step.kind != ConcreteScheduleStepKind::DriveChildInput &&
@@ -1576,10 +1744,12 @@ FailureOr<VerilogDesignPlan> prepareVerilog(ModuleOp package,
         const ConcreteChildPlan &child = module.children[*step.childIndex];
         if (step.inputs.front() == clock &&
             ((child.kind == ConcreteChildKind::Module &&
-              *step.portIndex != *result.design.modules[*child.moduleIndex].clockInput) ||
-             (child.kind != ConcreteChildKind::Module && *step.portIndex != 0))) {
-          step.operation->emitOpError()
-              << "physical RTL forbids clock use as data or combinational control";
+              *step.portIndex !=
+                  *result.design.modules[*child.moduleIndex].clockInput) ||
+             (child.kind != ConcreteChildKind::Module &&
+              *step.portIndex != 0))) {
+          step.operation->emitOpError() << "physical RTL forbids clock use as "
+                                           "data or combinational control";
           return failure();
         }
         if (child.kind == ConcreteChildKind::Module) {
@@ -1604,11 +1774,11 @@ FailureOr<VerilogDesignPlan> prepareVerilog(ModuleOp package,
       }
       for (const ConcreteChildPlan &child : module.children)
         if (child.kind != ConcreteChildKind::Module &&
-            !llvm::is_contained(
-                {StringRef("dff"), StringRef("dffe"), StringRef("fifo"),
-                 StringRef("byte_mem"), StringRef("sync_mem"),
-                 StringRef("sync_mem_dp")},
-                child.primitiveKind.getValue())) {
+            !llvm::is_contained({StringRef("dff"), StringRef("dffe"),
+                                 StringRef("fifo"), StringRef("byte_mem"),
+                                 StringRef("sync_mem"),
+                                 StringRef("sync_mem_dp")},
+                                child.primitiveKind.getValue())) {
           child.occurrence->emitOpError()
               << "physical RTL does not support primitive '"
               << child.primitiveKind.getValue() << "'";
@@ -1622,22 +1792,26 @@ FailureOr<VerilogDesignPlan> prepareVerilog(ModuleOp package,
           continue;
         if (child.inputs.empty()) {
           child.occurrence->emitOpError()
-              << "state initializer requires a closed static literal/constructor DAG";
+              << "state initializer requires a closed static "
+                 "literal/constructor DAG";
           return failure();
         }
         auto initializer =
             evaluatePhysicalInitializer(module, child.inputs.back().value);
         if (failed(initializer)) {
           child.occurrence->emitOpError()
-              << "state initializer requires a closed static literal/constructor DAG";
+              << "state initializer requires a closed static "
+                 "literal/constructor DAG";
           return failure();
         }
         VerilogDesignPlan::PhysicalInitializer materialized;
         materialized.moduleIndex = moduleIndex;
         materialized.childIndex = childIndex;
-        for (unsigned word = 0; word < initializer->value.getNumWords(); ++word) {
+        for (unsigned word = 0; word < initializer->value.getNumWords();
+             ++word) {
           materialized.words.push_back(initializer->value.getRawData()[word]);
-          materialized.knownWords.push_back(initializer->known.getRawData()[word]);
+          materialized.knownWords.push_back(
+              initializer->known.getRawData()[word]);
           materialized.zWords.push_back(initializer->z.getRawData()[word]);
         }
         result.physicalInitializers.push_back(std::move(materialized));
@@ -1647,9 +1821,8 @@ FailureOr<VerilogDesignPlan> prepareVerilog(ModuleOp package,
   return result;
 }
 
-FailureOr<VerilogSourceParts>
-emitVerilog(const VerilogDesignPlan &verilog,
-            uint64_t sourceShardTargetBytes) {
+FailureOr<VerilogSourceParts> emitVerilog(const VerilogDesignPlan &verilog,
+                                          uint64_t sourceShardTargetBytes) {
   if (failed(verifyConcreteDesignPlan(verilog.design)))
     return failure();
   if (sourceShardTargetBytes == 0) {
@@ -1664,10 +1837,11 @@ emitVerilog(const VerilogDesignPlan &verilog,
   for (const ConcreteModulePlan &module : verilog.design.modules)
     for (const ConcreteChildPlan &child : module.children)
       if (child.kind != ConcreteChildKind::Module) {
-        std::string path = "include/verilog/" + child.primitiveKind.getValue().str() + ".v";
+        std::string path =
+            "include/verilog/" + child.primitiveKind.getValue().str() + ".v";
         if (standards.insert(path).second)
           parts.standardSources.push_back(std::move(path));
-  }
+      }
   for (auto [unitIndex, unit] : llvm::enumerate(verilog.design.sourceUnits)) {
     std::optional<VerilogSourceGroup> shard;
     unsigned shardIndex = 0;
@@ -1697,8 +1871,9 @@ emitVerilog(const VerilogDesignPlan &verilog,
         finishShard();
       if (!shard)
         startShard();
-      shard->definitions.push_back(FlatSymbolRefAttr::get(
-          module.key.definition->getContext(), module.key.definition.getSymName()));
+      shard->definitions.push_back(
+          FlatSymbolRefAttr::get(module.key.definition->getContext(),
+                                 module.key.definition.getSymName()));
       shard->text += moduleText;
     }
     finishShard();

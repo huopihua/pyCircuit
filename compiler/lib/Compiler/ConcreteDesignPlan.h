@@ -132,8 +132,7 @@ struct ConcretePrimitiveConfig {
   // For each non-temporal output, input pin ordinals that must be driven
   // before the runtime primitive can refresh that pure output. Temporal
   // outputs ignore this list because they are committed-state views.
-  llvm::SmallVector<llvm::SmallVector<unsigned, 1>, 2>
-      outputRefreshInputs;
+  llvm::SmallVector<llvm::SmallVector<unsigned, 1>, 2> outputRefreshInputs;
   bool hasPureOutputRefresh = false;
   bool hasWork = false;
 };
@@ -185,8 +184,8 @@ enum class ConcreteComputeKind {
   TableSplat,
   TableView,
   TableIndex,
-  TableGet
-  ,TableMatch,
+  TableGet,
+  TableMatch,
   TableChoose,
   TableFold,
   ValueMerge
@@ -206,6 +205,18 @@ struct ConcreteComputePlan {
   llvm::SmallVector<uint64_t, 2> zWords;
 };
 
+// One child input (or packed input field) that must be refreshed before a
+// combinational child output field can be read.  The source value belongs to
+// the parent module; sourceLow permits a leaf to be projected from an already
+// available aggregate without manufacturing a second SSA value.
+struct ConcreteRefreshInput {
+  unsigned port = 0;
+  ConcreteValueId source = 0;
+  std::optional<uint64_t> targetLow;
+  uint64_t sourceLow = 0;
+  uint64_t width = 0;
+};
+
 struct ConcreteScheduleStep {
   ConcreteScheduleStepKind kind = ConcreteScheduleStepKind::ComputeValue;
   // Retained for opcode/configuration lookup and diagnostics. Value wiring is
@@ -213,11 +224,11 @@ struct ConcreteScheduleStep {
   mlir::Operation *operation = nullptr;
   std::optional<unsigned> childIndex;
   std::optional<unsigned> portIndex;
-  // A field-level child read extracts this packed slice after all listed
-  // child input ports have been driven.  These records are produced from the
+  // A field-level child read extracts this packed slice after the listed
+  // child inputs have been refreshed.  These records are produced from the
   // verified HWIR output dependency contract, not rediscovered by rendering.
   std::optional<uint64_t> fieldLow;
-  llvm::SmallVector<unsigned, 2> refreshInputPorts;
+  llvm::SmallVector<ConcreteRefreshInput, 2> refreshInputs;
   llvm::SmallVector<ConcreteValueId, 4> inputs;
   llvm::SmallVector<ConcreteValueId, 2> outputs;
   std::optional<ConcreteComputePlan> compute;

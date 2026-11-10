@@ -279,6 +279,51 @@ TEST_F(ConcreteDesignPlanTest,
   EXPECT_EQ(definitions.size(), 2u);
 }
 
+TEST_F(ConcreteDesignPlanTest,
+       ProjectsChildOutputDependenciesThroughRuleCaptures) {
+  auto parsed = parseHWIRFrom(PYCIRCUIT_TEST_STRUCTURAL_CPP_NESTED_INTERLEAVE);
+  ASSERT_TRUE(parsed);
+  auto plan = compiler::prepareStructuralCpp(*parsed);
+  ASSERT_TRUE(mlir::succeeded(plan));
+  const auto &root = plan->modules[plan->rootModule];
+  auto projected =
+      llvm::find_if(root.concreteSchedule.steps, [](const auto &step) {
+        return step.kind ==
+                   compiler::ConcreteScheduleStepKind::ReadChildOutputField &&
+               !step.refreshInputs.empty();
+      });
+  ASSERT_NE(projected, root.concreteSchedule.steps.end());
+  ASSERT_EQ(projected->refreshInputs.size(), 1u);
+  EXPECT_EQ(projected->refreshInputs.front().port, 0u);
+  ASSERT_TRUE(projected->refreshInputs.front().targetLow.has_value());
+  EXPECT_EQ(*projected->refreshInputs.front().targetLow, 8u);
+  EXPECT_EQ(projected->refreshInputs.front().sourceLow, 0u);
+  EXPECT_EQ(projected->refreshInputs.front().width, 8u);
+  EXPECT_EQ(root.values[projected->refreshInputs.front().source].kind,
+            compiler::ConcreteValueKind::ModuleInput);
+
+  std::string source;
+  llvm::raw_string_ostream stream(source);
+  ASSERT_TRUE(mlir::succeeded(compiler::emitStructuralCpp(*plan, stream)));
+  EXPECT_NE(source.find(".assignSlice(8, input_0.packed())"),
+            std::string::npos);
+}
+
+TEST_F(ConcreteDesignPlanTest, VerilogCompactsUniformCollectionInstances) {
+  auto parsed = parseHWIRFrom(PYCIRCUIT_TEST_COLLECTION_COMPOSITE);
+  ASSERT_TRUE(parsed);
+  auto plan = compiler::prepareVerilog(*parsed);
+  ASSERT_TRUE(mlir::succeeded(plan));
+  auto parts = compiler::emitVerilog(*plan);
+  ASSERT_TRUE(mlir::succeeded(parts));
+  std::string source;
+  for (const auto &group : parts->sourceGroups)
+    source += group.text;
+  EXPECT_NE(source.find("for (pyc_lane_0 = 0; pyc_lane_0 < 64;"),
+            std::string::npos);
+  EXPECT_EQ(llvm::StringRef(source).count("pyc_rtl_pipe__"), 2u);
+}
+
 TEST_F(ConcreteDesignPlanTest, BuildsConcreteVerilogModuleParameters) {
   auto parsed = parseFrom(PYCIRCUIT_TEST_VERILOG_GENERIC_INPUT);
   ASSERT_TRUE(parsed);

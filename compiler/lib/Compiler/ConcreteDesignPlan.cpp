@@ -92,21 +92,20 @@ bool isApprovedStructuralOp(Operation *operation) {
   static const llvm::StringSet<> approved = [] {
     llvm::StringSet<> result;
     for (StringRef name :
-         {"ac.module",        "ac.rule",           "ac.yield",
-          "ac.instance",      "ac.collection",     "ac.queue",
-          "ac.constant",      "ac.bits.constant",  "ac.bits.constant4",
-          "ac.bits.unary",
-          "ac.bits.binary",   "ac.bits.compare",   "ac.bits.select",
-          "ac.bits.concat",   "ac.bits.extract",   "ac.bits.resize",
-          "ac.math.constant", "ac.math.from_bits", "ac.math.compare",
-          "ac.math.binary",   "ac.math.to_bits",   "ac.value.merge",
-          "ac.struct.create", "ac.struct.get",     "ac.enum.create",
-          "ac.enum.to_bits",  "ac.enum.from_bits", "ac.table.create",
-          "ac.table.splat",   "ac.table.map",      "ac.table.view",
-          "ac.table.index",   "ac.table.get",      "ac.table.match",
-          "ac.table.choose",  "ac.table.fold",     "ac.state",
-          "ac.state.read",    "ac.state.write",    "ac.expect",
-          "ac.observe"})
+         {"ac.module",       "ac.rule",          "ac.yield",
+          "ac.instance",     "ac.collection",    "ac.queue",
+          "ac.constant",     "ac.bits.constant", "ac.bits.constant4",
+          "ac.bits.unary",   "ac.bits.binary",   "ac.bits.compare",
+          "ac.bits.select",  "ac.bits.concat",   "ac.bits.extract",
+          "ac.bits.resize",  "ac.math.constant", "ac.math.from_bits",
+          "ac.math.compare", "ac.math.binary",   "ac.math.to_bits",
+          "ac.value.merge",  "ac.struct.create", "ac.struct.get",
+          "ac.enum.create",  "ac.enum.to_bits",  "ac.enum.from_bits",
+          "ac.table.create", "ac.table.splat",   "ac.table.map",
+          "ac.table.view",   "ac.table.index",   "ac.table.get",
+          "ac.table.match",  "ac.table.choose",  "ac.table.fold",
+          "ac.state",        "ac.state.read",    "ac.state.write",
+          "ac.expect",       "ac.observe"})
       result.insert(name);
     return result;
   }();
@@ -160,7 +159,8 @@ public:
     plan.rootModule = *rootIndex;
     plan.root = plan.modules[*rootIndex].key;
     if (failed(buildSystemPlan()))
-      return package.emitOpError() << "failed to build the concrete system plan";
+      return package.emitOpError()
+             << "failed to build the concrete system plan";
     materializeDesignLifecycle();
     buildManifest();
     if (failed(buildSourceUnits()))
@@ -204,15 +204,14 @@ private:
                   "exceeds the current Runtime bit-width capacity";
       return success();
     };
-    auto checkMemory = [&](Operation *site,
-                           const ac::HardwareBindings &child,
+    auto checkMemory = [&](Operation *site, const ac::HardwareBindings &child,
                            uint64_t childMultiplicity) -> LogicalResult {
       StringRef primitive = analysis.getPrimitiveKind(child.owner);
       if (primitive != "sync_mem" && primitive != "sync_mem_dp" &&
           primitive != "byte_mem")
         return success();
-      auto depth = dyn_cast_or_null<ac::MathIntAttr>(
-          child.integers.lookup("DEPTH"));
+      auto depth =
+          dyn_cast_or_null<ac::MathIntAttr>(child.integers.lookup("DEPTH"));
       if (!depth)
         return site->emitOpError() << "memory depth is unresolved";
       llvm::APSInt depthValue(depth.getCanonicalValue());
@@ -222,8 +221,7 @@ private:
                << "memory depth exceeds target storage indexing";
       Type payload = child.types.lookup("T");
       if (!payload)
-        return site->emitOpError()
-               << "memory payload type is unresolved";
+        return site->emitOpError() << "memory payload type is unresolved";
       auto bits = analysis.getPackedWidth(payload, child, site);
       if (failed(bits))
         return failure();
@@ -241,8 +239,7 @@ private:
                   "the current Runtime object capacity";
       const uint64_t perLaneLimit = capacity / childMultiplicity;
       if (overhead >= perLaneLimit ||
-          depthValue.getZExtValue() >
-              (perLaneLimit - overhead) / entryBytes)
+          depthValue.getZExtValue() > (perLaneLimit - overhead) / entryBytes)
         return site->emitOpError()
                << "memory storage including enclosing collections exceeds "
                   "the current Runtime object capacity";
@@ -256,8 +253,8 @@ private:
         auto config = resolveHWIRQueue(queue, bindings);
         if (failed(config))
           return failure();
-        auto elementWidth = analysis.getPackedWidth(
-            config->tokenElementType, bindings, queue);
+        auto elementWidth =
+            analysis.getPackedWidth(config->tokenElementType, bindings, queue);
         if (failed(elementWidth))
           return failure();
         const uint64_t scalarBytes =
@@ -294,17 +291,17 @@ private:
       hwir::InstanceOp instance = dyn_cast<hwir::InstanceOp>(operation);
       hwir::CollectionOp collection = dyn_cast<hwir::CollectionOp>(operation);
       if (instance || collection) {
-        Operation *site = instance ? instance.getOperation()
-                                   : collection.getOperation();
+        Operation *site =
+            instance ? instance.getOperation() : collection.getOperation();
         Operation *callee = analysis.lookupDefinition(
             instance ? instance.getCallee() : collection.getCallee());
-        auto child = analysis.bindCallee(
-            callee,
-            instance ? instance.getParametersAttr()
-                     : collection.getParametersAttr(),
-            instance ? instance.getTypeArgumentsAttr()
-                     : collection.getTypeArgumentsAttr(),
-            bindings, site);
+        auto child =
+            analysis.bindCallee(callee,
+                                instance ? instance.getParametersAttr()
+                                         : collection.getParametersAttr(),
+                                instance ? instance.getTypeArgumentsAttr()
+                                         : collection.getTypeArgumentsAttr(),
+                                bindings, site);
         if (failed(child))
           return failure();
         uint64_t childMultiplicity = multiplicity;
@@ -313,18 +310,17 @@ private:
                                              collection);
           if (failed(shape))
             return failure();
-        for (uint64_t extent : *shape) {
-          if (!extent || childMultiplicity > UINT64_MAX / extent)
-            return collection.emitOpError()
-                   << "collection occurrence multiplicity overflows";
-          childMultiplicity *= extent;
-        }
+          for (uint64_t extent : *shape) {
+            if (!extent || childMultiplicity > UINT64_MAX / extent)
+              return collection.emitOpError()
+                     << "collection occurrence multiplicity overflows";
+            childMultiplicity *= extent;
+          }
         }
         if (failed(checkMemory(site, *child, childMultiplicity)))
           return failure();
         if (isa<hwir::ModuleOp>(child->owner) &&
-            failed(preflightResources(child->owner, *child,
-                                      childMultiplicity)))
+            failed(preflightResources(child->owner, *child, childMultiplicity)))
           return failure();
       }
     }
@@ -342,7 +338,7 @@ private:
              << "structural C++ root_kind must be system";
     auto domain = root.key.definition->getAttrOfType<DictionaryAttr>(
         package->hasAttr("hwir.contract") ? "hwir.domain_inputs"
-                                           : "ac.domain_inputs");
+                                          : "ac.domain_inputs");
     auto clock = domain ? domain.getAs<IntegerAttr>("clock") : IntegerAttr();
     auto reset = domain ? domain.getAs<IntegerAttr>("reset") : IntegerAttr();
     if (!domain || domain.size() != 2 || !clock || !reset ||
@@ -686,9 +682,9 @@ private:
       llvm::erase_if(config.types, [](const ConcreteTypeBinding &type) {
         return type.name.getValue() == "T";
       });
-      auto payloadBinding = normalizeTypeBinding(
-          StringAttr::get(package.getContext(), "T"),
-          config.queue->payloadType, bindings, site);
+      auto payloadBinding =
+          normalizeTypeBinding(StringAttr::get(package.getContext(), "T"),
+                               config.queue->payloadType, bindings, site);
       if (failed(payloadBinding))
         return failure();
       config.types.push_back(std::move(*payloadBinding));
@@ -716,11 +712,12 @@ private:
       config.outputIsTemporal = {config.queue->readyPolicy ==
                                      ac::QueueReadyPolicy::LocalOccupancy,
                                  true, true};
-      config.outputRefreshInputs = {
-          config.queue->readyPolicy == ac::QueueReadyPolicy::LocalOccupancy
-              ? llvm::SmallVector<unsigned, 1>{}
-              : llvm::SmallVector<unsigned, 1>{4},
-          {}, {}};
+      config.outputRefreshInputs = {config.queue->readyPolicy ==
+                                            ac::QueueReadyPolicy::LocalOccupancy
+                                        ? llvm::SmallVector<unsigned, 1>{}
+                                        : llvm::SmallVector<unsigned, 1>{4},
+                                    {},
+                                    {}};
       config.hasPureOutputRefresh = true;
       config.hasWork = true;
     }
@@ -896,15 +893,105 @@ private:
            << "structural C++ value is outside the module value plan";
   }
 
+  struct ProjectedValue {
+    Value value;
+    llvm::SmallVector<StringRef, 2> remainingPath;
+  };
+
+  ProjectedValue projectConstructedField(Value value,
+                                         ArrayRef<StringRef> path) {
+    value = flattenRegionValue(value);
+    if (path.empty())
+      return {value, {}};
+    auto create = value.getDefiningOp<ac::StructCreateOp>();
+    auto declaration = create
+                           ? analysis.lookupStruct(create.getResult().getType())
+                           : ac::StructOp();
+    if (!create || !declaration)
+      return {value, {path.begin(), path.end()}};
+    for (auto [index, raw] : llvm::enumerate(declaration.getFields())) {
+      auto field = cast<DictionaryAttr>(raw);
+      if (field.getAs<StringAttr>("name").getValue() != path.front())
+        continue;
+      return projectConstructedField(create.getValues()[index],
+                                     path.drop_front());
+    }
+    return {value, {path.begin(), path.end()}};
+  }
+
+  FailureOr<ConcreteRefreshInput>
+  materializeRefreshInput(ConcreteModulePlan &module,
+                          const ConcreteChildPlan &child, unsigned inputPort,
+                          ArrayRef<StringRef> path, Operation *site) {
+    if (inputPort >= child.inputs.size() || inputPort >= site->getNumOperands())
+      return site->emitOpError()
+             << "HWIR child output dependency names an absent input port";
+    ConcreteRefreshInput refresh;
+    refresh.port = inputPort;
+    const ConcreteTypePlan &target =
+        plan.modules[*child.moduleIndex].inputs[inputPort].type;
+    if (path.empty()) {
+      refresh.source = child.inputs[inputPort].value;
+      refresh.width = target.packedWidth;
+      return refresh;
+    }
+    const ConcreteTypePlan::PackedField *targetField = nullptr;
+    for (const auto &candidate : target.fields) {
+      if (candidate.path.size() != path.size())
+        continue;
+      bool matches = true;
+      for (auto [index, component] : llvm::enumerate(path))
+        matches &= candidate.path[index] == component;
+      if (matches) {
+        targetField = &candidate;
+        break;
+      }
+    }
+    if (!targetField)
+      return site->emitOpError()
+             << "HWIR child input dependency lacks packed layout";
+
+    ProjectedValue projected =
+        projectConstructedField(site->getOperand(inputPort), path);
+    auto source = valueId(module, projected.value, site);
+    if (failed(source))
+      return failure();
+    refresh.source = *source;
+    refresh.targetLow = targetField->low;
+    refresh.width = targetField->width;
+    if (projected.remainingPath.empty()) {
+      if (module.values[*source].type.packedWidth != refresh.width)
+        return site->emitOpError()
+               << "HWIR child input field source has an incompatible width";
+      return refresh;
+    }
+    const ConcreteTypePlan::PackedField *sourceField = nullptr;
+    for (const auto &candidate : module.values[*source].type.fields) {
+      if (candidate.path.size() != projected.remainingPath.size())
+        continue;
+      bool matches = true;
+      for (auto [index, component] : llvm::enumerate(projected.remainingPath))
+        matches &= candidate.path[index] == component;
+      if (matches) {
+        sourceField = &candidate;
+        break;
+      }
+    }
+    if (!sourceField || sourceField->width != refresh.width)
+      return site->emitOpError()
+             << "HWIR child input field source lacks packed layout";
+    refresh.sourceLow = sourceField->low;
+    return refresh;
+  }
+
   ConcreteValueId addSyntheticValue(
       ConcreteModulePlan &module, ConcreteValueKind kind, ConcreteTypePlan type,
       std::string cppName,
       std::optional<ConcreteValueId> availabilityParent = std::nullopt,
       std::optional<uint64_t> tableLane = std::nullopt) {
     ConcreteValueId id = module.values.size();
-    module.values.push_back(
-        {id, kind, std::move(type), std::move(cppName), availabilityParent,
-         tableLane});
+    module.values.push_back({id, kind, std::move(type), std::move(cppName),
+                             availabilityParent, tableLane});
     return id;
   }
 
@@ -1101,32 +1188,51 @@ private:
       return compute;
     }
     if (auto view = dyn_cast<hwir::TableViewOp>(operation)) {
-      ConcreteComputePlan compute{ConcreteComputeKind::TableView, view.getKind().str(), {}, {}, std::nullopt};
-      auto shape = analysis.getTableShape(view.getInput().getType(), module.bindings, view);
-      auto outShape = analysis.getTableShape(view.getResult().getType(), module.bindings, view);
+      ConcreteComputePlan compute{ConcreteComputeKind::TableView,
+                                  view.getKind().str(),
+                                  {},
+                                  {},
+                                  std::nullopt};
+      auto shape = analysis.getTableShape(view.getInput().getType(),
+                                          module.bindings, view);
+      auto outShape = analysis.getTableShape(view.getResult().getType(),
+                                             module.bindings, view);
       if (failed(shape) || failed(outShape))
         return failure();
-      for (uint64_t lane = 0, count = shapeProduct(*outShape); lane < count; ++lane) {
+      for (uint64_t lane = 0, count = shapeProduct(*outShape); lane < count;
+           ++lane) {
         auto mapped = [&]() -> FailureOr<uint64_t> {
-          // Reuse the shared ACIR view mapping through a temporary operation-shaped
-          // calculation; the HWIR operation carries the same canonical attributes.
+          // Reuse the shared ACIR view mapping through a temporary
+          // operation-shaped calculation; the HWIR operation carries the same
+          // canonical attributes.
           SmallVector<uint64_t> coords(outShape->size()), source(shape->size());
           uint64_t ordinal = lane;
-          for (size_t i = outShape->size(); i-- > 0;) { coords[i] = ordinal % (*outShape)[i]; ordinal /= (*outShape)[i]; }
+          for (size_t i = outShape->size(); i-- > 0;) {
+            coords[i] = ordinal % (*outShape)[i];
+            ordinal /= (*outShape)[i];
+          }
           source = coords;
           auto params = view.getParameters();
           if (view.getKind() == "reshape")
             return lane;
           else if (view.getKind() == "slice") {
-            auto offsets = params.getAs<ArrayAttr>("offsets"); auto strides = params.getAs<ArrayAttr>("strides");
-            if (!offsets || !strides) return failure();
+            auto offsets = params.getAs<ArrayAttr>("offsets");
+            auto strides = params.getAs<ArrayAttr>("strides");
+            if (!offsets || !strides)
+              return failure();
             for (unsigned i = 0; i < source.size(); ++i) {
-              auto o = dyn_cast<ac::StaticExprAttr>(offsets[i]); auto s = dyn_cast<ac::StaticExprAttr>(strides[i]);
-              if (!o || !s) return failure();
-              auto ov = analysis.evaluateStatic(o, module.bindings, view); auto sv = analysis.evaluateStatic(s, module.bindings, view);
-              if (failed(ov) || failed(sv)) return failure();
-              auto oi = dyn_cast<ac::MathIntAttr>(*ov); auto si = dyn_cast<ac::MathIntAttr>(*sv);
-              if (!oi || !si) return failure();
+              auto o = dyn_cast<ac::StaticExprAttr>(offsets[i]);
+              auto s = dyn_cast<ac::StaticExprAttr>(strides[i]);
+              if (!o || !s)
+                return failure();
+              auto ov = analysis.evaluateStatic(o, module.bindings, view);
+              auto sv = analysis.evaluateStatic(s, module.bindings, view);
+              if (failed(ov) || failed(sv))
+                return failure();
+              auto oi = dyn_cast<ac::MathIntAttr>(*ov);
+              auto si = dyn_cast<ac::MathIntAttr>(*sv);
+              if (!oi || !si)
+                return failure();
               llvm::APSInt offsetValue(oi.getCanonicalValue());
               llvm::APSInt strideValue(si.getCanonicalValue());
               if (offsetValue.isNegative() || strideValue.isNegative() ||
@@ -1142,9 +1248,9 @@ private:
               return view.emitOpError() << "table transpose has invalid axes";
             for (unsigned i = 0; i < source.size(); ++i) {
               auto axis = dyn_cast<ac::StaticExprAttr>(axes[i]);
-              auto value = axis ? analysis.evaluateStatic(
-                                      axis, module.bindings, view)
-                                : FailureOr<Attribute>(failure());
+              auto value =
+                  axis ? analysis.evaluateStatic(axis, module.bindings, view)
+                       : FailureOr<Attribute>(failure());
               auto integer = succeeded(value)
                                  ? dyn_cast<ac::MathIntAttr>(*value)
                                  : ac::MathIntAttr();
@@ -1161,12 +1267,12 @@ private:
           } else if (view.getKind() == "rotate") {
             auto axis = dyn_cast<ac::StaticExprAttr>(params.get("axis"));
             auto offset = dyn_cast<ac::StaticExprAttr>(params.get("offset"));
-            auto axisValue = axis ? analysis.evaluateStatic(
-                                        axis, module.bindings, view)
-                                  : FailureOr<Attribute>(failure());
-            auto offsetValue = offset ? analysis.evaluateStatic(
-                                            offset, module.bindings, view)
-                                      : FailureOr<Attribute>(failure());
+            auto axisValue =
+                axis ? analysis.evaluateStatic(axis, module.bindings, view)
+                     : FailureOr<Attribute>(failure());
+            auto offsetValue =
+                offset ? analysis.evaluateStatic(offset, module.bindings, view)
+                       : FailureOr<Attribute>(failure());
             auto axisInteger = succeeded(axisValue)
                                    ? dyn_cast<ac::MathIntAttr>(*axisValue)
                                    : ac::MathIntAttr();
@@ -1189,59 +1295,82 @@ private:
             const unsigned bits = std::max<unsigned>(
                 65, shift.getBitWidth() + unsigned(shift.isUnsigned()));
             llvm::APInt modulus(bits, extent);
-            llvm::APInt extended = shift.isUnsigned()
-                                       ? shift.zextOrTrunc(bits)
-                                       : shift.sextOrTrunc(bits);
+            llvm::APInt extended = shift.isUnsigned() ? shift.zextOrTrunc(bits)
+                                                      : shift.sextOrTrunc(bits);
             llvm::APInt remainder = extended.srem(modulus);
             if (remainder.isNegative())
               remainder += modulus;
             source[ax] = (coords[ax] + remainder.getZExtValue()) % extent;
           } else {
-            return view.emitOpError() << "unsupported table view kind '"
-                                      << view.getKind() << "'";
+            return view.emitOpError()
+                   << "unsupported table view kind '" << view.getKind() << "'";
           }
-          uint64_t mappedOrdinal = 0; for (unsigned i = 0; i < source.size(); ++i) mappedOrdinal = mappedOrdinal * (*shape)[i] + source[i]; return mappedOrdinal;
+          uint64_t mappedOrdinal = 0;
+          for (unsigned i = 0; i < source.size(); ++i)
+            mappedOrdinal = mappedOrdinal * (*shape)[i] + source[i];
+          return mappedOrdinal;
         }();
-        if (failed(mapped)) return failure();
+        if (failed(mapped))
+          return failure();
         compute.laneMap.push_back(*mapped);
       }
       return compute;
     }
     if (auto index = dyn_cast<hwir::TableIndexOp>(operation)) {
-      ConcreteComputePlan compute{ConcreteComputeKind::TableIndex, "index", {}, {}, std::nullopt};
-      auto shape = analysis.resolveShape(index.getShape(), module.bindings, index);
-      if (failed(shape)) return failure();
+      ConcreteComputePlan compute{
+          ConcreteComputeKind::TableIndex, "index", {}, {}, std::nullopt};
+      auto shape =
+          analysis.resolveShape(index.getShape(), module.bindings, index);
+      if (failed(shape))
+        return failure();
       compute.laneMap.append(shape->begin(), shape->end());
       return compute;
     }
     if (isa<hwir::TableMatchOp>(operation))
-      return ConcreteComputePlan{ConcreteComputeKind::TableMatch, "match", {}, {}, std::nullopt};
+      return ConcreteComputePlan{
+          ConcreteComputeKind::TableMatch, "match", {}, {}, std::nullopt};
     if (auto choose = dyn_cast<hwir::TableChooseOp>(operation))
-      return ConcreteComputePlan{ConcreteComputeKind::TableChoose, choose.getOrder().str(), {}, {},
+      return ConcreteComputePlan{ConcreteComputeKind::TableChoose,
+                                 choose.getOrder().str(),
+                                 {},
+                                 {},
                                  static_cast<uint64_t>(choose.getCount())};
     if (auto fold = dyn_cast<hwir::TableFoldOp>(operation))
-      return ConcreteComputePlan{ConcreteComputeKind::TableFold, fold.getKind().str(), {}, {}, std::nullopt};
+      return ConcreteComputePlan{ConcreteComputeKind::TableFold,
+                                 fold.getKind().str(),
+                                 {},
+                                 {},
+                                 std::nullopt};
     if (auto merge = dyn_cast<hwir::ValueMergeOp>(operation)) {
-      ConcreteComputePlan compute{ConcreteComputeKind::ValueMerge, "merge", {}, {}, std::nullopt};
-      auto baseType = concreteType(merge.getBase().getType(), module.bindings,
-                                   merge);
+      ConcreteComputePlan compute{
+          ConcreteComputeKind::ValueMerge, "merge", {}, {}, std::nullopt};
+      auto baseType =
+          concreteType(merge.getBase().getType(), module.bindings, merge);
       if (failed(baseType))
         return failure();
       for (Attribute raw : merge.getPaths()) {
         auto path = cast<ArrayAttr>(raw);
         uint64_t low = std::numeric_limits<uint64_t>::max(), high = 0;
         for (const auto &field : baseType->fields) {
-          if (path.size() > field.path.size()) continue;
+          if (path.size() > field.path.size())
+            continue;
           bool prefix = true;
           for (auto [i, component] : llvm::enumerate(path))
             prefix &= cast<StringAttr>(component).getValue() == field.path[i];
-          if (!prefix) continue;
-          low = std::min(low, field.low); high = std::max(high, field.low + field.width);
+          if (!prefix)
+            continue;
+          low = std::min(low, field.low);
+          high = std::max(high, field.low + field.width);
         }
-        if (path.empty()) { low = 0; high = concreteWidth(merge.getBase().getType(), module, merge); }
+        if (path.empty()) {
+          low = 0;
+          high = concreteWidth(merge.getBase().getType(), module, merge);
+        }
         if (low == std::numeric_limits<uint64_t>::max() || high <= low)
-          return merge.emitOpError() << "structural C++ cannot resolve merge field path";
-        compute.laneMap.push_back(low); compute.laneMap.push_back(high - low);
+          return merge.emitOpError()
+                 << "structural C++ cannot resolve merge field path";
+        compute.laneMap.push_back(low);
+        compute.laneMap.push_back(high - low);
       }
       return compute;
     }
@@ -1549,14 +1678,19 @@ private:
   }
 
   template <typename TableMatchT>
-  LogicalResult unrollTableMatch(TableMatchT match, ConcreteModulePlan &module) {
-    auto shape = analysis.getTableShape(match.getInput().getType(), module.bindings, match);
-    if (failed(shape)) return failure();
+  LogicalResult unrollTableMatch(TableMatchT match,
+                                 ConcreteModulePlan &module) {
+    auto shape = analysis.getTableShape(match.getInput().getType(),
+                                        module.bindings, match);
+    if (failed(shape))
+      return failure();
     uint64_t lanes = shapeProduct(*shape);
     auto maskId = valueId(module, match.getMask(), match);
-    if (failed(maskId)) return failure();
+    if (failed(maskId))
+      return failure();
     auto inputId = valueId(module, match.getInput(), match);
-    if (failed(inputId)) return failure();
+    if (failed(inputId))
+      return failure();
     Block &body = match.getBody().front();
     if (body.empty() || !isa<hwir::YieldOp>(body.back()))
       return match.emitOpError() << "table.match body has no hwir.yield";
@@ -1565,16 +1699,20 @@ private:
     predicates.reserve(lanes);
     for (uint64_t lane = 0; lane < lanes; ++lane) {
       llvm::DenseMap<Value, ConcreteValueId> local;
-      auto element = concreteType(body.getArgument(0).getType(), module.bindings, match);
-      if (failed(element)) return failure();
-      local[body.getArgument(0)] = addSyntheticValue(
-          module, ConcreteValueKind::TableElement, *element,
-          (Twine(module.values[*inputId].cppName) + ".element(" + Twine(lane) +
-           ")")
-              .str(),
-          *inputId, lane);
+      auto element =
+          concreteType(body.getArgument(0).getType(), module.bindings, match);
+      if (failed(element))
+        return failure();
+      local[body.getArgument(0)] =
+          addSyntheticValue(module, ConcreteValueKind::TableElement, *element,
+                            (Twine(module.values[*inputId].cppName) +
+                             ".element(" + Twine(lane) + ")")
+                                .str(),
+                            *inputId, lane);
       for (auto [i, capture] : llvm::enumerate(match.getCaptures())) {
-        auto id = valueId(module, capture, match); if (failed(id)) return failure();
+        auto id = valueId(module, capture, match);
+        if (failed(id))
+          return failure();
         local[body.getArgument(i + 1)] = *id;
       }
       for (Operation &nested : body.without_terminator()) {
@@ -1583,21 +1721,32 @@ private:
         step.operation = &nested;
         for (Value operand : nested.getOperands()) {
           auto found = local.find(operand);
-          if (found == local.end()) return nested.emitOpError() << "table.match body operand is not closed";
+          if (found == local.end())
+            return nested.emitOpError()
+                   << "table.match body operand is not closed";
           step.inputs.push_back(found->second);
         }
         for (Value result : nested.getResults()) {
           auto type = concreteType(result.getType(), module.bindings, &nested);
-          if (failed(type)) return failure();
-          auto id = addSyntheticValue(module, ConcreteValueKind::OperationResult, *type,
-                                      (Twine("match_value_") + Twine(lane) + "_" + Twine(module.values.size())).str());
-          step.outputs.push_back(id); local[result] = id;
+          if (failed(type))
+            return failure();
+          auto id = addSyntheticValue(module,
+                                      ConcreteValueKind::OperationResult, *type,
+                                      (Twine("match_value_") + Twine(lane) +
+                                       "_" + Twine(module.values.size()))
+                                          .str());
+          step.outputs.push_back(id);
+          local[result] = id;
         }
-        auto compute = computePlan(&nested, module); if (failed(compute)) return failure();
-        step.compute = std::move(*compute); module.concreteSchedule.steps.push_back(std::move(step));
+        auto compute = computePlan(&nested, module);
+        if (failed(compute))
+          return failure();
+        step.compute = std::move(*compute);
+        module.concreteSchedule.steps.push_back(std::move(step));
       }
       auto found = local.find(yield.getValues().front());
-      if (found == local.end()) return match.emitOpError() << "table.match yield is not closed";
+      if (found == local.end())
+        return match.emitOpError() << "table.match yield is not closed";
       predicates.push_back(found->second);
     }
     ConcreteScheduleStep aggregate;
@@ -1605,7 +1754,8 @@ private:
     aggregate.operation = match;
     aggregate.inputs.append(predicates.begin(), predicates.end());
     aggregate.outputs.push_back(*maskId);
-    aggregate.compute = ConcreteComputePlan{ConcreteComputeKind::TableMatch, "match", {}, {}, std::nullopt};
+    aggregate.compute = ConcreteComputePlan{
+        ConcreteComputeKind::TableMatch, "match", {}, {}, std::nullopt};
     module.concreteSchedule.steps.push_back(std::move(aggregate));
     return success();
   }
@@ -1739,12 +1889,10 @@ private:
             bool projected = false;
             if (ordinary && child.moduleIndex && !child.laneIndex) {
               Value result = operation->getResult(output.port);
-              auto childOutput = plan.modules[*child.moduleIndex]
-                                     .outputs[output.port]
-                                     .type;
+              auto childOutput =
+                  plan.modules[*child.moduleIndex].outputs[output.port].type;
               auto dependencies = plan.modules[*child.moduleIndex]
-                                      .key.definition
-                                      ->getAttrOfType<ArrayAttr>(
+                                      .key.definition->getAttrOfType<ArrayAttr>(
                                           "hwir.output_dependencies");
               if (!dependencies)
                 return operation->emitOpError()
@@ -1753,6 +1901,22 @@ private:
                   [&](Value value, ArrayRef<StringRef> prefix) {
                     bool sawUse = false;
                     for (OpOperand &use : value.getUses()) {
+                      if (isa<ac::RuleOp, hwir::RuleOp>(use.getOwner()) &&
+                          !use.getOwner()->getRegion(0).empty() &&
+                          use.getOperandNumber() < use.getOwner()
+                                                       ->getRegion(0)
+                                                       .front()
+                                                       .getNumArguments()) {
+                        sawUse = true;
+                        if (failed(
+                                visit(use.getOwner()
+                                          ->getRegion(0)
+                                          .front()
+                                          .getArgument(use.getOperandNumber()),
+                                      prefix)))
+                          return failure();
+                        continue;
+                      }
                       auto get = dyn_cast<ac::StructGetOp>(use.getOwner());
                       if (!get || get.getValue() != value)
                         return failure();
@@ -1789,21 +1953,21 @@ private:
                             << "HWIR child output field lacks packed layout";
                         return failure();
                       }
-                      SmallVector<unsigned, 2> refreshInputs;
+                      SmallVector<ConcreteRefreshInput, 2> refreshInputs;
                       bool covered = false;
                       for (Attribute raw : dependencies) {
                         auto row = dyn_cast<DictionaryAttr>(raw);
-                        auto endpoint = row
-                                            ? row.getAs<DictionaryAttr>("output")
-                                            : DictionaryAttr();
+                        auto endpoint =
+                            row ? row.getAs<DictionaryAttr>("output")
+                                : DictionaryAttr();
                         auto port = endpoint
                                         ? endpoint.getAs<IntegerAttr>("port")
                                         : IntegerAttr();
-                        auto outputPath = endpoint
-                                              ? endpoint.getAs<ArrayAttr>("path")
-                                              : ArrayAttr();
-                        auto inputs = row ? row.getAs<ArrayAttr>("inputs")
-                                          : ArrayAttr();
+                        auto outputPath =
+                            endpoint ? endpoint.getAs<ArrayAttr>("path")
+                                     : ArrayAttr();
+                        auto inputs =
+                            row ? row.getAs<ArrayAttr>("inputs") : ArrayAttr();
                         if (!port || !outputPath || !inputs ||
                             port.getValue().getZExtValue() != output.port ||
                             outputPath.size() != path.size())
@@ -1818,18 +1982,36 @@ private:
                         covered = true;
                         for (Attribute inputRaw : inputs) {
                           auto input = dyn_cast<DictionaryAttr>(inputRaw);
-                          auto inputPort = input
-                                                ? input.getAs<IntegerAttr>("port")
-                                                : IntegerAttr();
-                          if (!inputPort ||
+                          auto inputPort =
+                              input ? input.getAs<IntegerAttr>("port")
+                                    : IntegerAttr();
+                          auto inputPath = input
+                                               ? input.getAs<ArrayAttr>("path")
+                                               : ArrayAttr();
+                          if (!inputPort || !inputPath ||
                               inputPort.getValue().getActiveBits() > 32) {
                             operation->emitOpError()
                                 << "HWIR child has malformed dependency facts";
                             return failure();
                           }
-                          unsigned ordinal = inputPort.getValue().getZExtValue();
-                          if (!llvm::is_contained(refreshInputs, ordinal))
-                            refreshInputs.push_back(ordinal);
+                          unsigned ordinal =
+                              inputPort.getValue().getZExtValue();
+                          SmallVector<StringRef, 4> path;
+                          for (Attribute rawComponent : inputPath) {
+                            auto component = dyn_cast<StringAttr>(rawComponent);
+                            if (!component) {
+                              operation->emitOpError()
+                                  << "HWIR child has malformed dependency "
+                                     "facts";
+                              return failure();
+                            }
+                            path.push_back(component.getValue());
+                          }
+                          auto refresh = materializeRefreshInput(
+                              module, child, ordinal, path, operation);
+                          if (failed(refresh))
+                            return failure();
+                          refreshInputs.push_back(std::move(*refresh));
                         }
                       }
                       if (!covered) {
@@ -1847,7 +2029,11 @@ private:
                       fieldStep.childIndex = childIndex;
                       fieldStep.portIndex = output.port;
                       fieldStep.fieldLow = field->low;
-                      fieldStep.refreshInputPorts = std::move(refreshInputs);
+                      for (const ConcreteRefreshInput &refresh : refreshInputs)
+                        if (!llvm::is_contained(fieldStep.inputs,
+                                                refresh.source))
+                          fieldStep.inputs.push_back(refresh.source);
+                      fieldStep.refreshInputs = std::move(refreshInputs);
                       fieldStep.outputs.push_back(*outputId);
                       module.concreteSchedule.steps.push_back(
                           std::move(fieldStep));
@@ -1929,7 +2115,8 @@ private:
       bool forwardedStructField = false;
       if (auto get = dyn_cast<ac::StructGetOp>(operation)) {
         if (auto create = get.getValue().getDefiningOp<ac::StructCreateOp>()) {
-          auto declaration = analysis.lookupStruct(create.getResult().getType());
+          auto declaration =
+              analysis.lookupStruct(create.getResult().getType());
           if (!declaration)
             return get.emitOpError()
                    << "cannot resolve struct.create field forwarding";
@@ -1942,9 +2129,12 @@ private:
             if (failed(id))
               return failure();
             step.inputs.push_back(*id);
-            step.compute = ConcreteComputePlan{
-                ConcreteComputeKind::PackedIdentity, "identity", {}, {},
-                std::nullopt};
+            step.compute =
+                ConcreteComputePlan{ConcreteComputeKind::PackedIdentity,
+                                    "identity",
+                                    {},
+                                    {},
+                                    std::nullopt};
             forwardedStructField = true;
             break;
           }
@@ -2053,14 +2243,6 @@ private:
              step.kind == ConcreteScheduleStepKind::InvokePrimitiveWork))
           ready = step.childIndex &&
                   driven[*step.childIndex] == driveCounts[*step.childIndex];
-        if (ready && step.kind ==
-                         ConcreteScheduleStepKind::ReadChildOutputField) {
-          ready = step.childIndex &&
-                  llvm::all_of(step.refreshInputPorts, [&](unsigned input) {
-                    return input < drivenPorts[*step.childIndex].size() &&
-                           drivenPorts[*step.childIndex][input];
-                  });
-        }
         if (ready &&
             (step.kind == ConcreteScheduleStepKind::ReadChildOutput ||
              step.kind == ConcreteScheduleStepKind::ReadPrimitiveOutput)) {
@@ -2083,18 +2265,16 @@ private:
           } else if (step.kind ==
                          ConcreteScheduleStepKind::ReadPrimitiveOutput &&
                      step.childIndex && step.portIndex) {
-            const ConcreteChildPlan &child =
-                module.children[*step.childIndex];
-            ready = child.primitive &&
-                    *step.portIndex <
-                        child.primitive->outputRefreshInputs.size() &&
-                    llvm::all_of(
-                        child.primitive
-                            ->outputRefreshInputs[*step.portIndex],
-                        [&](unsigned input) {
-                          return input < drivenPorts[*step.childIndex].size() &&
-                                 drivenPorts[*step.childIndex][input];
-                        });
+            const ConcreteChildPlan &child = module.children[*step.childIndex];
+            ready =
+                child.primitive &&
+                *step.portIndex < child.primitive->outputRefreshInputs.size() &&
+                llvm::all_of(
+                    child.primitive->outputRefreshInputs[*step.portIndex],
+                    [&](unsigned input) {
+                      return input < drivenPorts[*step.childIndex].size() &&
+                             drivenPorts[*step.childIndex][input];
+                    });
           } else {
             ready = step.childIndex && invoked[*step.childIndex];
           }
@@ -2208,10 +2388,8 @@ private:
       // A packed aggregate output is also published one top-level field at a
       // time. This projection is what RefreshPureOutputs uses when different
       // fields have different input/temporal dependencies.
-      Value yielded = moduleBody(module.key.definition)
-                          .front()
-                          .back()
-                          .getOperand(port);
+      Value yielded =
+          moduleBody(module.key.definition).front().back().getOperand(port);
       yielded = flattenRegionValue(yielded);
       auto create = yielded.getDefiningOp<ac::StructCreateOp>();
       auto declaration =
@@ -2227,8 +2405,7 @@ private:
         Attribute rawField = fields[fieldIndex];
         auto field = cast<DictionaryAttr>(rawField);
         auto width = analysis.getPackedWidth(
-            field.getAs<TypeAttr>("type").getValue(), module.bindings,
-            create);
+            field.getAs<TypeAttr>("type").getValue(), module.bindings, create);
         if (failed(width))
           return failure();
         auto input = valueId(module, create.getValues()[fieldIndex], create);
@@ -2355,19 +2532,15 @@ private:
         case ConcreteScheduleStepKind::MaterializeOutput:
           break;
         case ConcreteScheduleStepKind::ReadChildOutputField:
-          admit = step.childIndex &&
-                  llvm::all_of(step.refreshInputPorts, [&](unsigned input) {
-                    return input < pureDriven[*step.childIndex].size() &&
-                           pureDriven[*step.childIndex][input];
-                  });
+          admit = step.childIndex.has_value();
           break;
         case ConcreteScheduleStepKind::ReadChildOutput:
           if (step.childIndex && step.portIndex) {
             const ConcreteChildPlan &child = module.children[*step.childIndex];
             const auto &temporal =
                 plan.modules[*child.moduleIndex].outputIsTemporal;
-            admit = *step.portIndex < temporal.size() &&
-                    temporal[*step.portIndex];
+            admit =
+                *step.portIndex < temporal.size() && temporal[*step.portIndex];
           } else {
             admit = false;
           }
@@ -2381,8 +2554,7 @@ private:
                     (*step.portIndex <
                          child.primitive->outputRefreshInputs.size() &&
                      llvm::all_of(
-                         child.primitive
-                             ->outputRefreshInputs[*step.portIndex],
+                         child.primitive->outputRefreshInputs[*step.portIndex],
                          [&](unsigned input) {
                            return input < pureDriven[*step.childIndex].size() &&
                                   pureDriven[*step.childIndex][input];
@@ -2535,18 +2707,23 @@ private:
         Attribute location = expect.getLocation();
         Attribute checkId = expect->getAttr("ac.check_id");
         auto locationJson = emissionMetadataJson(
-            location ? location : metadataBuilder.getDictionaryAttr({}), expect);
+            location ? location : metadataBuilder.getDictionaryAttr({}),
+            expect);
         auto checkIdJson = emissionMetadataJson(
             checkId ? checkId : metadataBuilder.getDictionaryAttr({}), expect);
         if (failed(locationJson) || failed(checkIdJson))
           return failure();
         auto message = expect->getAttrOfType<StringAttr>("ac.message");
         ConcreteCheckPlan check{
-            static_cast<unsigned>(moduleIndex), *condition, *path,
-            expect.getKind().str(), {},
+            static_cast<unsigned>(moduleIndex),
+            *condition,
+            *path,
+            expect.getKind().str(),
+            {},
             message ? message.getValue().str()
                     : ("source " + expect.getKind() + " check failed").str(),
-            std::move(*locationJson), std::move(*checkIdJson)};
+            std::move(*locationJson),
+            std::move(*checkIdJson)};
         plan.checks.push_back(std::move(check));
       }
       for (auto expect :
@@ -2559,18 +2736,23 @@ private:
         Attribute location = expect.getLocation().value_or(DictionaryAttr());
         Attribute checkId = expect->getAttr("ac.check_id");
         auto locationJson = emissionMetadataJson(
-            location ? location : metadataBuilder.getDictionaryAttr({}), expect);
+            location ? location : metadataBuilder.getDictionaryAttr({}),
+            expect);
         auto checkIdJson = emissionMetadataJson(
             checkId ? checkId : metadataBuilder.getDictionaryAttr({}), expect);
         if (failed(locationJson) || failed(checkIdJson))
           return failure();
         auto message = expect->getAttrOfType<StringAttr>("ac.message");
         ConcreteCheckPlan check{
-            static_cast<unsigned>(moduleIndex), *condition, *path,
-            expect.getKind().str(), {},
+            static_cast<unsigned>(moduleIndex),
+            *condition,
+            *path,
+            expect.getKind().str(),
+            {},
             message ? message.getValue().str()
                     : ("source " + expect.getKind() + " check failed").str(),
-            std::move(*locationJson), std::move(*checkIdJson)};
+            std::move(*locationJson),
+            std::move(*checkIdJson)};
         for (Value sample : expect.getSampling()) {
           auto id = valueId(module, sample, expect);
           if (failed(id))
@@ -3199,8 +3381,7 @@ private:
       if (!inputs || !outputs || !defaults ||
           inputs.getValue().getActiveBits() > 64 ||
           outputs.getValue().getActiveBits() > 64)
-        return definition->emitOpError()
-               << "HWIR interface is not concrete";
+        return definition->emitOpError() << "HWIR interface is not concrete";
       module.publicInputCount = inputs.getValue().getZExtValue();
       module.publicOutputCount = outputs.getValue().getZExtValue();
       for (Attribute raw : defaults) {
@@ -3213,7 +3394,7 @@ private:
     }
     auto domain = definition->getAttrOfType<DictionaryAttr>(
         package->hasAttr("hwir.contract") ? "hwir.domain_inputs"
-                                           : "ac.domain_inputs");
+                                          : "ac.domain_inputs");
     if (domain && !domain.empty()) {
       auto clock = domain.getAs<IntegerAttr>("clock");
       auto reset = domain.getAs<IntegerAttr>("reset");
@@ -3224,15 +3405,16 @@ private:
       module.resetInput = reset.getValue().getZExtValue();
     }
     auto rootKind = definition->getAttrOfType<StringAttr>(
-        package->hasAttr("hwir.contract") ? "hwir.root_kind"
-                                           : "ac.root_kind");
+        package->hasAttr("hwir.contract") ? "hwir.root_kind" : "ac.root_kind");
     module.closedSystem = rootKind && rootKind.getValue() == "system";
     if (module.publicInputCount > boundaryType.getNumInputs() ||
         module.publicOutputCount > boundaryType.getNumResults() ||
         module.rootInputDefaults.size() !=
             boundaryType.getNumInputs() - module.publicInputCount ||
-        (module.clockInput && *module.clockInput >= boundaryType.getNumInputs()) ||
-        (module.resetInput && *module.resetInput >= boundaryType.getNumInputs()) ||
+        (module.clockInput &&
+         *module.clockInput >= boundaryType.getNumInputs()) ||
+        (module.resetInput &&
+         *module.resetInput >= boundaryType.getNumInputs()) ||
         (module.clockInput && module.resetInput &&
          *module.clockInput == *module.resetInput))
       return definition->emitOpError()
@@ -3701,8 +3883,7 @@ LogicalResult verifyConcreteDesignPlan(const ConcreteDesignPlan &plan) {
         if (child.primitive->inputMembers.size() != child.inputs.size() ||
             child.primitive->outputMembers.size() != child.outputs.size() ||
             child.primitive->outputIsTemporal.size() != child.outputs.size() ||
-            child.primitive->outputRefreshInputs.size() !=
-                child.outputs.size())
+            child.primitive->outputRefreshInputs.size() != child.outputs.size())
           return child.occurrence->emitOpError()
                  << "structural C++ primitive plan has an invalid pin schema";
       }
@@ -3727,6 +3908,27 @@ LogicalResult verifyConcreteDesignPlan(const ConcreteDesignPlan &plan) {
       if (step.childIndex && *step.childIndex >= module.children.size())
         return step.operation->emitOpError()
                << "structural C++ schedule has an invalid child index";
+      for (const ConcreteRefreshInput &refresh : step.refreshInputs)
+        if (!step.childIndex ||
+            !module.children[*step.childIndex].moduleIndex ||
+            refresh.port >= module.children[*step.childIndex].inputs.size() ||
+            refresh.source >= module.values.size() || refresh.width == 0 ||
+            (refresh.targetLow &&
+             (*refresh.targetLow >
+                  plan.modules[*module.children[*step.childIndex].moduleIndex]
+                      .inputs[refresh.port]
+                      .type.packedWidth ||
+              refresh.width >
+                  plan.modules[*module.children[*step.childIndex].moduleIndex]
+                          .inputs[refresh.port]
+                          .type.packedWidth -
+                      *refresh.targetLow)) ||
+            refresh.sourceLow >
+                module.values[refresh.source].type.packedWidth ||
+            refresh.width > module.values[refresh.source].type.packedWidth -
+                                refresh.sourceLow)
+          return step.operation->emitOpError()
+                 << "structural C++ schedule has an invalid child refresh";
       if (step.kind != ConcreteScheduleStepKind::ComputeValue)
         continue;
       if (!step.compute ||
@@ -3784,31 +3986,37 @@ LogicalResult verifyConcreteDesignPlan(const ConcreteDesignPlan &plan) {
       case ConcreteComputeKind::TableView:
         if (step.inputs.size() != 1 || step.outputs.size() != 1 ||
             compute.laneMap.empty())
-          return step.operation->emitOpError() << "structural C++ has an invalid table view mapping";
+          return step.operation->emitOpError()
+                 << "structural C++ has an invalid table view mapping";
         break;
       case ConcreteComputeKind::TableIndex:
         if (step.inputs.empty() || step.outputs.size() != 1 ||
             compute.laneMap.size() != step.inputs.size())
-          return step.operation->emitOpError() << "structural C++ has an invalid table index mapping";
+          return step.operation->emitOpError()
+                 << "structural C++ has an invalid table index mapping";
         break;
       case ConcreteComputeKind::TableMatch:
         if (step.inputs.empty() || step.outputs.size() != 1)
-          return step.operation->emitOpError() << "structural C++ has an invalid table match mapping";
+          return step.operation->emitOpError()
+                 << "structural C++ has an invalid table match mapping";
         break;
       case ConcreteComputeKind::TableChoose:
         if (step.inputs.size() != 2 || !compute.immediate ||
             step.outputs.size() != *compute.immediate * 2)
-          return step.operation->emitOpError() << "structural C++ has an invalid table choose mapping";
+          return step.operation->emitOpError()
+                 << "structural C++ has an invalid table choose mapping";
         break;
       case ConcreteComputeKind::TableFold:
         if (step.inputs.size() != 1 || step.outputs.size() != 1)
-          return step.operation->emitOpError() << "structural C++ has an invalid table fold mapping";
+          return step.operation->emitOpError()
+                 << "structural C++ has an invalid table fold mapping";
         break;
       case ConcreteComputeKind::ValueMerge:
         if (step.outputs.size() != 2 || step.inputs.empty() ||
             (step.inputs.size() - 1) % 2 ||
             compute.laneMap.size() != step.inputs.size() - 1)
-          return step.operation->emitOpError() << "structural C++ has an invalid value merge mapping";
+          return step.operation->emitOpError()
+                 << "structural C++ has an invalid value merge mapping";
         break;
       case ConcreteComputeKind::BitsUnary:
       case ConcreteComputeKind::BitsBinary:

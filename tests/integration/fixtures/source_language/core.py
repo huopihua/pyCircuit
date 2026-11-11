@@ -18,5 +18,5 @@ class Core:
         self.advance()
 
     @rule
-    def advance(self):
+    def advance(self) -> None:
         self.left_request = Request(1, not self.left_request.valid)

@@ -97,7 +97,8 @@ verifyBodySnapshotsAgainstAuthority(ModuleOp body, ModuleOp owningHeader,
         operation.getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName());
     auto snapshotOwner = ac::detail::declarationSourceOwner(&operation);
     bool localDefinition =
-        isa<ac::StructOp, ac::EnumOp, func::FuncOp>(operation) && role &&
+        isa<ac::TypeAliasOp, ac::ConstantOp, ac::StructOp, ac::EnumOp,
+            func::FuncOp>(operation) && role &&
         role.getValue() == "definition" && snapshotOwner == owner;
     if (!role || (role.getValue() != "import_snapshot" && !localDefinition) ||
         !symbol || !snapshotOwner)

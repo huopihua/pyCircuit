@@ -1,6 +1,6 @@
 #include "gfsim/SimExecutor.h"
 #include "gfsim/SystemRunner.h"
-#include "pycircuit_system.hpp"
+#include "design.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -408,7 +408,7 @@ void fourState(unsigned workers) {
 }
 void directAndTerminal(unsigned workers) {
   Row r{0, 0, 0, token(binary(255, Width)), 0};
-  auto drive = [&](pyc_root &root, const Row &x) {
+  auto drive = [&](auto &root, const Row &x) {
     auto p = inputs(x);
     root.pyc_7079635f636c6b = p.pyc_7079635f636c6b;
     root.pyc_7079635f727374 = p.pyc_7079635f727374;
@@ -416,8 +416,8 @@ void directAndTerminal(unsigned workers) {
     root.data = p.data;
     root.take = p.take;
   };
-  gfsim::WorkExecutor pool(workers);
-  pyc_root root("discard", &pool);
+  pyc_dut probe(workers);
+  auto &root = probe.root();
   root.Build();
   drive(root, r);
   root.Reset();

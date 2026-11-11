@@ -1,5 +1,5 @@
 #include "gfsim/SystemRunner.h"
-#include "pycircuit_system.hpp"
+#include "design.hpp"
 #include <array>
 #include <algorithm>
 #include <cstdint>
@@ -224,8 +224,8 @@ void writeRows(const std::vector<Row>&rows) {
   require(bool(file));
 }
 void nativeRollback(unsigned workers,const std::vector<Row>&rows) {
-  gfsim::WorkExecutor pool(workers);pyc_root root("dma-rollback",&pool);root.Build();
-  auto drive=[&](const pyc_dut::Inputs&p){root.pyc_7079635f636c6b=p.pyc_7079635f636c6b;root.pyc_7079635f727374=p.pyc_7079635f727374;root.seed_valid=p.seed_valid;root.seed=p.seed;root.copy_valid=p.copy_valid;root.copy=p.copy;root.check_valid=p.check_valid;root.check=p.check;root.take_seed=p.take_seed;root.take_copy=p.take_copy;root.take_check=p.take_check;};
+  pyc_dut rollback(workers);auto &root=rollback.root();root.Build();
+  auto drive=[&](const pyc_dut::Inputs&p){rollback.drive(p);};
   drive(inputs({}));root.Reset();root.Xfer();Oracle o;unsigned probes=0;
   for(unsigned i=0;i<rows.size();++i) {
     const auto&r=rows[i];auto e=o.output();

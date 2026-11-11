@@ -210,7 +210,7 @@ def test_module_loop_clean_rebuild_tracks_all_public_inputs_and_outputs(
         assert f"units/{imported}/unit.json" in root_query
         assert f"units/{imported}/{imported}.ac" not in root_query
 
-    for target in ("cpp", "verilog"):
+    for target in ("structural-cpp", "verilog"):
         emit_query = _run(
             [
                 ninja,
@@ -245,11 +245,12 @@ def test_module_loop_clean_rebuild_tracks_all_public_inputs_and_outputs(
         assert (unit / f"{stem}.d").is_file()
         assert (unit / "unit.json").is_file()
     assert (build / "module_loop.ac").is_file()
-    assert (build / "cpp" / "generated.json").is_file()
+    assert (build / "structural-cpp" / "generated.json").is_file()
     assert (build / "verilog" / "generated.json").is_file()
 
     generated_outputs = {
-        target: _generated_paths(build / target) for target in ("cpp", "verilog")
+        target: _generated_paths(build / target)
+        for target in ("structural-cpp", "verilog")
     }
     declared_artifacts = (
         tuple(
@@ -266,7 +267,7 @@ def test_module_loop_clean_rebuild_tracks_all_public_inputs_and_outputs(
     before_clean = _owned_files(declared_artifacts)
     all_destinations = tuple(outputs.values()) + (
         build / "module_loop.ac",
-        build / "cpp",
+        build / "structural-cpp",
         build / "verilog",
     )
     controls_before = _publication_controls(all_destinations)
@@ -286,7 +287,7 @@ def test_module_loop_clean_rebuild_tracks_all_public_inputs_and_outputs(
     for stem, unit in outputs.items():
         assert (unit / f"{stem}.d").is_file()
         assert (unit / "unit.json").is_file()
-    assert (build / "cpp" / "generated.json").is_file()
+    assert (build / "structural-cpp" / "generated.json").is_file()
     assert (build / "verilog" / "generated.json").is_file()
     after_rebuild = _owned_files(declared_artifacts)
     assert {path: payload for path, (_mtime, payload) in after_rebuild.items()} == {

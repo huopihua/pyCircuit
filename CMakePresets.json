@@ -13,11 +13,13 @@
       "binaryDir": "${sourceDir}/.pycircuit_out/toolchain/build",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "CMAKE_INSTALL_PREFIX": "${sourceDir}/.pycircuit_out/toolchain/install",
         "PYC_BUILD_COMPILER_DEV": "ON",
         "PYC_BUILD_TESTING": "ON",
         "PYC_BUILD_RUNTIME_LIB": "ON",
         "PYC_INSTALL_PYTHON": "ON",
+        "LLVM_EXTERNAL_LIT": "$env{LLVM_EXTERNAL_LIT}",
         "LLVM_DIR": "$env{LLVM_DIR}",
         "MLIR_DIR": "$env{MLIR_DIR}"
       }

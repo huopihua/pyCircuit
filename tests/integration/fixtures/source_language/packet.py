@@ -1,14 +1,18 @@
-"""Approved record source; compiler input, never eagerly imported by tests."""
+"""Approved nominal record source; compiler input, never eagerly imported."""
 
 from typing import Annotated
+
+from pycircuit import struct, u1, u8
 
 Word = Annotated[int, range(256)]
 
 
+@struct
 class Request:
-    value: Word
-    valid: bool
+    value: u8
+    valid: u1
 
-    def __init__(self, value: Word = 0, valid: bool = False):
-        self.value = value
-        self.valid = valid
+
+@struct
+class ProbeResult:
+    value: u8

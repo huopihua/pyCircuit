@@ -1,9 +1,7 @@
 # ruff: noqa: N802,F841
-from pycircuit import module
-
-from .types import Word
+from pycircuit import system, u8 as Word
 
 
-@module
+@system
 def ZeroRuleTop():
     retained: Word = 9

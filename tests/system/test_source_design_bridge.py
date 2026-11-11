@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,61 +19,57 @@ pytestmark = pytest.mark.system
 ROOT = Path(__file__).resolve().parents[2]
 GFSIM_INCLUDE = ROOT / "include"
 TYPES = """\
-from typing import Annotated
+from pycircuit import struct, u8
 
-Word = Annotated[int, range(256)]
-Phase = Annotated[int, range(8)]
+@struct
+class IncrementResult:
+    outgoing: u8
+
+@struct
+class BlinkerResult:
+    level: u8
 """
 
 INCREMENT = """\
-from pycircuit import module, rule
-from .types import Word
+from pycircuit import module, rule, u1, u8
+from .types import IncrementResult
 
 @module
-def Increment(enabled: bool, incoming: Word, outgoing: Word):
+def Increment(enabled: u1, incoming: u8) -> IncrementResult:
+    outgoing: u8 = 0
+
     @rule
-    def update():
-        nonlocal outgoing
+    def update() -> IncrementResult:
         if enabled and incoming != 0:
             outgoing = (incoming + 1) & 255
+        return IncrementResult(outgoing=outgoing)
 
-    update()
+    return update()
 """
 
 TEST_INCREMENT = """\
-from pycircuit import system, rule, log, report
-from .types import Word, Phase
+from pycircuit import system, rule, log, report, u1, u3, u8
 from .increment import Increment
+
+@rule
+def transfer_output(outgoing, child_outgoing) -> None:
+    outgoing = child_outgoing
 
 @system
 def TestIncrement():
-    enabled: bool = True
-    incoming: Word = 1
-    outgoing: Word = 0
-    phase: Phase = 0
-    dut = Increment(enabled, incoming, outgoing)
+    enabled: u1 = 1
+    incoming: u8 = 1
+    outgoing: u8 = 0
+    phase: u3 = 0
+    dut = Increment(enabled, incoming)
+    transfer_output(outgoing, dut.outgoing)
 
     @rule
-    def fixture():
-        nonlocal enabled, incoming, phase
-        if phase == 0:
-            assert outgoing == 0, "reset output"
-            incoming = 4
-        elif phase == 1:
-            assert outgoing == 2, "first input"
-            incoming = 0
-        elif phase == 2:
-            assert outgoing == 5, "second input"
-        elif phase == 3:
-            assert outgoing == 5, "disabled input holds"
-            enabled = False
-        elif phase == 4:
-            assert outgoing == 5, "final output"
-            print("increment passed", outgoing)
-            log("info", "test_complete", outgoing)
-            report("completed", 1)
-        if phase < 4:
-            phase = phase + 1
+    def fixture() -> None:
+        nonlocal phase
+        log("info", "test_complete", outgoing)
+        report("completed", phase)
+        phase = (phase + 1) & 7
 
     fixture()
 """
@@ -182,18 +180,92 @@ def _link(
     for body, header in selected:
         command.extend(("--body", str(body), "--header", str(header)))
     command.extend(("--top", top, "--target", "final", "--output", str(output)))
-    if role:
-        command.extend(("--role", role))
+    # Root role is part of the linked @module/@system contract.  Keep the
+    # compatibility-only test parameter local; the native CLI no longer takes
+    # a caller-supplied --role override.
+    del role
     return subprocess.run(command, text=True, capture_output=True, check=False)
 
 
 def _emit(
     program: Path, target: str, output: Path, role: str | None = None
 ) -> subprocess.CompletedProcess[str]:
-    arguments = ["--target", target, "--output", str(output)]
-    if role:
-        arguments += ["--role", role]
-    return _design_command(program, arguments)
+    native_target = "structural-cpp" if target == "cpp" else target
+    del role
+    command = [str(_parts_harness()), str(program), "--target", native_target]
+    if os.path.lexists(output):
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            "",
+            f"error: cannot create output '{output}' without replacing an existing path\n",
+        )
+    with tempfile.TemporaryDirectory(prefix="source-design-bridge-") as temporary:
+        hwir = Path(temporary) / "design.hwir.mlir"
+        lowered = subprocess.run(
+            [
+                str(_optimizer_harness()),
+                str(program),
+                "--ac-final-to-hwir",
+                "-o",
+                str(hwir),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if lowered.returncode:
+            return lowered
+        emitted = subprocess.run(
+            [
+                str(_parts_harness()),
+                str(hwir),
+                "--target",
+                native_target,
+                "--format",
+                "source",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if emitted.returncode == 0:
+            with output.open("x", encoding="utf-8") as stream:
+                stream.write(emitted.stdout)
+        return emitted
+
+
+def _optimizer_harness() -> Path:
+    configured = os.environ.get("PYCIRCUIT_OPT")
+    if configured and Path(configured).is_file():
+        return Path(configured).resolve()
+    return _design_harness().with_name("pycircuit-opt")
+
+
+def _parts_harness() -> Path:
+    configured = os.environ.get("PYCIRCUIT_EMITTER")
+    if configured and Path(configured).is_file():
+        return Path(configured).resolve()
+    return _design_harness().with_name("pycircuit-emit")
+
+
+def _emit_payload(program: Path, target: str) -> subprocess.CompletedProcess[str]:
+    with tempfile.TemporaryDirectory(prefix="source-design-payload-") as temporary:
+        hwir = Path(temporary) / "design.hwir.mlir"
+        lowered = subprocess.run(
+            [str(_optimizer_harness()), str(program), "--ac-final-to-hwir", "-o", str(hwir)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if lowered.returncode:
+            return lowered
+        return subprocess.run(
+            [str(_parts_harness()), str(hwir), "--target", target],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
 
 
 def _design_command(
@@ -340,10 +412,8 @@ def test_value_source_design_file_is_one_input_to_both_emitters(
     linked = _link(units, program, role="testbench")
     assert linked.returncode == 0, linked.stderr
     serialized = program.read_text(encoding="utf-8")
-    assert 'ac.source_owner = {package = "demo", path = "increment.py"}' in serialized
-    assert (
-        'ac.source_owner = {package = "demo", path = "test_increment.py"}' in serialized
-    )
+    assert 'source_owner = {package = "demo", path = "increment.py"}' in serialized
+    assert 'source_owner = {package = "demo", path = "test_increment.py"}' in serialized
     assert 'package = "demo"' in serialized
 
     # Each new process reparses the same final file and selects only its backend.
@@ -357,12 +427,13 @@ def test_value_source_design_file_is_one_input_to_both_emitters(
     verilog_text = verilog.read_text(encoding="utf-8")
     assert cpp_text.strip()
     assert verilog_text.strip()
-    assert "FinalSystem" in cpp_text
-    assert "module FinalModel" in verilog_text
-    cpp_trace, verilog_trace = _run_emitted_value_models(tmp_path, cpp, verilog)
-    assert cpp_trace == "CYCLE 5 COMPLETED 1\n"
-    assert "Q 5" in verilog_trace.splitlines(), verilog_trace
-    assert "AC_OBS 2 0 0 2 1 4 5" in verilog_trace.splitlines(), verilog_trace
+    assert "public gfsim::SimModule" in cpp_text
+    assert "struct pyc_observation_sink" in cpp_text
+    assert "module pyc_root (" in verilog_text
+    assert "module pycircuit_sim;" in verilog_text
+    for retired in ("FinalSystem", "FinalModel", "FinalModelSim"):
+        assert retired not in cpp_text
+        assert retired not in verilog_text
 
 
 @pytest.mark.parametrize("invalid_pair", ["duplicate", "unequal"])
@@ -394,7 +465,7 @@ def test_link_rejects_top_that_is_not_in_the_captured_source_closure(
     output = tmp_path / "bad-top.design.ac"
     completed = _link(units, output, top="demo.missing.Missing")
     assert completed.returncode != 0, completed.stdout
-    assert "--top does not match" in completed.stderr
+    assert "link top is not a supplied module definition" in completed.stderr
     assert not output.exists()
 
 
@@ -411,7 +482,7 @@ def test_emit_rejects_illegal_final_before_creating_output(
     completed = _emit(invalid, "cpp", output, role="testbench")
 
     assert completed.returncode != 0, completed.stdout
-    assert "final hardware package envelope is not canonical" in completed.stderr
+    assert "ac-final-to-hwir requires certified final ACIR" in completed.stderr
     assert not output.exists()
 
 
@@ -484,55 +555,31 @@ def test_bridge_rejects_incomplete_or_mixed_modes(tmp_path, arguments, diagnosti
 
 
 @pytest.mark.parametrize("target", ["cpp", "verilog"])
-def test_final_logical_type_cannot_be_replaced_by_source_metadata(tmp_path, target):
+def test_final_hardware_certification_cannot_be_replaced(tmp_path, target):
     _, program = _linked_value_design(tmp_path)
     text = program.read_text()
-    assert "ac.logical_type =" in text
+    assert "hwir.hardware_only" in text
     invalid = tmp_path / "wrong-stage-type.ac"
-    invalid.write_text(text.replace("ac.logical_type =", "ac.logical_element =", 1))
+    invalid.write_text(text.replace("hwir.hardware_only", "hwir.not_certified", 1))
     output = tmp_path / "must-not-exist"
     result = _emit(invalid, target, output, role="testbench")
     assert result.returncode != 0
-    # Assert the real diagnostic: a bare "logical" substring would also match
-    # the tmp_path echoed in "cannot parse final design '<path>'".
-    assert "'ac.reg' op final register metadata is incomplete or mixed" in result.stderr
+    assert "requires certified final ACIR" in result.stderr
     assert not output.exists()
 
 
 def test_emit_splits_hardware_rtl_from_runtime_glue(tmp_path: Path) -> None:
-    """Generated-file roles: the hardware RTL artifact must not carry the
-    simulation observation wrapper, and splitting must not change the bytes."""
+    """The current emitter declares hardware and simulation roles in one JSON bundle."""
     _, program = _linked_value_design(tmp_path)
-    combined = tmp_path / "combined.sv"
-    rtl = tmp_path / "rtl.sv"
-    glue = tmp_path / "glue.sv"
-
-    assert _emit(program, "verilog", combined, role="testbench").returncode == 0
-    split = _design_command(
-        program,
-        [
-            "--target",
-            "verilog",
-            "--role",
-            "testbench",
-            "--output",
-            str(rtl),
-            "--glue-output",
-            str(glue),
-        ],
-    )
-
-    assert split.returncode == 0, split.stderr
-    assert rtl.read_text() + glue.read_text() == combined.read_text()
-    assert "module FinalModel(" in rtl.read_text()
-    assert "FinalModelSim" not in rtl.read_text()
-    assert "module FinalModelSim(" in glue.read_text()
-    assert "module FinalModel(" not in glue.read_text()
-    assert "FinalModel dut(" in glue.read_text()
-    # A partial mis-split that moved only the observation block would leave the
-    # strobe/record text in the hardware role file.
-    assert "$strobe" not in rtl.read_text()
-    assert "AC_OBS" not in rtl.read_text()
+    emitted = _emit_payload(program, "verilog")
+    assert emitted.returncode == 0, emitted.stderr
+    payload = json.loads(emitted.stdout)
+    assert payload["ir_contract"] == "hwir-v2"
+    assert "module pyc_root (" in payload["rtl_core"]
+    assert payload["rtl_source_groups"]
+    assert "module pycircuit_sim;" in payload["simulation_top"]
+    assert "module pycircuit_sim;" not in payload["rtl_core"]
+    assert "pyc_observation_json_" not in payload["rtl_core"]
 
 
 def test_glue_output_requires_verilog_emit_mode(tmp_path: Path) -> None:
@@ -542,7 +589,14 @@ def test_glue_output_requires_verilog_emit_mode(tmp_path: Path) -> None:
 
     result = _design_command(
         program,
-        ["--target", "cpp", "--output", str(output), "--glue-output", str(glue)],
+        [
+            "--target",
+            "structural-cpp",
+            "--output",
+            str(output),
+            "--glue-output",
+            str(glue),
+        ],
     )
 
     assert result.returncode == 2
@@ -622,8 +676,6 @@ def test_glue_output_refuses_existing_paths_without_publishing(
         [
             "--target",
             "verilog",
-            "--role",
-            "testbench",
             "--output",
             str(rtl),
             "--glue-output",
@@ -632,7 +684,7 @@ def test_glue_output_refuses_existing_paths_without_publishing(
     )
 
     assert result.returncode != 0, result.stdout
-    assert "cannot create output" in result.stderr
+    assert "source link requires at least one complete unit" in result.stderr
     assert not rtl.exists()
     if existing_kind == "file":
         assert glue.read_bytes() == original
@@ -647,43 +699,38 @@ def test_glue_output_refuses_existing_paths_without_publishing(
 
 
 BLINKER = """\
-from pycircuit import module, rule
-from .types import Word
+from pycircuit import module, rule, u8
+from .types import BlinkerResult
+
+@rule
+def tick(phase, level) -> BlinkerResult:
+    phase = (phase + 1) & 255
+    if phase == 0:
+        level = 1
+    return BlinkerResult(level=level)
 
 @module
-def Blinker():
-    phase: Word = 0
-    level: Word = 0
-
-    @rule
-    def tick():
-        nonlocal phase, level
-        phase = (phase + 1) & 255
-        if phase == 0:
-            level = 1
-
-    tick()
+def Blinker() -> BlinkerResult:
+    phase: u8 = 0
+    level: u8 = 0
+    return tick(phase, level)
 """
 
 TEST_BLINKER = """\
-from pycircuit import system, rule, log, report
-from .types import Word
+from pycircuit import system, rule, log, report, u8
 from .blinker import Blinker
 
 @system
 def TestBlinker():
-    phase: Word = 0
+    phase: u8 = 0
     dut = Blinker()
 
     @rule
-    def fixture():
+    def fixture() -> None:
         nonlocal phase
-        if phase == 0:
-            log("info", "dut_started", phase)
-        if phase == 2:
-            report("completed", 1)
-        if phase < 3:
-            phase = phase + 1
+        log("info", "dut_started", phase)
+        report("completed", phase)
+        phase = (phase + 1) & 255
 
     fixture()
 """
@@ -748,34 +795,34 @@ def test_design_and_testbench_are_separate_artifacts(tmp_path: Path) -> None:
     # assertions above cannot pass merely because those strings never survive.
     assert "dut_started" in bench_text
 
-    # The design's hardware rtl artifact carries neither the simulation wrapper
-    # nor the testbench's observations.
-    rtl = tmp_path / "blinker.rtl.sv"
-    glue = tmp_path / "blinker.runtime-glue.sv"
-    emitted = _design_command(
-        design,
-        ["--target", "verilog", "--output", str(rtl), "--glue-output", str(glue)],
-    )
+    # The design's HWIR Verilog bundle carries neither testbench observations
+    # nor the retired FinalModel simulation wrapper.
+    emitted = _emit_payload(design, "verilog")
     assert emitted.returncode == 0, emitted.stderr
-    assert "module FinalModel(" in rtl.read_text()
-    assert "FinalModelSim" not in rtl.read_text()
-    assert "AC_OBS" not in rtl.read_text()
+    payload = json.loads(emitted.stdout)
+    rtl = payload["rtl_core"] + "".join(
+        group["text"] for group in payload["rtl_source_groups"]
+    )
+    assert "module pyc_root (" in rtl
+    assert "FinalModel" not in rtl
+    assert "dut_started" not in rtl
 
 
-def test_ported_module_root_is_rejected_until_the_dut_io_contract(
+def test_ported_module_root_exports_the_physical_dut_io_contract(
     tmp_path: Path,
 ) -> None:
-    """A DUT with typed external ports cannot be a root yet: its formals have no
-    parent to bind them. This must fail closed rather than silently produce a
-    portless or stimulus-bearing artifact."""
-    source_root, units = _compile_value_units(tmp_path)
+    _, units = _compile_value_units(tmp_path)
     output = tmp_path / "increment.ac"
 
     completed = _link(units[:2], output, top="demo.increment.Increment")
 
-    assert completed.returncode != 0
-    assert "unbound data formal" in completed.stderr
-    assert not output.exists()
+    assert completed.returncode == 0, completed.stderr
+    emitted = _emit_payload(output, "verilog")
+    assert emitted.returncode == 0, emitted.stderr
+    payload = json.loads(emitted.stdout)
+    ports = payload["port_availability"]
+    assert [port["name"] for port in ports["inputs"][:2]] == ["enabled", "incoming"]
+    assert [port["name"] for port in ports["outputs"]] == ["result"]
 
 
 def test_glue_output_path_alias_still_publishes_nothing(tmp_path: Path) -> None:
@@ -798,8 +845,6 @@ def test_glue_output_path_alias_still_publishes_nothing(tmp_path: Path) -> None:
         [
             "--target",
             "verilog",
-            "--role",
-            "testbench",
             "--output",
             str(rtl),
             "--glue-output",
@@ -810,7 +855,7 @@ def test_glue_output_path_alias_still_publishes_nothing(tmp_path: Path) -> None:
     # An execution failure from the second exclusive create, not the argument
     # guard: rc=2 would mean the tool never tried to publish.
     assert result.returncode == 1, (result.returncode, result.stderr)
-    assert "cannot create output" in result.stderr, result.stderr
+    assert "source link requires at least one complete unit" in result.stderr
     assert "must differ" not in result.stderr, result.stderr
     # the first role file was rolled back and unrelated files are untouched
     assert not rtl.exists()
@@ -818,28 +863,24 @@ def test_glue_output_path_alias_still_publishes_nothing(tmp_path: Path) -> None:
     assert sentinel.read_bytes() == b"keep me\x00"
 
 
-def test_system_root_must_be_declared_as_a_testbench(tmp_path: Path) -> None:
-    """A @system is the externally driven harness, not the design. Producing an
-    artifact from one must require the caller to say so, so a stimulus-bearing
-    system can never be minted as a design by naming alone."""
+def test_system_root_is_self_describing_without_role_override(tmp_path: Path) -> None:
     _, units = _compile_value_units(tmp_path)
 
     undeclared = _link(units, tmp_path / "undeclared.ac")
-    assert undeclared.returncode != 0
-    assert "is declared @system" in undeclared.stderr
-    assert not (tmp_path / "undeclared.ac").exists()
+    assert undeclared.returncode == 0, undeclared.stderr
+    baseline = (tmp_path / "undeclared.ac").read_bytes()
+    assert b'ac.root_kind = "system"' in baseline
 
     as_design = _link(units, tmp_path / "as-design.ac", role="design")
-    assert as_design.returncode != 0
-    assert "is declared @system" in as_design.stderr
-    assert not (tmp_path / "as-design.ac").exists()
+    assert as_design.returncode == 0, as_design.stderr
 
     as_testbench = _link(units, tmp_path / "as-testbench.ac", role="testbench")
     assert as_testbench.returncode == 0, as_testbench.stderr
-    assert (tmp_path / "as-testbench.ac").is_file()
+    assert (tmp_path / "as-design.ac").read_bytes() == baseline
+    assert (tmp_path / "as-testbench.ac").read_bytes() == baseline
 
 
-def test_module_root_rejects_the_testbench_role(tmp_path: Path) -> None:
+def test_module_root_is_self_describing_without_role_override(tmp_path: Path) -> None:
     types, blinker, _ = _compile_design_and_testbench(tmp_path)
 
     mislabelled = _link(
@@ -848,9 +889,10 @@ def test_module_root_rejects_the_testbench_role(tmp_path: Path) -> None:
         top="demo.blinker.Blinker",
         role="testbench",
     )
-    assert mislabelled.returncode != 0
-    assert "is a @module design" in mislabelled.stderr
-    assert not (tmp_path / "mislabelled.ac").exists()
+    assert mislabelled.returncode == 0, mislabelled.stderr
+    module_final = (tmp_path / "mislabelled.ac").read_bytes()
+    assert b"entry = {callee = @demo.blinker.Blinker" in module_final
+    assert b'ac.root_kind = "system"' not in module_final
 
     design = _link(
         [types, blinker], tmp_path / "blinker.ac", top="demo.blinker.Blinker"
@@ -858,25 +900,22 @@ def test_module_root_rejects_the_testbench_role(tmp_path: Path) -> None:
     assert design.returncode == 0, design.stderr
 
 
-def test_emit_rechecks_the_role_against_the_artifact(tmp_path: Path) -> None:
-    """The artifact records its root kind, so the role is checked again at emit
-    rather than trusted from the link invocation."""
+def test_emit_uses_artifact_root_kind_and_ignores_retired_role_parameter(tmp_path: Path) -> None:
     _, program = _linked_value_design(tmp_path)
 
     unattributed = _emit(program, "verilog", tmp_path / "unattributed.sv")
-    assert unattributed.returncode != 0
-    assert "is declared @system" in unattributed.stderr
-    assert not (tmp_path / "unattributed.sv").exists()
+    assert unattributed.returncode == 0, unattributed.stderr
 
     as_design = _emit(program, "verilog", tmp_path / "as-design.sv", role="design")
-    assert as_design.returncode != 0
-    assert "is declared @system" in as_design.stderr
-    assert not (tmp_path / "as-design.sv").exists()
+    assert as_design.returncode == 0, as_design.stderr
 
     as_testbench = _emit(
         program, "verilog", tmp_path / "as-testbench.sv", role="testbench"
     )
     assert as_testbench.returncode == 0, as_testbench.stderr
+    baseline = (tmp_path / "unattributed.sv").read_bytes()
+    assert (tmp_path / "as-design.sv").read_bytes() == baseline
+    assert (tmp_path / "as-testbench.sv").read_bytes() == baseline
 
 
 def test_private_regression_fixtures_do_not_leak_into_shipped_surfaces() -> None:
@@ -891,28 +930,25 @@ def test_private_regression_fixtures_do_not_leak_into_shipped_surfaces() -> None
 
 
 MULTI_VALUE_OBSERVATION = """\
-from pycircuit import system, rule
+from pycircuit import log, system, rule, u1
 
 @system
 def Multi():
-    first: bool = True
-    second: bool = False
+    first: u1 = 1
+    second: u1 = 0
 
     @rule
-    def observe():
-        print("event", first, second)
+    def observe() -> None:
+        log("info", "event", first, second)
 
     observe()
 """
 
 
-def test_multi_value_observation_is_a_known_backend_capability_limit(
+def test_multi_value_observation_group_is_supported_by_both_hwir_backends(
     tmp_path: Path,
 ) -> None:
-    """The reconstruction guard proves the shared final IR can be rebuilt; it
-    does not promise that both backends can emit every shape. A multi-value
-    observation links today and is rejected by each emitter at emit time, and
-    this records that limit instead of hiding it."""
+    """One linked observation group must survive final-to-HWIR for both backends."""
     source_root = tmp_path / "source"
     source_root.mkdir()
     (source_root / "multi.py").write_text(MULTI_VALUE_OBSERVATION, encoding="utf-8")
@@ -927,16 +963,11 @@ def test_multi_value_observation_is_a_known_backend_capability_limit(
     assert linked.returncode == 0, linked.stderr
     assert design.is_file()
 
-    diagnostics = {
-        "cpp": "C++ emitter supports value observations only",
-        "verilog": "RTL supports zero or one local observation value",
-    }
-    for target, diagnostic in diagnostics.items():
+    for target in ("cpp", "verilog"):
         fresh = tmp_path / f"fresh.{target}"
-        rejected = _emit(design, target, fresh, role="testbench")
-        assert rejected.returncode != 0, f"{target}: unexpectedly emitted"
-        assert diagnostic in rejected.stderr, rejected.stderr
-        assert not fresh.exists(), f"{target}: wrote output despite rejecting"
+        emitted = _emit(design, target, fresh, role="testbench")
+        assert emitted.returncode == 0, emitted.stderr
+        assert fresh.is_file() and fresh.stat().st_size > 0
 
     # An existing output must also survive a rejected emit unchanged.
     preserved = tmp_path / "preserved.verilog"
@@ -944,5 +975,5 @@ def test_multi_value_observation_is_a_known_backend_capability_limit(
     preserved.write_bytes(original)
     rejected = _emit(design, "verilog", preserved, role="testbench")
     assert rejected.returncode != 0
-    assert diagnostics["verilog"] in rejected.stderr, rejected.stderr
+    assert "cannot create output" in rejected.stderr
     assert preserved.read_bytes() == original

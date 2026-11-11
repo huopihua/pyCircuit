@@ -1,9 +1,10 @@
 // Expected vectors come from independent host arithmetic and symbol truth tables.
 #include "gfsim/SimExecutor.h"
 #include "gfsim/SystemRunner.h"
-#include "pycircuit_system.hpp"
+#include "design.hpp"
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <source_location>
 #include <stdexcept>
 #include <string>
@@ -78,7 +79,7 @@ struct Context {
 };
 #ifdef ENUM_SOURCE_STATE
 void lifecycle(unsigned workers) {
-  gfsim::WorkExecutor pool(workers); pyc_root root("probe", &pool);
+  pyc_dut probe(workers); auto &root = probe.root();
   pyc_dut::Inputs initial; driveProbe(initial, 0); driveRoot(root, initial);
   root.Work();require(!root.result.isFullyKnown());root.DiscardNext();root.Xfer();
   root.Reset();require(!root.result.isFullyKnown());root.Xfer();
@@ -114,9 +115,9 @@ void lifecycle(unsigned workers) {
 #endif
 int main(int argc, char **argv) {
   gfsim::SystemRunner runner(argc, argv); if (!runner.ready()) return 2;
-  pyc_dut dut(runner.workers()); Context context{dut};
+  auto dut = std::make_unique<pyc_dut>(runner.workers()); Context context{*dut};
   const gfsim::RunnerCallbacks callbacks{&context, &Context::initialize, &Context::driveInputs, &Context::sample};
-  const int status = runner.Run(dut.system(), dut.observations(), {}, callbacks);
+  const int status = runner.Run(dut->system(), dut->observations(), {}, callbacks);
   require(status == 0 && context.sampled == row_count);
 #ifdef ENUM_SOURCE_STATE
   lifecycle(runner.workers());

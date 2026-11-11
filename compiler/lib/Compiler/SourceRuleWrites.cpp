@@ -322,6 +322,36 @@ LogicalResult SourceRuleWritesAnalysis::analyze() {
         plan.writes.push_back(
             {owner->second, formals.item("args", j).string("arg").str(), {}});
       }
+      // A lexically nested Rule names module-owned persistent state with
+      // Python's ``nonlocal`` declaration instead of passing that state as an
+      // explicit formal.  Publish those owners into the same write plan used
+      // for formal owner arguments.  The importer already captures the
+      // corresponding current values lexically; without this plan entry an
+      // assignment was lowered as dead rule-local SSA and the storage stayed
+      // permanently disabled.
+      if (nestedRuleNames.contains(function.string("id")))
+        for (size_t j = 0; j < plan.rule.array("body").size(); ++j) {
+          auto declaration = plan.rule.item("body", j);
+          if (declaration.kind() != "Nonlocal")
+            continue;
+          for (Attribute raw : declaration.array("names")) {
+            auto name = dyn_cast<StringAttr>(raw);
+            if (!name)
+              return diagnostic(declaration)
+                     << "nonlocal owner name is malformed";
+            auto owner = owners.find(name.getValue());
+            if (owner == owners.end())
+              continue;
+            if (ownerForFormal.contains(name.getValue()))
+              return diagnostic(declaration)
+                     << "persistent owner is bound more than once: '"
+                     << name.getValue() << "'";
+            ++aliases[owner->getKey()];
+            ownerForFormal[name.getValue()] = plan.writes.size();
+            plan.writes.push_back(
+                {owner->second, name.getValue().str(), {}});
+          }
+        }
       OpBuilder builder(operation->getContext());
       auto scanWrites = [&](auto &&self, const AstNode &parent,
                             StringRef field) -> LogicalResult {

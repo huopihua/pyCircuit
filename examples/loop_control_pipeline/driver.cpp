@@ -1,6 +1,6 @@
 #include "gfsim/SimExecutor.h"
 #include "gfsim/SystemRunner.h"
-#include "pycircuit_system.hpp"
+#include "design.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <deque>
@@ -327,7 +327,7 @@ void step(gfsim::SimExecutor &exec) {
   require(exec.Step(&s) == PYCIRCUIT_MODEL_STATUS_V1_OK &&
           s.state == PYCIRCUIT_MODEL_STEP_V1_RUNNING);
 }
-void rawDrive(pyc_root &dut, const Row &r) {
+template <class Root> void rawDrive(Root &dut, const Row &r) {
   auto p = ports(r);
   dut.pyc_7079635f636c6b = p.pyc_7079635f636c6b;
   dut.pyc_7079635f727374 = p.pyc_7079635f727374;
@@ -336,8 +336,8 @@ void rawDrive(pyc_root &dut, const Row &r) {
   dut.data = p.data;
 }
 void owner(unsigned workers, unsigned mode) {
-  gfsim::WorkExecutor pool(workers);
-  pyc_root dut("owner", &pool);
+  pyc_dut probe(workers);
+  auto &dut = probe.root();
   dut.Build();
   Golden golden;
   Row r{"OWNER", false};

@@ -189,9 +189,9 @@ def main():
         PYCIRCUIT_SOURCE_COMPILER=args.source_compiler,
         PYCIRCUIT_LINKER=args.linker,
         PYCIRCUIT_EMITTER=args.emitter,
-        MAKEFLAGS="CFG_CXXFLAGS_PCH_I=-include",
     )
     commands, receipts, visibility = [], [], []
+    command_timeout = int(os.environ.get("PYC_LIT_COMMAND_TIMEOUT", "900"))
 
     def run(label, command, text_input=None):
         command = list(map(str, command))
@@ -202,7 +202,7 @@ def main():
             env=env,
             text=True,
             capture_output=True,
-            timeout=300,
+            timeout=command_timeout,
         )
         (scratch / (label + ".stdout")).write_text(result.stdout)
         (scratch / (label + ".stderr")).write_text(result.stderr)
@@ -218,6 +218,7 @@ def main():
         return result.stdout
 
     def cli(label, *arguments):
+        arguments = list(arguments)
         return run(label, [sys.executable, "-m", "pycircuit.cli", *arguments])
 
     units = []
@@ -272,7 +273,7 @@ def main():
                 "--replace",
             )
             traces = {}
-            for backend in ("cpp", "verilog"):
+            for backend in ("structural-cpp", "verilog"):
                 label = f"{kind}-{profile}-{backend}"
                 generated = scratch / label
                 cli(
@@ -286,7 +287,7 @@ def main():
                     "--replace",
                 )
                 executable = scratch / (label + "-driver")
-                if backend == "cpp":
+                if backend == "structural-cpp":
                     sources = [
                         generated / item["path"]
                         for item in json.loads(
@@ -315,9 +316,7 @@ def main():
                                 }
                             )
                         names = drivers.instances(
-                            (
-                                probe / "sources/history_resident/resident_pairs.hpp"
-                            ).read_text(),
+                            (probe / "design.hpp").read_text(),
                             kind,
                         )
                         driver = scratch / (label + "-driver.cpp")
@@ -346,7 +345,7 @@ def main():
                 elif profile == "module":
                     native_header = (
                         scratch
-                        / f"{kind}-module-cpp/sources/history_resident/resident_pairs.hpp"
+                        / f"{kind}-module-structural-cpp/design.hpp"
                     )
                     names = drivers.instances(native_header.read_text(), kind)
                     driver = scratch / (label + "-driver.sv")
@@ -369,7 +368,7 @@ def main():
                             "-o",
                             executable,
                             generated / "design_top.sv",
-                            *generated.rglob("*.v"),
+                            *generated.rglob("*.sv"),
                             repo / "include/verilog/dffe.v",
                             driver,
                         ],
@@ -394,7 +393,7 @@ def main():
                 for group in groups:
                     rows = vectors[group][kind]["rows"]
                     assert len(rows) <= 256
-                    for workers in (1, 2) if backend == "cpp" else (1,):
+                    for workers in (1, 2) if backend == "structural-cpp" else (1,):
                         case_label = f"{label}-{group}-workers{workers}"
                         if profile == "module":
                             input_text = stimulus(kind, rows)
@@ -404,10 +403,10 @@ def main():
                                 case_label,
                                 (
                                     [executable, workers]
-                                    if backend == "cpp"
+                                    if backend == "structural-cpp"
                                     else [executable, "+stimulus=" + str(input_file)]
                                 ),
-                                input_text if backend == "cpp" else None,
+                                input_text if backend == "structural-cpp" else None,
                             )
                             observed = [
                                 line.split()
@@ -427,9 +426,16 @@ def main():
                                 check_result(kind, row, actual[4])
                         else:
                             options = (
-                                ["--cycles", len(rows), "--workers", workers]
-                                if backend == "cpp"
-                                else ["+cycles=" + str(len(rows))]
+                                [
+                                    "--cycles",
+                                    len(rows),
+                                    "--workers",
+                                    workers,
+                                    "--events",
+                                    "-",
+                                ]
+                                if backend == "structural-cpp"
+                                else ["+cycles=" + str(len(rows)), "--events", "-"]
                             )
                             output = run(case_label, [executable, *options])
                             records = [

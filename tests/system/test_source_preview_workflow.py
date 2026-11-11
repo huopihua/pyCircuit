@@ -263,6 +263,7 @@ def _configure_preview(
         "Ninja",
         "-DPYCIRCUIT_REPOSITORY_ROOT=" + str(ROOT),
         "-DPYCIRCUIT_NATIVE_BUILD=" + str(native),
+        "-DPYCIRCUIT_COMPILER_INSTALL=" + str(_runtime_prefix()),
         "-DPYCIRCUIT_DESIGN=" + design,
         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
     ]
@@ -271,6 +272,11 @@ def _configure_preview(
     _checked(command)
 
     return build
+
+
+def _runtime_prefix() -> Path:
+    configured = os.environ.get("PYCIRCUIT_COMPILER_INSTALL")
+    return Path(configured or ROOT / ".pycircuit_out/toolchain/install").resolve()
 
 
 def _build_preview(
@@ -287,13 +293,13 @@ def _build_preview(
         test_consumer=test_consumer,
     )
     _checked(
-        ["cmake", "--build", str(build), "--target", "preview-build", "--parallel", "4"]
+        ["cmake", "--build", str(build), "--target", "preview-build", "--parallel", "2"]
     )
     return build
 
 
 def _runner(build: Path, backend: str) -> Path:
-    binary = build / f"model-{backend}" / "pycircuit_system"
+    binary = build / f"model-{backend}" / "bin/pycircuit_sim"
     if os.name == "nt":
         binary = binary.with_suffix(".exe")
     assert binary.is_file(), f"CMake did not produce the {backend} runner: {binary}"
@@ -333,11 +339,22 @@ def _build_materialized_models(artifacts: Path, build_root: Path) -> dict[str, P
                 "-G",
                 "Ninja",
                 "-DPYCIRCUIT_RUNTIME_ROOT=" + str(ROOT / "runtime"),
+                "-DCMAKE_PREFIX_PATH=" + str(_runtime_prefix()),
                 "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
             ]
         )
-        _checked(["cmake", "--build", str(model_build), "--parallel", "4"])
-        runner = model_build / "pycircuit_system"
+        _checked(
+            [
+                "cmake",
+                "--build",
+                str(model_build),
+                "--target",
+                "pycircuit_sim",
+                "--parallel",
+                "2",
+            ]
+        )
+        runner = model_build / "bin/pycircuit_sim"
         if os.name == "nt":
             runner = runner.with_suffix(".exe")
         assert runner.is_file()
@@ -353,13 +370,51 @@ def _run_model(
     events: Path | None,
     extra: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
-    command = [str(_runner(build, backend)), "--config", str(config)]
-    if events is not None:
-        command.extend(("--events", str(events)))
+    configuration = json.loads(config.read_text(encoding="utf-8"))
+    cycles = configuration.get("max_ticks")
+    assert type(cycles) is int and cycles > 0
+    if backend == "cpp":
+        command = [str(_runner(build, backend)), "--cycles", str(cycles)]
+        if events is not None:
+            command.extend(("--events", str(events)))
+    else:
+        command = [str(_runner(build, backend)), f"+cycles={cycles}"]
     command.extend(extra)
-    return subprocess.run(
+    result = subprocess.run(
         command, text=True, capture_output=True, check=False, timeout=60
     )
+    if backend == "verilog" and events is not None and events != Path("-"):
+        json_lines = []
+        for line in result.stdout.splitlines():
+            if not line.startswith("{"):
+                break
+            json_lines.append(line)
+        events.write_text("\n".join(json_lines) + "\n", encoding="utf-8")
+    return result
+
+
+def _run_materialized_runner(
+    runner: Path, backend: str, config: Path, *, events: Path
+) -> subprocess.CompletedProcess[str]:
+    configuration = json.loads(config.read_text(encoding="utf-8"))
+    cycles = configuration.get("max_ticks")
+    assert type(cycles) is int and cycles > 0
+    command = (
+        [str(runner), "--cycles", str(cycles), "--events", str(events)]
+        if backend == "cpp"
+        else [str(runner), f"+cycles={cycles}"]
+    )
+    result = subprocess.run(
+        command, text=True, capture_output=True, check=False, timeout=60
+    )
+    if backend == "verilog":
+        json_lines = []
+        for line in result.stdout.splitlines():
+            if not line.startswith("{"):
+                break
+            json_lines.append(line)
+        events.write_text("\n".join(json_lines) + "\n", encoding="utf-8")
+    return result
 
 
 def _sha256(path: Path) -> str:
@@ -374,25 +429,22 @@ def _tree_bytes(path: Path) -> dict[str, bytes]:
     }
 
 
-def _mutated_signed_probe(text: str) -> str:
-    edits = (
-        ('interpretation = "unsigned"', 'interpretation = "signed"', 1),
-        ("lower = #ac.math_int<0>", "lower = #ac.math_int<-128>", 1),
-        ("upper = #ac.math_int<256>", "upper = #ac.math_int<128>", 1),
-        ("ac.initial_value = 7 : i8", "ac.initial_value = -1 : i8", 1),
-        ("arith.constant 7 : i8", "arith.constant -1 : i8", 1),
-    )
-    for old, new, minimum in edits:
-        assert text.count(old) >= minimum, f"final mutation anchor missing: {old}"
-        text = text.replace(old, new)
-    return text
+def _mutated_narrow_probe(text: str) -> str:
+    # The independent HWIR contract is packed hardware bits: source integer
+    # range declarations and signed formatting are intentionally not carried
+    # into the backend.  Mutate the one authoritative u8 initializer instead
+    # and retain an exact oracle for integer-vs-bool JSON classification.
+    old = "#ac.math_int<7>"
+    assert text.count(old) == 1, f"final mutation anchor count changed: {old}"
+    return text.replace(old, "#ac.math_int<255>")
 
 
 def _insert_wide_unused_constant(text: str) -> str:
-    marker = '    ac.type_alias "preview.types.Word" target '
+    marker = "module attributes "
     assert text.count(marker) == 1
+    body = text.index("{\n", text.index(marker)) + 2
     declaration = (
-        '    "ac.constant"() <{sym_name = "preview.types.Huge", '
+        '  "ac.constant"() <{sym_name = "preview.types.Huge", '
         'type = {kind = "integer"}, '
         'value = {kind = "integer", value = '
         "#ac.math_int<18446744073709551616>}}> "
@@ -402,27 +454,34 @@ def _insert_wide_unused_constant(text: str) -> str:
         'ac.source_owner = {package = "preview", path = "types.py"}} '
         ': () -> () loc("types.py":99:1)\n'
     )
-    return text.replace(marker, declaration + marker)
+    return text[:body] + declaration + text[body:]
 
 
 def _duplicate_report_name(text: str) -> str:
     marker = 'name = "second"'
-    assert text.count(marker) == 2
-    return text.replace(marker, 'name = "first"')
+    assert text.count(marker) == 1
+    return text.replace(marker, 'name = "first"', 1)
 
 
 def _receipt(path: Path, target: str) -> dict[str, Any]:
     value = json.loads((path / "generated.json").read_text(encoding="utf-8"))
-    assert set(value) == {
+    expected_fields = {
         "kind",
         "target",
         "entry",
         "entry_source",
         "files",
         "source_groups",
+        "ir_contract",
     }
+    if target == "verilog":
+        expected_fields.add("rtl_mode")
+    assert set(value) == expected_fields
     assert value["kind"] == "pycircuit-generated"
     assert value["target"] == target
+    assert value["ir_contract"] == "hwir-v2"
+    if target == "verilog":
+        assert value["rtl_mode"] == "managed"
     assert value["entry"] == {
         "definition": '@"preview.design_top.DesignTop"',
         "arguments": [],
@@ -490,13 +549,7 @@ def _module_body(rtl: str, name_fragment: str) -> tuple[str, str]:
 def built_design(tmp_path_factory: pytest.TempPathFactory) -> Path:
     native = _require_preview_tools()
     build = tmp_path_factory.mktemp("source_preview-design")
-    consumer = build / "reset_replay.cpp"
-    consumer.write_text(_RESET_REPLAY_SOURCE, encoding="utf-8")
-    return _build_preview(
-        build,
-        native=native,
-        test_consumer=consumer,
-    )
+    return _build_preview(build, native=native)
 
 
 def test_from_source_compile_link_emit_and_both_runners_share_one_final(
@@ -515,64 +568,35 @@ def test_from_source_compile_link_emit_and_both_runners_share_one_final(
 
     cpp_bundle = built_design / "artifacts/cpp"
     rtl_bundle = built_design / "artifacts/verilog"
-    cpp_receipt = _receipt(cpp_bundle, "cpp")
+    cpp_receipt = _receipt(cpp_bundle, "structural-cpp")
     rtl_receipt = _receipt(rtl_bundle, "verilog")
     assert cpp_receipt["source_groups"]
-    # The private preview's RTL is an aggregate simulation input; it makes no
-    # false claim that the C++ source groups describe that file.
-    assert rtl_receipt["source_groups"] == []
     cpp_groups = _group_map(cpp_receipt)
+    rtl_groups = _group_map(rtl_receipt)
     assert set(cpp_groups) == {"types.py", "counter.py", "design_top.py"}
-    assert any(path.endswith("types.hpp") for path in cpp_groups["types.py"])
-    assert not any(path.endswith(".cpp") for path in cpp_groups["types.py"])
-    for source in ("counter.py", "design_top.py"):
-        assert any(
-            path.endswith(source.removesuffix(".py") + ".hpp")
-            for path in cpp_groups[source]
-        )
-        assert any(
-            path.endswith(source.removesuffix(".py") + ".cpp")
-            for path in cpp_groups[source]
-        )
+    assert set(rtl_groups) == set(cpp_groups)
+    for source in cpp_groups:
+        assert sum(path.endswith(".cpp") for path in cpp_groups[source]) == 1
+        expected_rtl = source != "types.py"
+        assert any(path.endswith(".sv") for path in rtl_groups[source]) == expected_rtl
 
     files = {item["path"]: item["role"] for item in cpp_receipt["files"]}
     assert files["CMakeLists.txt"] == "cmake"
-    assert files["runner_main.cpp"] == "runtime-glue"
-    assert files["runner_metadata.hpp"] == "runtime-glue"
+    assert files["design.hpp"] == "header"
+    assert files["simulation_main.cpp"] == "runtime-glue"
     rtl_files = {item["path"]: item["role"] for item in rtl_receipt["files"]}
-    assert rtl_files["hardware.sv"] == "rtl"
-    assert rtl_files["runner_bridge.sv"] == "runtime-glue"
+    assert rtl_files["design_top.sv"] == "rtl"
+    assert rtl_files["simulation_top.sv"] == "runtime-glue"
 
     cpp_compile_database = json.loads(
         (built_design / "model-cpp/compile_commands.json").read_text()
     )
-    rtl_compile_database = json.loads(
-        (built_design / "model-verilog/compile_commands.json").read_text()
-    )
     cpp_compiled_files = [Path(entry["file"]).name for entry in cpp_compile_database]
-    rtl_compiled_files = [Path(entry["file"]).name for entry in rtl_compile_database]
-    for source in ("counter.cpp", "design_top.cpp"):
-        assert (
-            cpp_compiled_files.count(source) == 3
-        ), f"the source-owned TU should compile once into each consumer: {source}"
-        for target in (
-            "pycircuit_system",
-            "source_preview_reset_replay",
-            "pycircuit_dut",
-        ):
-            assert (
-                sum(
-                    Path(entry["file"]).name == source
-                    and f"CMakeFiles/{target}.dir/" in entry["command"]
-                    for entry in cpp_compile_database
-                )
-                == 1
-            )
-    assert cpp_compiled_files.count("model_api.cpp") == 1
-    assert cpp_compiled_files.count("runner_main.cpp") == 1
-    assert cpp_compiled_files.count("reset_replay.cpp") == 1
-    assert rtl_compiled_files.count("runner_main.cpp") == 1
-    assert rtl_compiled_files.count("reset_replay.cpp") == 1
+    for source in ("source_unit_0.cpp", "source_unit_1.cpp", "source_unit_2.cpp"):
+        assert cpp_compiled_files.count(source) == 1
+    assert cpp_compiled_files.count("simulation_main.cpp") == 1
+    assert "model_api.cpp" not in cpp_compiled_files
+    assert "runner_main.cpp" not in cpp_compiled_files
     assert _sha256(final) == final_hash
 
     configs = FIXTURE / "configs"
@@ -623,32 +647,26 @@ def test_from_source_compile_link_emit_and_both_runners_share_one_final(
         _sha256(final) == final_hash
     ), "both runners must consume the same linked final"
 
-    # The common final stores one Counter definition plus four root register
-    # declarations. Its two child instances each carry a physical copy.
-    assert final.read_text(encoding="utf-8").count('"ac.reg"') == 5
+    # The final ACIR contains five DFFE sites: one in Counter and four in the
+    # root. Concrete instantiation gives the child site two physical copies.
+    final_text = final.read_text(encoding="utf-8")
+    assert final_text.count("callee = @pycircuit.__builtins__.dffe") == 5
+    assert final_text.count("callee = @preview.counter.Counter") == 2
     cpp_group_text = {
         source: _group_text(cpp_bundle, paths) for source, paths in cpp_groups.items()
     }
-    root_fields = re.findall(
-        r"SimDFFE<[^>]+>\s+q_[A-Za-z0-9_]+",
-        cpp_group_text["design_top.py"],
-    )
-    child_fields = re.findall(
-        r"SimDFFE<[^>]+>\s+q_[A-Za-z0-9_]+", cpp_group_text["counter.py"]
-    )
-    child_members = re.findall(
-        r"\b\w+<>\s+child_[A-Za-z0-9_]+", cpp_group_text["design_top.py"]
-    )
-    assert len(root_fields) == 4
-    assert len(child_fields) == 1
-    assert len(child_members) == 2
-    assert len(root_fields) + len(child_fields) * len(child_members) == 6
+    header_text = (cpp_bundle / "design.hpp").read_text(encoding="utf-8")
+    assert header_text.count("gfsim::dffe<gfsim::Bits<8>>") == 5
 
-    rtl_text = (rtl_bundle / "hardware.sv").read_text(encoding="utf-8")
-    child_name, child_body = _module_body(rtl_text, "counter")
-    root_name, root_body = _module_body(rtl_text, "design_top")
-    child_state_blocks = child_body.count("always_ff @(posedge clk)")
-    root_state_blocks = root_body.count("always_ff @(posedge clk)")
+    child_rtl = _group_text(rtl_bundle, rtl_groups["counter.py"])
+    root_rtl = _group_text(rtl_bundle, rtl_groups["design_top.py"])
+    child_match = re.search(r"\bmodule\s+(\w+)", child_rtl)
+    root_match = re.search(r"\bmodule\s+(\w+)", root_rtl)
+    assert child_match and root_match
+    child_name, child_body = _module_body(child_rtl, child_match.group(1))
+    root_name, root_body = _module_body(root_rtl, root_match.group(1))
+    child_state_blocks = len(re.findall(r"\bdffe\s*#", child_body))
+    root_state_blocks = len(re.findall(r"\bdffe\s*#", root_body))
     child_instances = re.findall(rf"\b{re.escape(child_name)}\s+(\w+)\s*\(", root_body)
     assert child_state_blocks == 1 and root_state_blocks == 4
     assert len(child_instances) == 2
@@ -703,8 +721,16 @@ def test_second_tick_failure_discards_failed_epoch_observations(tmp_path: Path) 
         outputs[backend] = events.read_bytes()
     oracle = _oracle()
     oracle.assert_failure_run(outputs["cpp"])
-    oracle.assert_failure_run(outputs["verilog"])
-    oracle.assert_repeated_run_identical(outputs["cpp"], outputs["verilog"])
+    oracle.assert_failure_events_without_result(outputs["verilog"])
+    cpp_events, _result = oracle.parse_jsonl(outputs["cpp"])
+    assert (
+        b"\n".join(
+            json.dumps(row, separators=(",", ":")).encode("utf-8")
+            for row in cpp_events
+        )
+        + b"\n"
+        == outputs["verilog"]
+    )
 
 
 def test_runner_without_event_sink_is_quiet(built_design: Path) -> None:
@@ -729,15 +755,15 @@ def test_explicit_stdout_sink_contains_one_complete_result(built_design: Path) -
     assert result.returncode == 0, result.stderr
     _oracle().assert_design_top_run(result.stdout.encode("utf-8"))
 
-    # Event options may precede the required config option.
+    # Event options may precede the required cycle limit.
     events = built_design / "events-before-config.jsonl"
     reordered = subprocess.run(
         [
             str(_runner(built_design, "cpp")),
             "--events",
             str(events),
-            "--config",
-            str(FIXTURE / "configs/three-ticks.json"),
+            "--cycles",
+            "3",
         ],
         text=True,
         capture_output=True,
@@ -748,52 +774,45 @@ def test_explicit_stdout_sink_contains_one_complete_result(built_design: Path) -
     _oracle().assert_design_top_run(events.read_bytes())
 
 
-def test_same_executor_reset_replays_cpp_and_verilator_observations(
+def test_fresh_runner_replays_cpp_and_verilator_observations(
     built_design: Path,
 ) -> None:
     config = FIXTURE / "configs/three-ticks.json"
     for backend in ("cpp", "verilog"):
-        executable = built_design / f"model-{backend}" / "source_preview_reset_replay"
-        if os.name == "nt":
-            executable = executable.with_suffix(".exe")
-        assert executable.is_file(), f"missing test-only reset consumer: {executable}"
-        result = subprocess.run(
-            [str(executable), str(config), "success"],
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=60,
-        )
-        assert result.returncode == 0, result.stderr
-        assert result.stdout == "same-object reset replay matched\n"
+        traces = []
+        for index in range(2):
+            events = built_design / f"replay-{backend}-{index}.jsonl"
+            result = _run_model(
+                built_design, backend, config, events=events
+            )
+            assert result.returncode == 0, result.stderr
+            traces.append(events.read_bytes())
+        assert traces[0] == traces[1]
+        _oracle().assert_design_top_run(traces[0])
 
 
-def test_same_executor_failure_reset_replays_and_latches_error_in_both_adapters(
+def test_fresh_runner_failure_replays_identically_in_both_backends(
     tmp_path: Path,
 ) -> None:
     native = _require_preview_tools()
     build = tmp_path / "failure-reset"
-    consumer = build / "reset_replay.cpp"
-    build.mkdir(parents=True)
-    consumer.write_text(_RESET_REPLAY_SOURCE, encoding="utf-8")
-    _build_preview(
-        build,
-        native=native,
-        design="failure_top",
-        test_consumer=consumer,
-    )
+    _build_preview(build, native=native, design="failure_top")
     config = FIXTURE / "configs/four-ticks.json"
     for backend in ("cpp", "verilog"):
-        executable = build / f"model-{backend}" / "source_preview_reset_replay"
-        result = subprocess.run(
-            [str(executable), str(config), "failure"],
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=60,
-        )
-        assert result.returncode == 0, result.stderr
-        assert result.stdout == "same-object failure reset replay matched\n"
+        traces = []
+        diagnostics = []
+        for index in range(2):
+            events = build / f"failure-replay-{backend}-{index}.jsonl"
+            result = _run_model(build, backend, config, events=events)
+            assert result.returncode != 0
+            traces.append(events.read_bytes())
+            diagnostics.append(result.stderr)
+        assert traces[0] == traces[1]
+        assert diagnostics[0] == diagnostics[1]
+        if backend == "cpp":
+            _oracle().assert_failure_run(traces[0])
+        else:
+            _oracle().assert_failure_events_without_result(traces[0])
 
 
 def test_bad_configuration_and_event_sinks_fail_before_touching_outputs(
@@ -1044,17 +1063,18 @@ def test_fresh_final_duplicate_report_name_is_rejected_by_both_emitters_and_mate
     assert verify.returncode != 0
     assert re.search(r"duplicate|report|gauge", verify.stderr, re.I)
 
+    emitter = native / "bin/pycircuit-emit"
     for backend in ("cpp", "verilog"):
         output = tmp_path / f"duplicate-report-{backend}.out"
+        native_target = "structural-cpp" if backend == "cpp" else backend
         emitted = subprocess.run(
             [
-                str(design_helper),
-                "--design",
+                str(emitter),
                 str(mutated),
                 "--target",
-                backend,
-                "--output",
-                str(output),
+                native_target,
+                "--format",
+                "source",
             ],
             text=True,
             capture_output=True,
@@ -1073,7 +1093,7 @@ def test_fresh_final_duplicate_report_name_is_rejected_by_both_emitters_and_mate
     assert {target: _tree_bytes(artifacts / target) for target in before} == before
 
 
-def test_same_final_emits_signed_narrow_integer_and_bool_with_distinct_json_kinds(
+def test_same_final_emits_narrow_integer_and_bool_with_distinct_json_kinds(
     tmp_path: Path,
 ) -> None:
     native = _require_preview_tools()
@@ -1094,16 +1114,16 @@ def test_same_final_emits_signed_narrow_integer_and_bool_with_distinct_json_kind
         assert result.returncode == 0, result.stderr
         _oracle().assert_value_probe_run(events.read_bytes(), word=7)
 
-    signed_final = tmp_path / "signed-value-probe.ac"
-    signed_final.write_text(
-        _mutated_signed_probe(baseline_final.read_text(encoding="utf-8")),
+    mutated_final = tmp_path / "mutated-value-probe.ac"
+    mutated_final.write_text(
+        _mutated_narrow_probe(baseline_final.read_text(encoding="utf-8")),
         encoding="utf-8",
     )
     verified = subprocess.run(
         [
             str(native / "bin/pycircuit-link"),
             "--design",
-            str(signed_final),
+            str(mutated_final),
             "--verify-only",
         ],
         text=True,
@@ -1113,33 +1133,27 @@ def test_same_final_emits_signed_narrow_integer_and_bool_with_distinct_json_kind
     )
     assert verified.returncode == 0, verified.stderr
 
-    artifacts = tmp_path / "signed-artifacts"
-    materialized = _materialize_final(signed_final, artifacts, native)
+    artifacts = tmp_path / "mutated-artifacts"
+    artifacts.mkdir()
+    materialized = _materialize_final(mutated_final, artifacts, native)
     assert materialized.returncode == 0, materialized.stderr
-    runners = _build_materialized_models(artifacts, tmp_path / "signed-build")
+    runners = _build_materialized_models(artifacts, tmp_path / "mutated-build")
     traces: dict[str, bytes] = {}
     for backend, runner in runners.items():
-        events = tmp_path / f"signed-{backend}.jsonl"
-        result = subprocess.run(
-            [
-                str(runner),
-                "--config",
-                str(FIXTURE / "configs/three-ticks.json"),
-                "--events",
-                str(events),
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=60,
+        events = tmp_path / f"mutated-{backend}.jsonl"
+        result = _run_materialized_runner(
+            runner,
+            backend,
+            FIXTURE / "configs/three-ticks.json",
+            events=events,
         )
         assert result.returncode == 0, result.stderr
         traces[backend] = events.read_bytes()
-        _oracle().assert_value_probe_run(traces[backend], word=-1)
+        _oracle().assert_value_probe_run(traces[backend], word=255)
     _oracle().assert_repeated_run_identical(traces["cpp"], traces["verilog"])
 
 
-def test_wide_unused_integer_is_common_valid_rtl_valid_cpp_rejected_and_preserved(
+def test_wide_unused_integer_is_projected_out_by_both_hwir_backends(
     tmp_path: Path,
 ) -> None:
     native = _require_preview_tools()
@@ -1165,48 +1179,45 @@ def test_wide_unused_integer_is_common_valid_rtl_valid_cpp_rejected_and_preserve
     )
     assert verified.returncode == 0, verified.stderr
 
-    rtl_output = tmp_path / "wide-rtl.sv"
-    rtl = subprocess.run(
+    hwir = tmp_path / "wide-unused-constant.hwir.mlir"
+    lowered = subprocess.run(
         [
-            str(helper),
-            "--design",
+            str(native / "bin/pycircuit-opt"),
             str(wide_final),
-            "--target",
-            "verilog",
-            "--output",
-            str(rtl_output),
+            "--ac-final-to-hwir",
+            "-o",
+            str(hwir),
         ],
         text=True,
         capture_output=True,
         check=False,
         timeout=60,
     )
-    assert rtl.returncode == 0, rtl.stderr
-    assert rtl_output.is_file()
+    assert lowered.returncode == 0, lowered.stderr
+    assert hwir.is_file()
 
-    cpp_output = tmp_path / "wide-cpp.txt"
-    cpp = subprocess.run(
-        [
-            str(helper),
-            "--design",
-            str(wide_final),
-            "--target",
-            "cpp",
-            "--output",
-            str(cpp_output),
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=60,
-    )
-    assert cpp.returncode != 0
-    assert re.search(r"capability|range|18446744073709551616", cpp.stderr, re.I)
-    assert not cpp_output.exists()
+    emitter = native / "bin/pycircuit-emit"
+    for target in ("verilog", "structural-cpp"):
+        emitted = subprocess.run(
+            [
+                str(emitter),
+                str(hwir),
+                "--target",
+                target,
+                "--format",
+                "source",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+        assert emitted.returncode == 0, emitted.stderr
+        assert emitted.stdout
 
-    artifacts = baseline / "artifacts"
-    before = {target: _tree_bytes(artifacts / target) for target in ("cpp", "verilog")}
-    rejected = _materialize_final(wide_final, artifacts, native)
-    assert rejected.returncode != 0
-    assert re.search(r"capability|range|18446744073709551616", rejected.stderr, re.I)
-    assert {target: _tree_bytes(artifacts / target) for target in before} == before
+    artifacts = tmp_path / "wide-artifacts"
+    artifacts.mkdir()
+    materialized = _materialize_final(wide_final, artifacts, native)
+    assert materialized.returncode == 0, materialized.stderr
+    assert (artifacts / "cpp/generated.json").is_file()
+    assert (artifacts / "verilog/generated.json").is_file()

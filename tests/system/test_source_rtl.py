@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -18,34 +19,46 @@ import test_source_preview_workflow as preview
 pytestmark = pytest.mark.system
 
 ROOT = Path(__file__).resolve().parents[2]
-_RTL_TB = r"""module tb;
-  logic clk = 0;
-  logic reset = 1;
-  FinalModel dut(.clk(clk), .reset(reset));
-  initial begin
-    #5; clk = 1; #5;
-    if (dut.q0 != 3 || dut.q1 != 10 || dut.q2 != 100 || dut.q3 != 200)
-      $fatal(1, "reset image differs");
-    clk = 0; reset = 0; #5; clk = 1; #5;
-    if (dut.q2 != 0 || dut.q3 != 0)
-      $fatal(1, "first source-owned child transfer differs");
-    clk = 0; #5; clk = 1; #5;
-    if (dut.q2 != 3 || dut.q3 != 10)
-      $fatal(1, "repeated child instances did not retain distinct state");
-    $finish;
-  end
-endmodule
-"""
+
+
+def _run_emit_from_final(
+    final: Path, helper: Path
+) -> subprocess.CompletedProcess[str]:
+    with tempfile.TemporaryDirectory(prefix="pycircuit-source-rtl-hwir-") as temporary:
+        hwir = Path(temporary) / "design.hwir.mlir"
+        lowered = subprocess.run(
+            [
+                str(helper.with_name("pycircuit-opt")),
+                str(final),
+                "--ac-final-to-hwir",
+                "-o",
+                str(hwir),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=180,
+        )
+        if lowered.returncode != 0:
+            return lowered
+        return subprocess.run(
+            [
+                str(helper),
+                str(hwir),
+                "--target",
+                "verilog",
+                "--format",
+                "json",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=180,
+        )
 
 
 def _emit_from_final(final: Path, helper: Path) -> dict[str, Any]:
-    completed = subprocess.run(
-        [str(helper), str(final), "--runner"],
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=180,
-    )
+    completed = _run_emit_from_final(final, helper)
     assert completed.returncode == 0, completed.stderr
     return json.loads(completed.stdout)
 
@@ -79,31 +92,50 @@ def _build_and_run_generated_target(
     )
     assert configured.returncode == 0, f"{configured.stdout}\n{configured.stderr}"
     compiled = subprocess.run(
-        ["cmake", "--build", str(build), "--parallel", "4"],
+        [
+            "cmake",
+            "--build",
+            str(build),
+            "--target",
+            "pycircuit_sim",
+            "--parallel",
+            "2",
+        ],
         text=True,
         capture_output=True,
         check=False,
         timeout=900,
     )
     assert compiled.returncode == 0, f"{compiled.stdout}\n{compiled.stderr}"
-    runner = build / "pycircuit_system"
+    runner = build / "bin/pycircuit_sim"
     if os.name == "nt":
         runner = runner.with_suffix(".exe")
     events = output / f"{target}-events.jsonl"
-    run = subprocess.run(
-        [
+    arguments = (
+        [str(runner), "+cycles=3"]
+        if target == "verilog"
+        else [
             str(runner),
-            "--config",
-            str(public.FIXTURE / "configs/three-ticks.json"),
+            "--cycles",
+            "3",
             "--events",
             str(events),
-        ],
+        ]
+    )
+    run = subprocess.run(
+        arguments,
         text=True,
         capture_output=True,
         check=False,
         timeout=120,
     )
     assert run.returncode == 0, f"{target}: {run.stdout}\n{run.stderr}"
+    if target == "verilog":
+        return b"\n".join(
+            line
+            for line in run.stdout.encode("utf-8").splitlines()
+            if line.startswith(b"{")
+        ) + b"\n"
     return events.read_bytes()
 
 
@@ -124,7 +156,10 @@ def _verilate_groups(
     core = output / "core.sv"
     core.write_text(payload["rtl_core"], encoding="utf-8")
     testbench = output / "tb.sv"
-    testbench.write_text(_RTL_TB, encoding="utf-8")
+    testbench.write_text(payload["simulation_top"], encoding="utf-8")
+    install = Path(os.environ["PYCIRCUIT_COMPILER_INSTALL"])
+    standard_sources = [install / path for path in payload["rtl_standard_sources"]]
+    assert all(path.is_file() for path in standard_sources), standard_sources
     build = output / "obj"
     command = [
         verilator,
@@ -132,9 +167,10 @@ def _verilate_groups(
         "--timing",
         "-Wno-fatal",
         "--top-module",
-        "tb",
+        "pycircuit_sim",
         "--Mdir",
         str(build),
+        *(str(path) for path in standard_sources),
         *(str(path) for path in source_paths),
         str(core),
         str(testbench),
@@ -146,9 +182,13 @@ def _verilate_groups(
         f"Verilator failed ({compiled.returncode}): {command!r}\n"
         f"{compiled.stdout}\n{compiled.stderr}"
     )
-    executable = build / "Vtb"
+    executable = build / "Vpycircuit_sim"
     return subprocess.run(
-        [str(executable)], text=True, capture_output=True, check=False, timeout=60
+        [str(executable), "+cycles=3"],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=60,
     )
 
 
@@ -170,26 +210,23 @@ def test_source_compile_link_emits_genuine_rtl_owner_files_and_matching_behavior
         ("preview", "design_top.py"),
     ]
     assert [group["path"] for group in groups] == [
-        "sources/preview/counter.sv",
-        "sources/preview/design_top.sv",
+        "sources/source_unit_0_0.sv",
+        "sources/source_unit_1_0.sv",
     ]
-    assert [group["module"] for group in groups] == [
-        "ac_preview_counter",
-        "ac_preview_design_top",
+    module_names = [
+        re.search(r"\bmodule\s+([A-Za-z_][A-Za-z0-9_$]*)", group["text"])
+        for group in groups
     ]
-    assert "module ac_preview_counter" in groups[0]["text"]
-    assert "module ac_preview_design_top" in groups[1]["text"]
+    assert all(match is not None for match in module_names)
+    counter_module = module_names[0].group(1)
     root_instances = re.findall(
-        r"\bac_preview_counter\s+(child_\d+)", groups[1]["text"]
+        rf"\b{re.escape(counter_module)}\s+(pyc_instance_\d+)", groups[1]["text"]
     )
     assert len(root_instances) == 2 and len(set(root_instances)) == 2
     # types.py is declaration-only. It has no executable RTL owner group.
     assert all(group["source"]["path"] != "types.py" for group in groups)
-    assert "module FinalModel" in payload["rtl_core"]
-    assert all(
-        re.search(rf"\bmodule\s+{re.escape(group['module'])}\b", group["text"])
-        for group in groups
-    )
+    assert "module pyc_root" in payload["rtl_core"]
+    assert payload["root_rtl_name"] == "pyc_root"
 
     cpp_events = build / "cpp-source-events.jsonl"
     cpp_result = preview._run_model(
@@ -204,10 +241,16 @@ def test_source_compile_link_emits_genuine_rtl_owner_files_and_matching_behavior
     rtl_result = _verilate_groups(payload, tmp_path / "grouped-rtl")
     assert rtl_result.returncode == 0, rtl_result.stdout + rtl_result.stderr
     assert "finish" in rtl_result.stdout.lower()
+    rtl_jsonl = b"\n".join(
+        line
+        for line in rtl_result.stdout.encode("utf-8").splitlines()
+        if line.startswith(b"{")
+    ) + b"\n"
+    preview._oracle().assert_design_top_run(rtl_jsonl)
     assert preview._sha256(final) == final_hash
 
 
-def test_rtl_source_module_name_collision_fails_without_partial_output(
+def test_rtl_source_module_names_that_share_a_legacy_spelling_remain_distinct(
     tmp_path: Path,
 ) -> None:
     source_root = tmp_path / "collision-source"
@@ -219,7 +262,7 @@ def test_rtl_source_module_name_collision_fails_without_partial_output(
     ):
         (source_root / filename).write_text(
             "from pycircuit import module, rule\n"
-            "from .types import Word\n\n"
+            "from pycircuit import u8 as Word\n\n"
             "@module\n"
             f"def {definition}(incoming: Word, outgoing: Word):\n"
             "    @rule\n"
@@ -231,7 +274,7 @@ def test_rtl_source_module_name_collision_fails_without_partial_output(
         )
     (source_root / "top.py").write_text(
         "from pycircuit import system\n"
-        "from .types import Word\n"
+        "from pycircuit import u8 as Word\n"
         "from .fooBar import FirstUnit\n"
         "from .foo_bar import SecondUnit\n\n"
         "@system\n"
@@ -275,20 +318,24 @@ def test_rtl_source_module_name_collision_fails_without_partial_output(
     )
     assert linked.returncode == 0, linked.stderr
 
-    completed = subprocess.run(
-        [
-            str(preview._parts_helper(preview._require_preview_tools())),
-            str(final),
-            "--runner",
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=180,
+    completed = _run_emit_from_final(
+        final,
+        preview._parts_helper(preview._require_preview_tools()),
     )
-    assert completed.returncode == 1
-    assert completed.stdout == "", "rejected collision must not publish partial JSON"
-    assert re.search(r"colli(sion|de)|same", completed.stderr, re.IGNORECASE)
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    groups = {
+        group["source"]["path"]: group["text"]
+        for group in payload["rtl_source_groups"]
+    }
+    definitions = []
+    for source in ("fooBar.py", "foo_bar.py"):
+        match = re.search(
+            r"\bmodule\s+([A-Za-z_][A-Za-z0-9_$]*)", groups[source]
+        )
+        assert match is not None
+        definitions.append(match.group(1))
+    assert len(set(definitions)) == 2
 
 
 def test_unicode_value_formals_compile_and_match_on_cpp_and_verilog(
@@ -304,7 +351,7 @@ def test_unicode_value_formals_compile_and_match_on_cpp_and_verilog(
     )
     final = public._compile_link(source_root, tmp_path / "published", "source_public")
     cpp_output, rtl_output = tmp_path / "unicode-cpp", tmp_path / "unicode-rtl"
-    public._emit(final, "cpp", cpp_output)
+    public._emit(final, "structural-cpp", cpp_output)
     public._emit(final, "verilog", rtl_output)
 
     rtl = "\n".join(
@@ -318,11 +365,12 @@ def test_unicode_value_formals_compile_and_match_on_cpp_and_verilog(
     rtl_events = _build_and_run_generated_target(
         rtl_output, "verilog", tmp_path / "unicode-run"
     )
-    assert cpp_events == rtl_events
-    preview._oracle().assert_design_top_run(cpp_events)
+    oracle = preview._oracle()
+    oracle.assert_design_top_run(cpp_events)
+    oracle.assert_design_top_run(rtl_events)
 
 
-def test_verilog_formals_that_collide_after_identifier_legalization_are_rejected(
+def test_verilog_formals_that_differ_by_case_remain_distinct(
     tmp_path: Path,
 ) -> None:
     source_root = tmp_path / "formal-collision-source"
@@ -330,7 +378,7 @@ def test_verilog_formals_that_collide_after_identifier_legalization_are_rejected
     (source_root / "types.py").write_text(cpp.TYPES, encoding="utf-8")
     (source_root / "child.py").write_text(
         "from pycircuit import module, rule\n"
-        "from .types import Word\n\n"
+        "from pycircuit import u8 as Word\n\n"
         "@module\n"
         "def Child(A: Word, a: Word):\n"
         "    @rule\n"
@@ -342,7 +390,7 @@ def test_verilog_formals_that_collide_after_identifier_legalization_are_rejected
     )
     (source_root / "top.py").write_text(
         "from pycircuit import module\n"
-        "from .types import Word\n"
+        "from pycircuit import u8 as Word\n"
         "from .child import Child\n\n"
         "@module\n"
         "def Top():\n"
@@ -369,16 +417,19 @@ def test_verilog_formals_that_collide_after_identifier_legalization_are_rejected
         headers=(types.header, child.header),
     )
     final = tmp_path / "formal-collision.final.ac"
-    linked = cpp._link([types, child, top], final, top="demo.top.Top", role=None)
+    linked = cpp._link([types, child, top], final, top="demo.top.Top")
     assert linked.returncode == 0, linked.stderr
 
-    output = tmp_path / "rejected-rtl"
-    rejected = public._emit(final, "verilog", output, expected=1)
-    assert re.search(r"colli(sion|de)", rejected.stderr, re.IGNORECASE)
-    assert not output.exists()
+    output = tmp_path / "case-distinct-rtl"
+    public._emit(final, "verilog", output)
+    rtl = "\n".join(
+        path.read_text(encoding="utf-8") for path in sorted(output.rglob("*.sv"))
+    )
+    assert re.search(r"\binput wire logic \[7:0\] A\b", rtl)
+    assert re.search(r"\binput wire logic \[7:0\] a\b", rtl)
 
 
-def test_verilog_rejects_formal_enable_name_collision_with_owned_state(
+def test_verilog_formal_and_owned_state_use_distinct_names(
     tmp_path: Path,
 ) -> None:
     source_root = tmp_path / "formal-state-collision-source"
@@ -386,21 +437,20 @@ def test_verilog_rejects_formal_enable_name_collision_with_owned_state(
     (source_root / "types.py").write_text(cpp.TYPES, encoding="utf-8")
     (source_root / "child.py").write_text(
         "from pycircuit import module, rule\n"
-        "from .types import Word\n\n"
+        "from pycircuit import u8 as Word\n\n"
         "@module\n"
         "def Child(Q0: Word):\n"
         "    state0: Word = 0\n\n"
         "    @rule\n"
         "    def advance():\n"
-        "        nonlocal Q0, state0\n"
-        "        Q0 = state0\n"
+        "        nonlocal state0\n"
         "        state0 = Q0\n"
         "    advance()\n",
         encoding="utf-8",
     )
     (source_root / "top.py").write_text(
         "from pycircuit import module\n"
-        "from .types import Word\n"
+        "from pycircuit import u8 as Word\n"
         "from .child import Child\n\n"
         "@module\n"
         "def Top():\n"
@@ -426,45 +476,50 @@ def test_verilog_rejects_formal_enable_name_collision_with_owned_state(
         headers=(types.header, child.header),
     )
     final = tmp_path / "formal-state-collision.final.ac"
-    linked = cpp._link([types, child, top], final, top="demo.top.Top", role=None)
+    linked = cpp._link([types, child, top], final, top="demo.top.Top")
     assert linked.returncode == 0, linked.stderr
 
-    output = tmp_path / "formal-state-collision-rtl"
-    rejected = public._emit(final, "verilog", output, expected=1)
-    assert re.search(r"colli(sion|de)", rejected.stderr, re.IGNORECASE)
-    assert not output.exists()
+    output = tmp_path / "formal-state-distinct-rtl"
+    public._emit(final, "verilog", output)
+    rtl = "\n".join(
+        path.read_text(encoding="utf-8") for path in sorted(output.rglob("*.sv"))
+    )
+    assert re.search(r"\binput wire logic \[7:0\] Q0\b", rtl)
+    assert "dffe #( .T(logic [7:0]) ) pyc_instance_" in rtl
 
 
-def test_verilog_rejects_parent_formal_collision_with_child_output_wire(
+def test_verilog_parent_formal_and_child_result_wire_use_distinct_names(
     tmp_path: Path,
 ) -> None:
     source_root = tmp_path / "parent-wire-collision-source"
     source_root.mkdir()
     (source_root / "types.py").write_text(cpp.TYPES, encoding="utf-8")
     (source_root / "child.py").write_text(
-        "from pycircuit import module, rule\n"
-        "from .types import Word\n\n"
+        "from pycircuit import module, rule, struct\n"
+        "from pycircuit import u8 as Word\n\n"
+        "@struct\n"
+        "class ChildResult:\n"
+        "    value: Word\n\n"
         "@module\n"
-        "def Child(incoming: Word, outgoing: Word):\n"
+        "def Child(incoming: Word) -> ChildResult:\n"
         "    @rule\n"
-        "    def forward():\n"
-        "        nonlocal outgoing\n"
-        "        outgoing = incoming\n"
-        "    forward()\n",
+        "    def forward() -> ChildResult:\n"
+        "        return ChildResult(value=incoming)\n"
+        "    return forward()\n",
         encoding="utf-8",
     )
     (source_root / "parent.py").write_text(
         "from pycircuit import module\n"
-        "from .types import Word\n"
+        "from pycircuit import u8 as Word\n"
         "from .child import Child\n\n"
         "@module\n"
-        "def Parent(child_0_outgoing: Word, incoming: Word):\n"
-        "    child = Child(incoming, child_0_outgoing)\n",
+        "def Parent(child_0_result: Word, incoming: Word):\n"
+        "    child = Child(incoming)\n",
         encoding="utf-8",
     )
     (source_root / "top.py").write_text(
         "from pycircuit import module\n"
-        "from .types import Word\n"
+        "from pycircuit import u8 as Word\n"
         "from .parent import Parent\n\n"
         "@module\n"
         "def Top():\n"
@@ -497,15 +552,16 @@ def test_verilog_rejects_parent_formal_collision_with_child_output_wire(
         headers=(types.header, child.header, parent.header),
     )
     final = tmp_path / "parent-wire-collision.final.ac"
-    linked = cpp._link(
-        [types, child, parent, top], final, top="demo.top.Top", role=None
-    )
+    linked = cpp._link([types, child, parent, top], final, top="demo.top.Top")
     assert linked.returncode == 0, linked.stderr
 
-    output = tmp_path / "parent-wire-collision-rtl"
-    rejected = public._emit(final, "verilog", output, expected=1)
-    assert re.search(r"colli(sion|de)", rejected.stderr, re.IGNORECASE)
-    assert not output.exists()
+    output = tmp_path / "parent-wire-distinct-rtl"
+    public._emit(final, "verilog", output)
+    rtl = "\n".join(
+        path.read_text(encoding="utf-8") for path in sorted(output.rglob("*.sv"))
+    )
+    assert re.search(r"\binput wire logic \[7:0\] child_0_result\b", rtl)
+    assert ".result(" in rtl
 
 
 def test_distinct_source_owners_can_each_define_a_child_named_child(
@@ -516,15 +572,17 @@ def test_distinct_source_owners_can_each_define_a_child_named_child(
         directory.mkdir(parents=True, exist_ok=True)
     child_source = (
         "from typing import Annotated\n"
-        "from pycircuit import module, rule\n\n"
+        "from pycircuit import module, rule, struct\n\n"
         "Word = Annotated[int, range(256)]\n\n"
+        "@struct\n"
+        "class ChildResult:\n"
+        "    value: Word\n\n"
         "@module\n"
-        "def Child(incoming: Word, outgoing: Word):\n"
+        "def Child(incoming: Word) -> ChildResult:\n"
         "    @rule\n"
-        "    def forward():\n"
-        "        nonlocal outgoing\n"
-        "        outgoing = incoming\n"
-        "    forward()\n"
+        "    def forward() -> ChildResult:\n"
+        "        return ChildResult(value=incoming)\n"
+        "    return forward()\n"
     )
     for relative in ("left/child.py", "right/child.py"):
         (source_root / relative).write_text(child_source, encoding="utf-8")
@@ -540,8 +598,8 @@ def test_distinct_source_owners_can_each_define_a_child_named_child(
         "    right_in: Word = 10\n"
         "    left_out: Word = 0\n"
         "    right_out: Word = 0\n"
-        "    left = LeftChild(left_in, left_out)\n"
-        "    right = RightChild(right_in, right_out)\n",
+        "    left = LeftChild(left_in)\n"
+        "    right = RightChild(right_in)\n",
         encoding="utf-8",
     )
     left = cpp._compile_source(
@@ -561,7 +619,7 @@ def test_distinct_source_owners_can_each_define_a_child_named_child(
         headers=(left.header, right.header),
     )
     final = tmp_path / "same-short-name.final.ac"
-    linked = cpp._link([left, right, top], final, top="demo.top.Top", role=None)
+    linked = cpp._link([left, right, top], final, top="demo.top.Top")
     assert linked.returncode == 0, linked.stderr
 
     output = tmp_path / "same-short-name-rtl"

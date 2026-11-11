@@ -2,7 +2,7 @@ from pycircuit import bits, module, rule
 
 
 @rule
-def accumulate(value, enable):
+def accumulate(value, enable) -> None:
     if enable:
         value = value + 1
 

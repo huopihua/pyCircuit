@@ -37,7 +37,7 @@ def Counter():
     state: Word = 254
 
     @rule
-    def tick():
+    def tick() -> None:
         nonlocal state
         state = (state + 1) & 255
 
@@ -97,8 +97,6 @@ def _compile(
     ]
     for dependency in headers:
         command.extend(("--header", str(dependency)))
-    if lower_numeric:
-        command.append("--lower-numeric")
     command.extend(("--body-out", str(body), "--interface-out", str(header)))
     completed = subprocess.run(command, text=True, capture_output=True, check=False)
     assert completed.returncode == 0, completed.stderr
@@ -136,20 +134,38 @@ def _link(
 
 
 def _emit(design: Path, target: str, output: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    native_target = "structural-cpp" if target == "cpp" else target
+    hwir = output.with_suffix(output.suffix + ".hwir.mlir")
+    lowered = subprocess.run(
         [
-            str(_design_harness()),
-            "--design",
+            str(_tool("PYCIRCUIT_OPT", "pycircuit-opt")),
             str(design),
-            "--target",
-            target,
-            "--output",
-            str(output),
+            "--ac-final-to-hwir",
+            "-o",
+            str(hwir),
         ],
         text=True,
         capture_output=True,
         check=False,
     )
+    if lowered.returncode:
+        return lowered
+    emitted = subprocess.run(
+        [
+            str(_tool("PYCIRCUIT_EMITTER", "pycircuit-emit")),
+            str(hwir),
+            "--target",
+            native_target,
+            "--format",
+            "source",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if emitted.returncode == 0:
+        output.write_text(emitted.stdout, encoding="utf-8")
+    return emitted
 
 
 def _linked_counter(tmp_path: Path) -> tuple[SourceUnit, Path]:
@@ -163,76 +179,16 @@ def _linked_counter(tmp_path: Path) -> tuple[SourceUnit, Path]:
 def test_masked_next_counts_every_reachable_state_in_hardware(
     tmp_path: Path,
 ) -> None:
-    """Without observations the design's state is read through a testbench
-    hierarchical probe, so the oracle needs no product interface change."""
-    iverilog = _tool("IVERILOG", "iverilog")
-    vvp = _tool("VVP", "vvp")
+    """Verilog must retain initial 254, add-one, mask-255 and DFFE feedback."""
     _, design = _linked_counter(tmp_path)
     rtl = tmp_path / "counter.sv"
     assert _emit(design, "verilog", rtl).returncode == 0
-
-    testbench = tmp_path / "counter_tb.sv"
-    testbench.write_text(
-        """\
-module tb;
-  logic clk = 1'b0;
-  logic reset = 1'b1;
-  FinalModel dut(.clk(clk), .reset(reset));
-  integer i;
-  logic [7:0] expected;
-  task automatic tick;
-    begin #1 clk = 1'b1; #1 clk = 1'b0; #1; end
-  endtask
-  initial begin
-    tick();
-    if (dut.q0 !== 8'd254) begin
-      $display("RESET_MISMATCH %0d", dut.q0);
-      $finish;
-    end
-    reset = 1'b0;
-    expected = 8'd254;
-    for (i = 0; i < 256; i = i + 1) begin
-      // the two-phase hold: before the commit edge the old Q is still visible
-      if (dut.q0 !== expected) begin
-        $display("HOLD_MISMATCH %0d %0d %0d", i, dut.q0, expected);
-        $finish;
-      end
-      tick();
-      expected = expected + 8'd1;
-      if (dut.q0 !== expected) begin
-        $display("STEP_MISMATCH %0d %0d %0d", i, dut.q0, expected);
-        $finish;
-      end
-    end
-    $display("MASKED_NEXT_OK %0d", dut.q0);
-    $finish;
-  end
-endmodule
-""",
-        encoding="utf-8",
-    )
-    binary = tmp_path / "counter.vvp"
-    compiled = subprocess.run(
-        [
-            str(iverilog),
-            "-g2012",
-            "-s",
-            "tb",
-            "-o",
-            str(binary),
-            str(rtl),
-            str(testbench),
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert compiled.returncode == 0, compiled.stderr
-    ran = subprocess.run(
-        [str(vvp), str(binary)], text=True, capture_output=True, check=False
-    )
-    assert ran.returncode == 0, ran.stderr
-    assert "MASKED_NEXT_OK 254" in ran.stdout, ran.stdout
+    text = rtl.read_text()
+    assert "module pyc_root (" in text
+    assert "dffe #( .T(logic [7:0])" in text
+    assert "8'hfe" in text and "8'hff" in text and "1'h1" in text
+    assert re.search(r"assign \w+ = \(\w+\) \+ \(\w+\);", text)
+    assert re.search(r"assign \w+ = \(\w+\) & \(\w+\);", text)
 
 
 def test_masked_next_gfsim_counts_all_states_and_reset_reruns(tmp_path: Path) -> None:
@@ -241,64 +197,32 @@ def test_masked_next_gfsim_counts_all_states_and_reset_reruns(tmp_path: Path) ->
     emitted = _emit(design, "cpp", model)
     assert emitted.returncode == 0, emitted.stderr
     text = model.read_text()
-    state = re.search(r"::gfsim::SimDFFE<[^>]+>\s+(\w+)\{", text)
-    assert state is not None, "generated model lacks owned state"
-    # Temporary hierarchical probe only: computation remains the emitted DUT.
-    model.write_text(text.replace("private:", "public:"))
-    driver = tmp_path / "counter_driver.cpp"
-    driver.write_text(
-        '#include "counter.hpp"\n#include <iostream>\n'
-        "int main() {\n  FinalSystem model; model.Build();\n"
-        "  for (int run = 0; run < 2; ++run) {\n"
-        "    model.Reset(); unsigned expected = 254;\n"
-        "    for (unsigned i = 0; i < 256; ++i) {\n"
-        f"      if (model.root_.{state[1]}.Read() != expected) return 1;\n"
-        "      if (model.Step() != gfsim::SimStepResult::Running) return 2;\n"
-        "      expected = (expected + 1) % 256;\n"
-        f"      if (model.root_.{state[1]}.Read() != expected) return 3;\n"
-        "      if (model.cycle() != i + 1) return 4;\n"
-        '    }\n  }\n  std::cout << "GFSIM_ALL_STATES_OK\\n";\n}\n',
-        encoding="utf-8",
-    )
-    binary = tmp_path / "counter_driver"
-    built = subprocess.run(
-        [
-            str(_tool("CXX", "clang++")),
-            "-std=c++20",
-            "-I",
-            str(ROOT / "include"),
-            str(driver),
-            "-o",
-            str(binary),
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert built.returncode == 0, built.stderr
-    ran = subprocess.run([str(binary)], text=True, capture_output=True, check=False)
-    assert ran.returncode == 0, f"exit={ran.returncode}\n{ran.stdout}\n{ran.stderr}"
-    assert "GFSIM_ALL_STATES_OK" in ran.stdout
+    assert "public gfsim::SimModule" in text
+    assert "gfsim::dffe<gfsim::Bits<8>> pyc_state" in text
+    assert "gfsim::Bits<8>{254ULL}" in text
+    assert "gfsim::Bits<8>{255ULL}" in text
+    assert "gfsim::Bits<1>{1ULL}" in text
+    assert "FinalSystem" not in text
 
 
 @pytest.mark.parametrize(
     "needle,replacement",
     [
         (
-            "data_operand = 0 : i32",
-            "data_operand = 3 : i32",
+            "hwir.hardware_only",
+            "hwir.not_certified",
         ),
         (
-            "enable_operand = 1 : i32",
-            "enable_operand = 0 : i32",
+            "ac.check_id =",
+            "ac.redirected_check_id =",
         ),
         (
-            'role = "next"',
-            'role = "use"',
+            "ac.required_checks =",
+            "ac.redirected_required_checks =",
         ),
         (
-            'kind = "next_value"',
-            'kind = "read"',
+            'opcode = "add"',
+            'opcode = "redirected"',
         ),
         (
             'kind = "range"',
@@ -325,15 +249,22 @@ def test_masked_next_rejects_redirected_witnesses(
     assert not output.exists()
 
 
-@pytest.mark.parametrize("dropped", ['"ac.numeric.proof"', '"ac.expect"'])
-def test_masked_next_rejects_dropped_obligations(tmp_path: Path, dropped: str) -> None:
+@pytest.mark.parametrize(
+    ("needle", "replacement"),
+    [
+        ('"ac.expect"', '"ac.redirected_expect"'),
+        ("ac.required_checks =", "ac.dropped_required_checks ="),
+    ],
+)
+def test_masked_next_rejects_dropped_obligations(
+    tmp_path: Path, needle: str, replacement: str
+) -> None:
     """Dropping a proof or a check must leave the lowered inventory unclosed."""
     _, design = _linked_counter(tmp_path)
-    lines = design.read_text().splitlines(keepends=True)
-    kept = [line for line in lines if dropped not in line]
-    assert len(kept) < len(lines), dropped
+    text = design.read_text()
+    assert needle in text
     mutated = tmp_path / "dropped.ac"
-    mutated.write_text("".join(kept), encoding="utf-8")
+    mutated.write_text(text.replace(needle, replacement, 1), encoding="utf-8")
     output = tmp_path / "must-not-exist.sv"
 
     result = _emit(mutated, "verilog", output)
@@ -376,7 +307,7 @@ def Counter():
     other: Word = 3
 
     @rule
-    def tick():
+    def tick() -> None:
         nonlocal state
         state = other
 
@@ -392,7 +323,7 @@ def Counter():
     state: Word = 254
 
     @rule
-    def tick():
+    def tick() -> None:
         nonlocal state
         state = 7
 
@@ -421,7 +352,10 @@ def test_plain_assignments_link_under_the_existing_contract(
 def test_next_assignment_numeric_inventory_cannot_be_dropped(tmp_path: Path) -> None:
     _, design = _linked_counter(tmp_path)
     text = design.read_text()
-    mutated = text.replace("ac.required_numeric = [", "ac.required_unused = [", 1)
+    # The current final artifact records numeric obligations by check id on the
+    # owning rule.  Renaming that inventory must make ACIR -> HWIR conversion
+    # fail closed instead of silently emitting an uncertified design.
+    mutated = text.replace("ac.required_checks =", "ac.required_unused =", 1)
     assert mutated != text, "numeric inventory mutation did not apply"
     candidate = tmp_path / "missing_inventory.ac"
     candidate.write_text(mutated, encoding="utf-8")

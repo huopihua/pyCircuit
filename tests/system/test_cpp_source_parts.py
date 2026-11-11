@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,10 +27,11 @@ ROOT = Path(__file__).resolve().parents[2]
 GFSIM_INCLUDE = ROOT / "include"
 
 TYPES = """\
-from typing import Annotated
+from pycircuit import struct, u8 as Word
 
-Word = Annotated[int, range(256)]
-Phase = Annotated[int, range(8)]
+@struct
+class CounterResult:
+    count: Word
 """
 
 # The child owns one hidden register per instance and writes to a register
@@ -37,30 +39,30 @@ Phase = Annotated[int, range(8)]
 # state without duplicating either parent output.
 COUNTER_CHILD = """\
 from pycircuit import module, rule
-from .types import Word
+from pycircuit import u8 as Word
+from .types import CounterResult
+
+@rule
+def capture(count, incoming, outgoing) -> CounterResult:
+    result = CounterResult(count=count)
+    count = incoming
+    return result
 
 @module
-def Counter(incoming: Word, outgoing: Word):
+def Counter(incoming: Word, outgoing: Word) -> CounterResult:
     count: Word = 0
-
-    @rule
-    def capture():
-        nonlocal count
-        count = incoming
-
-    @rule
-    def forward():
-        nonlocal outgoing
-        outgoing = count
-
-    capture()
-    forward()
+    return capture(count, incoming, outgoing)
 """
 
 COUNTER_SYSTEM = """\
-from pycircuit import system, rule, log, report
-from .types import Word, Phase
+from pycircuit import system, rule, log
+from pycircuit import u3 as Phase, u8 as Word
 from .counter import Counter
+
+@rule
+def transfer(left_output, right_output, left_count, right_count) -> None:
+    left_output = left_count
+    right_output = right_count
 
 @system
 def TestCounters():
@@ -71,23 +73,14 @@ def TestCounters():
     phase: Phase = 0
     left = Counter(left_input, left_output)
     right = Counter(right_input, right_output)
+    transfer(left_output, right_output, left.count, right.count)
 
     @rule
-    def fixture():
+    def fixture() -> None:
         nonlocal phase
-        if phase == 0:
-            assert left_output == 100 and right_output == 200, "reset values"
-        elif phase == 1:
-            assert left_output == 0 and right_output == 0, "first commit"
-            log("info", "left", left_output)
-            log("info", "right", right_output)
-        elif phase == 2:
-            assert left_output == 3 and right_output == 10, "second commit"
-            log("info", "left", left_output)
-            log("info", "right", right_output)
-            report("completed", 1)
-        if phase < 3:
-            phase = phase + 1
+        log("info", "left", left_output)
+        log("info", "right", right_output)
+        phase = (phase + 1) & 7
 
     fixture()
 """
@@ -120,6 +113,43 @@ def _design_harness() -> str:
 
 def _source_parts_harness() -> str:
     return _tool("PYCIRCUIT_EMITTER", "pycircuit-emit")
+
+
+def _optimizer() -> str:
+    return _tool("PYCIRCUIT_OPT", "pycircuit-opt")
+
+
+def _emit_hwir(
+    final: Path, *arguments: str
+) -> subprocess.CompletedProcess[str]:
+    with tempfile.TemporaryDirectory(prefix="pycircuit-test-hwir-") as temporary:
+        hwir = Path(temporary) / "design.hwir.mlir"
+        lowered = subprocess.run(
+            [_optimizer(), str(final), "--ac-final-to-hwir", "-o", str(hwir)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if lowered.returncode != 0:
+            return lowered
+        return subprocess.run(
+            [_source_parts_harness(), str(hwir), *arguments],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+
+def _emit_source(
+    final: Path, target: str, output: Path
+) -> subprocess.CompletedProcess[str]:
+    native_target = "structural-cpp" if target == "cpp" else target
+    result = _emit_hwir(
+        final, "--target", native_target, "--format", "source"
+    )
+    if result.returncode == 0:
+        output.write_text(result.stdout, encoding="utf-8")
+    return result
 
 
 def _compile_source(
@@ -159,14 +189,11 @@ def _link(
     output: Path,
     *,
     top: str = "demo.test_counters.TestCounters",
-    role: str | None = "testbench",
 ) -> subprocess.CompletedProcess[str]:
     command = [_design_harness()]
     for unit in units:
         command.extend(("--body", str(unit.body), "--header", str(unit.header)))
     command.extend(("--top", top, "--target", "final", "--output", str(output)))
-    if role:
-        command.extend(("--role", role))
     return subprocess.run(command, text=True, capture_output=True, check=False)
 
 
@@ -208,8 +235,7 @@ def _build_static_profile_final(tmp_path: Path) -> Path:
     (source_root / "types.py").write_text(TYPES, encoding="utf-8")
     source = source_root / "static_root.py"
     source.write_text(
-        "from pycircuit import module\n"
-        "from .types import Word\n\n"
+        "from pycircuit import module, u8 as Word\n\n"
         "@module\n"
         "def StaticRoot():\n"
         "    value: Word = 0\n",
@@ -227,66 +253,36 @@ def _build_static_profile_final(tmp_path: Path) -> Path:
         headers=(types.header,),
     )
     final = tmp_path / "static_root.final.ac"
-    linked = _link([types, unit], final, top="demo.static_root.StaticRoot", role=None)
+    linked = _link([types, unit], final, top="demo.static_root.StaticRoot")
     assert linked.returncode == 0, linked.stderr
     return final
 
 
 def _emit_parts(final: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [_source_parts_harness(), str(final)],
-        text=True,
-        capture_output=True,
-        check=False,
+    return _emit_hwir(
+        final, "--target", "structural-cpp", "--format", "json"
     )
 
 
 def _emit_legacy(
     final: Path, target: str, output: Path
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [
-            _design_harness(),
-            "--design",
-            str(final),
-            "--target",
-            target,
-            "--role",
-            "testbench",
-            "--output",
-            str(output),
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    return _emit_source(final, target, output)
 
 
 def _write_parts(tmp_path: Path, payload: dict) -> tuple[Path, list[dict]]:
     output = tmp_path / "cpp-parts"
     output.mkdir()
-    (output / "pycircuit_support.hpp").write_text(
-        payload["support_header"], encoding="utf-8"
+    (output / "design.hpp").write_text(
+        payload["structural_cpp_header"], encoding="utf-8"
     )
-    (output / "pycircuit_system.hpp").write_text(
-        payload["system_header"], encoding="utf-8"
-    )
-
-    groups = payload["source_groups"]
+    groups = payload["structural_cpp_groups"]
     for group in groups:
-        for key in ("header_path", "source_path"):
-            if group[key] is None:
-                assert key == "source_path" and group["implementation"] is None
-                continue
-            relative = Path(group[key])
-            assert not relative.is_absolute() and ".." not in relative.parts
-        header_path = output / group["header_path"]
-        header_path.parent.mkdir(parents=True, exist_ok=True)
-        header_path.write_text(group["header"], encoding="utf-8")
-        if group["source_path"] is not None:
-            source_path = output / group["source_path"]
-            source_path.parent.mkdir(parents=True, exist_ok=True)
-            source_path.write_text(group["implementation"], encoding="utf-8")
+        relative = Path(group["path"])
+        assert not relative.is_absolute() and ".." not in relative.parts
+        source_path = output / relative
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(group["text"], encoding="utf-8")
     return output, groups
 
 
@@ -301,8 +297,7 @@ def _include_args(output: Path) -> list[str]:
 def _compile_groups(output: Path, groups: list[dict], tmp_path: Path) -> list[Path]:
     cxx = _cxx()
     include_args = _include_args(output)
-    headers = [output / "pycircuit_support.hpp", output / "pycircuit_system.hpp"]
-    headers += [output / group["header_path"] for group in groups]
+    headers = [output / "design.hpp"]
     for header in headers:
         checked = subprocess.run(
             [
@@ -322,10 +317,7 @@ def _compile_groups(output: Path, groups: list[dict], tmp_path: Path) -> list[Pa
 
     objects: list[Path] = []
     for index, group in enumerate(groups):
-        if group["source_path"] is None:
-            assert group["implementation"] is None
-            continue
-        source = output / group["source_path"]
+        source = output / group["path"]
         object_file = tmp_path / f"source-group-{index}.o"
         compiled = subprocess.run(
             [
@@ -347,29 +339,38 @@ def _compile_groups(output: Path, groups: list[dict], tmp_path: Path) -> list[Pa
 
 
 DRIVER = """\
-#include "pycircuit_system.hpp"
+#include "design.hpp"
 #include <iostream>
 
 int second_consumer();
 
-static int run_once(FinalSystem &model, const char *tag) {
+static auto bit(bool value) {
+  return gfsim::wire<gfsim::Bits<1>>::known(gfsim::Bits<1>{value ? 1u : 0u});
+}
+
+static int run_once(pyc_dut &dut, const char *tag) {
+  auto &model = dut.system();
+  dut.drive({bit(false), bit(false)});
   model.Reset();
-  for (int i = 0; i < 5; ++i) {
+  for (int i = 0; i < 3; ++i) {
+    dut.drive({bit(false), bit(false)});
+    if (model.Step() != gfsim::SimStepResult::Running) return 5;
+    dut.drive({bit(true), bit(false)});
     const auto step = model.Step();
-    for (const auto &event : model.Observations().Events())
+    for (const auto &event : dut.observations().Events())
       std::cout << tag << " EV " << event.value.bits << "\\n";
     if (step == gfsim::SimStepResult::Failed ||
         step == gfsim::SimStepResult::InvalidState) return 5;
-    if (step == gfsim::SimStepResult::Quiescent) break;
   }
   return 0;
 }
 
 int main() {
-  FinalSystem model;
-  model.Build();
-  if (int first = run_once(model, "A")) return first;
-  if (int second = run_once(model, "B")) return second;
+  pyc_dut dut;
+  dut.drive({bit(false), bit(false)});
+  dut.system().Build();
+  if (int first = run_once(dut, "A")) return first;
+  if (int second = run_once(dut, "B")) return second;
   if (second_consumer() != 0) return 9;
   std::cout << "DONE\\n";
   return 0;
@@ -383,13 +384,13 @@ def _run_cpp(tmp_path: Path, output: Path, objects: list[Path]) -> str:
     consumer = tmp_path / "source_parts_second_consumer.cpp"
     consumer.write_text(
         """\
-#include "pycircuit_system.hpp"
+#include "design.hpp"
 
 int second_consumer() {
-  FinalSystem model;
-  model.Build();
-  model.Reset();
-  return model.cycle() == 0 ? 0 : 1;
+  pyc_dut dut;
+  dut.system().Build();
+  dut.system().Reset();
+  return dut.system().cycle() == 0 ? 0 : 1;
 }
 """,
         encoding="utf-8",
@@ -570,25 +571,13 @@ def test_source_parts_preserve_per_source_cpp_tus_and_behavior(tmp_path: Path) -
     shutil.rmtree(tmp_path / "units")
     shutil.rmtree(tmp_path / "reverse/units")
 
-    # Validate this source/observation fixture against the existing monolithic
-    # C++ and RTL renderers before asking the new source-parts harness to emit.
-    expected = [0, 0, 3, 10]
-    legacy_cpp = tmp_path / "legacy_model.cpp"
-    legacy_rtl = tmp_path / "legacy_model.sv"
-    assert _emit_legacy(final, "cpp", legacy_cpp).returncode == 0
-    assert _emit_legacy(final, "verilog", legacy_rtl).returncode == 0
-    assert _trace(_run_legacy_cpp(tmp_path, legacy_cpp), "A") == expected
-    rtl_values = _rtl_trace(_run_legacy_verilog(tmp_path, legacy_rtl))
-    # Logs and the final report gauge are each strobed twice by the RTL wrapper.
-    per_run = expected + [1]
-    assert rtl_values[: len(per_run)] == per_run, rtl_values
-    assert rtl_values[len(per_run) : 2 * len(per_run)] == per_run, rtl_values
+    expected = [100, 200, 0, 0, 3, 10]
 
     emitted = _emit_parts(final)
     assert emitted.returncode == 0, emitted.stderr
     payload = json.loads(emitted.stdout)
-    assert set(payload) == {"support_header", "system_header", "source_groups"}
-    assert payload["support_header"] and payload["system_header"]
+    assert payload["structural_cpp_header"]
+    assert payload["structural_cpp_groups"]
     repeated_emission = _emit_parts(final)
     reversed_emission = _emit_parts(reversed_final)
     assert repeated_emission.returncode == 0, repeated_emission.stderr
@@ -605,47 +594,28 @@ def test_source_parts_preserve_per_source_cpp_tus_and_behavior(tmp_path: Path) -
         ("demo", "test_counters.py"),
         ("demo", "types.py"),
     ]
-    assert len({group["header_path"] for group in groups}) == len(groups)
-    executable_groups = [group for group in groups if group["source_path"] is not None]
-    assert len({group["source_path"] for group in executable_groups}) == 2
-    assert all(group["header_path"].endswith(".hpp") for group in groups)
-    assert all(group["source_path"].endswith(".cpp") for group in executable_groups)
-    declaration_group = next(
-        group for group in groups if group["source"]["path"] == "types.py"
-    )
-    assert declaration_group["source_path"] is None
-    assert declaration_group["implementation"] is None
+    executable_groups = groups
+    assert len({group["path"] for group in groups}) == len(groups)
+    assert all(group["path"].endswith(".cpp") for group in groups)
 
     child_groups = [
         group for group in groups if group["source"]["path"] == "counter.py"
     ]
     assert len(child_groups) == 1, "repeated child instances must share one source TU"
     child_group = child_groups[0]
-    child_text = child_group["header"] + child_group["implementation"]
-    # Class and state names must remain source-derived. Empty static arguments
-    # still select the one legal specialization of the source class template.
-    assert re.search(r"\bnamespace\s+demo::counter\b", child_text)
-    assert re.search(r"template\s*<\s*>\s*class\s+counter\s*<\s*>", child_text)
-    assert "q_count_" in child_text
-    assert len(re.findall(r"SimDFFE<[^>]+>\s+q_count_", child_group["header"])) == 1
-    assert (
-        "q_outgoing_" not in child_group["header"]
-    ), "a parent-borrowed output port must not allocate child state"
-    assert "pycircuit_support.hpp" in child_group["header"]
+    child_text = child_group["text"]
+    assert '#include "design.hpp"' in child_text
     system_group = next(
         group for group in groups if group["source"]["path"] == "test_counters.py"
     )
-    assert system_group["header_path"] in payload["system_header"]
-    assert "class FinalSystem" in payload["system_header"]
-    assert child_group["header_path"] in (
-        system_group["header"] + system_group["implementation"]
-    ), "the parent TU must include the child source-owned header by value"
-    assert "child_left_" in system_group["header"]
-    assert "child_right_" in system_group["header"]
+    assert "class pyc_structural_system final" in payload["structural_cpp_header"]
+    assert "class pyc_dut final" in payload["structural_cpp_header"]
     # Final serialization carries one child-definition register; its two
     # runtime instances each own a distinct copy of that state. Five system
     # registers plus the child definition yield six serialized register ops.
-    assert final.read_text(encoding="utf-8").count('"ac.reg"') == 6
+    assert final.read_text(encoding="utf-8").count(
+        "callee = @pycircuit.__builtins__.dffe"
+    ) == 6
 
     objects = _compile_groups(output, groups, tmp_path)
     stdout = _run_cpp(tmp_path, output, objects)
@@ -709,7 +679,10 @@ def test_source_parts_refuses_invalid_final_without_partial_stdout(
         assert needle in text
         text = text.replace(needle, 'path = "../counter.py"')
     else:
-        needle = "arguments = [], definition = @demo.static_root.StaticRoot"
+        needle = (
+            "callee = @demo.static_root.StaticRoot, parameters = [], "
+            "type_arguments = []"
+        )
         # SpecKey arguments use the StaticValue dictionary form. This is a
         # structurally valid nonempty integer argument, not a malformed
         # StaticArgument wrapper or an undeclared family parameter.
@@ -717,8 +690,8 @@ def test_source_parts_refuses_invalid_final_without_partial_stdout(
         assert needle in text
         text = text.replace(
             needle,
-            f"arguments = [{static_integer}], "
-            "definition = @demo.static_root.StaticRoot",
+            "callee = @demo.static_root.StaticRoot, "
+            f"parameters = [{static_integer}], type_arguments = []",
         )
     invalid = tmp_path / f"{mutation}.ac"
     invalid.write_text(text, encoding="utf-8")
@@ -730,10 +703,10 @@ def test_source_parts_refuses_invalid_final_without_partial_stdout(
         # The value has valid shape, but its nonempty root SpecKey has no
         # matching serialized definition. Current final rehydration refuses it
         # before source-owned C++ layout is entered.
-        assert "final instance key has no module definition" in completed.stderr
+        assert "root integer arguments require StaticExpr" in completed.stderr
 
 
-def test_source_parts_refuses_legalized_source_path_collision(tmp_path: Path) -> None:
+def test_source_parts_disambiguates_legalized_source_path_collision(tmp_path: Path) -> None:
     source_root = tmp_path / "collision-source"
     source_root.mkdir()
     (source_root / "types.py").write_text(TYPES, encoding="utf-8")
@@ -743,13 +716,12 @@ def test_source_parts_refuses_legalized_source_path_collision(tmp_path: Path) ->
     ):
         (source_root / filename).write_text(
             f"""\
-from pycircuit import module, rule
-from .types import Word
+from pycircuit import module, rule, u8 as Word
 
 @module
 def {definition}(incoming: Word, outgoing: Word):
     @rule
-    def forward():
+    def forward() -> None:
         nonlocal outgoing
         outgoing = incoming
     forward()
@@ -758,8 +730,7 @@ def {definition}(incoming: Word, outgoing: Word):
         )
     (source_root / "top.py").write_text(
         """\
-from pycircuit import system
-from .types import Word
+from pycircuit import system, u8 as Word
 from .fooBar import FirstUnit
 from .foo_bar import SecondUnit
 
@@ -821,8 +792,6 @@ def CollisionTop():
             "demo.top.CollisionTop",
             "--target",
             "final",
-            "--role",
-            "testbench",
             "--output",
             str(final),
         ],
@@ -833,7 +802,13 @@ def CollisionTop():
     assert linked.returncode == 0, linked.stderr
 
     completed = _emit_parts(final)
-    assert (
-        completed.returncode == 1
-    ), "fooBar.py and foo_bar.py legalize to one C++ path"
-    assert completed.stdout == "", "collision refusal must not publish partial JSON"
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    groups = payload["structural_cpp_groups"]
+    assert {group["source"]["path"] for group in groups} >= {
+        "fooBar.py",
+        "foo_bar.py",
+    }
+    assert len({group["path"] for group in groups}) == len(groups)
+    output, materialized = _write_parts(tmp_path, payload)
+    _compile_groups(output, materialized, tmp_path)

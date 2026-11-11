@@ -6,7 +6,7 @@ from .types import Word
 @module
 def Child(source: Word, sink: Word):
     @rule
-    def forward():
+    def forward() -> None:
         nonlocal sink
         sink = source
 

@@ -112,7 +112,6 @@ def main():
         PYCIRCUIT_SOURCE_COMPILER=args.source_compiler,
         PYCIRCUIT_LINKER=args.linker,
         PYCIRCUIT_EMITTER=args.emitter,
-        MAKEFLAGS="CFG_CXXFLAGS_PCH_I=-include",
     )
     oracle = repo / "tests/compiler/oracles/history_slot_issue"
     inputs = [*fixtures.rglob("*"), *oracle.glob("*")]
@@ -224,7 +223,7 @@ def main():
             final,
             "--replace",
         )
-        for backend in ("cpp", "verilog"):
+        for backend in ("structural-cpp", "verilog"):
             cli(
                 name + "-" + backend + "-emit",
                 "emit",
@@ -235,10 +234,9 @@ def main():
                 directory / backend,
                 "--replace",
             )
-        cpp = directory / "cpp"
+        cpp = directory / "structural-cpp"
         rtl = directory / "verilog"
-        provider_header = (cpp / "sources/history_slot_issue/providers.hpp").read_text()
-        system_header = (cpp / "sources/history_slot_issue/systems.hpp").read_text()
+        design_header = (cpp / "design.hpp").read_text()
         visible = directory / "read-only-visibility"
         shutil.copytree(cpp, visible, dirs_exist_ok=True)
         visibility = []
@@ -263,11 +261,17 @@ def main():
             json.dumps(visibility, indent=2) + "\n"
         )
         native_driver = directory / "driver.cpp"
+        simulation_main = (cpp / "simulation_main.cpp").read_text()
+        metadata = simulation_main[
+            simulation_main.index("static const std::array<gfsim::RunnerObservation") :
+        ]
+        metadata = metadata[: metadata.index("\n\nnamespace {")]
         native_driver.write_text(
             (fixtures / "module_harness.cpp")
             .read_text()
+            .replace("@METADATA@", metadata)
             .replace(
-                "@CONFIG@", drivers.cpp_config(system_header, provider_header, kind)
+                "@CONFIG@", drivers.cpp_config(design_header, kind)
             )
             .replace("@EPOCHS@", str(len(case["rows"])))
         )
@@ -282,7 +286,7 @@ def main():
                 "-I" + str(repo / "include"),
                 "-I" + str(visible),
                 native_driver,
-                *(visible / "sources").rglob("*.cpp"),
+                *visible.glob("source_unit_*.cpp"),
                 runtime,
                 "-o",
                 executable,
@@ -293,7 +297,7 @@ def main():
             (fixtures / "module_harness.sv")
             .read_text()
             .replace(
-                "@CONFIG@", drivers.verilog_config(system_header, provider_header, kind)
+                "@CONFIG@", drivers.verilog_config(design_header, kind)
             )
             .replace("@BITS_MINUS_ONE@", str(case["snapshot_bits"] - 1))
             .replace("@EPOCHS@", str(len(case["rows"])))
@@ -317,7 +321,7 @@ def main():
                 "-o",
                 rtl_executable,
                 rtl / "design_top.sv",
-                *rtl.rglob("*.v"),
+                *rtl.rglob("*.sv"),
                 repo / "include/verilog/dffe.v",
                 repo / "include/verilog/fifo.v",
                 sv_driver,

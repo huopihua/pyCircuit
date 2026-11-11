@@ -12,7 +12,6 @@ from test_generic_assignment_roundtrip import (
     _compile,
     _emit,
     _link,
-    _rtl_trace,
     _tool,
 )
 
@@ -27,7 +26,7 @@ def AssertControls():
     gate: bool = False
     sink: bool = False
     @rule
-    def step():
+    def step() -> None:
         nonlocal gate, sink
         if ok:
             assert ok, "aliased condition and path"
@@ -44,16 +43,24 @@ CPP_DRIVER = """\
 #include "assert_model.hpp"
 #include <iostream>
 int main() {
-  FinalSystem model;
+  const auto bit = [](bool value) {
+    return gfsim::wire<gfsim::Bits<1>>::known(gfsim::Bits<1>{value ? 1u : 0u});
+  };
+  pyc_dut dut;
+  auto &model = dut.system();
+  dut.drive({bit(false), bit(false)});
   model.Build();
   for (int run = 0; run != 2; ++run) {
     model.Reset();
     for (int epoch = 0; epoch != 3; ++epoch) {
-      auto step = model.Step();
+      dut.drive({bit(false), bit(false)});
+      if (model.Step() == gfsim::SimStepResult::InvalidState) return 4;
+      dut.drive({bit(true), bit(false)});
+      const auto step = model.Step();
       if (step == gfsim::SimStepResult::InvalidState) return 4;
       std::cout << "ERR " << run << " " << epoch << " "
                 << (step == gfsim::SimStepResult::Failed) << "\\n";
-      for (const auto &event : model.Observations().Events())
+      for (const auto &event : dut.observations().Events())
         std::cout << "EV " << run << " " << event.epoch << " " << event.value.bits << "\\n";
     }
   }
@@ -64,24 +71,47 @@ RTL_TESTBENCH = """\
 module tb;
   logic clk = 0;
   logic reset = 1;
-  FinalModelSim dut(.clk(clk), .reset(reset));
-  task automatic tick;
-    begin #1 clk = 1; #1 clk = 0; #1; end
+  logic [2:0] phase = 0;
+  logic commit_ok = 0;
+  wire check_complete, sampling_error, local_error;
+  pyc_root dut(
+    .pyc_7079635f636c6b(clk),
+    .pyc_7079635f727374(reset),
+    .pyc_phase(phase),
+    .pyc_root_commit_ok(commit_ok),
+    .pyc_check_complete(check_complete),
+    .pyc_sampling_error(sampling_error),
+    .pyc_local_error(local_error));
+  task automatic reset_model;
+    begin
+      reset = 1; commit_ok = 1; phase = 4; #1;
+      $display("RESET_ERR %0d", dut.dut.pyc_check_error_0 |
+                                      dut.dut.pyc_check_error_1);
+      phase = 2; #1; phase = 0; commit_ok = 0; reset = 0; #1;
+    end
+  endtask
+  task automatic step(input logic level, input integer run, input integer epoch,
+                      input logic report);
+    begin
+      clk = level; commit_ok = 0; phase = 0; #1; phase = 1; #1;
+      if (report) $display("ERR %0d %0d %0d", run, epoch, local_error);
+      if (check_complete === 1'b1 && sampling_error === 1'b0 && local_error === 1'b0) begin
+        commit_ok = 1; phase = 2; #1;
+        if (report && dut.dut.pyc_observation_pending_0 &&
+            dut.dut.pyc_observation_path_0 && dut.dut.pyc_observation_valid_0)
+          $display("EV %0d %0d", run, dut.dut.pyc_observation_value_0);
+      end else begin
+        phase = 3; #1;
+      end
+      phase = 0; commit_ok = 0; #1;
+    end
   endtask
   initial begin
     for (integer run = 0; run < 2; run = run + 1) begin
-      reset = 1;
-      #1;
-      // The first reset edge initializes state. Later reset assertion must
-      // suppress an already active ordinary check before restoring that state.
-      if (run != 0) $display("RESET_ERR %0d", dut.dut.root_subtree_error);
-      tick();
-      if (run == 0) $display("RESET_ERR %0d", dut.dut.root_subtree_error);
-      reset = 0;
+      reset_model();
       for (integer epoch = 0; epoch < 3; epoch = epoch + 1) begin
-        #1;
-        $display("ERR %0d %0d %0d", run, epoch, dut.dut.root_subtree_error);
-        tick();
+        step(0, run, epoch, 0);
+        step(1, run, epoch, 1);
       end
     end
     $finish;
@@ -104,6 +134,7 @@ def _run(tmp_path: Path, design: Path, target: str) -> str:
             "-I",
             str(GFSIM_INCLUDE),
             str(driver),
+            *(str(path) for path in sorted(tmp_path.glob("source_unit_*.cpp"))),
             "-o",
             str(binary),
         ]
@@ -121,6 +152,8 @@ def _run(tmp_path: Path, design: Path, target: str) -> str:
             str(binary),
             str(model),
             str(driver),
+            str(Path(GFSIM_INCLUDE) / "verilog/dff.v"),
+            str(Path(GFSIM_INCLUDE) / "verilog/dffe.v"),
         ]
         execution = [_tool("VVP", "vvp"), str(binary)]
     compiled = subprocess.run(command, text=True, capture_output=True, check=False)
@@ -168,4 +201,5 @@ def test_source_assertion_actual_paths_and_reset(
                 assert events == [events[0]] * 3, stdout
     else:
         assert re.findall(r"^RESET_ERR ([01])$", stdout, re.M) == ["0", "0"], stdout
-        assert _rtl_trace(stdout) == expected * 2, stdout
+        values = [int(value) for value in re.findall(r"^EV \d+ (\d+)$", stdout, re.M)]
+        assert values == expected * 2, stdout

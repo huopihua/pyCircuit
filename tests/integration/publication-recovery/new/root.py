@@ -2,7 +2,7 @@ from pycircuit import bits, rule, system
 
 
 @rule
-def tick(value):
+def tick(value) -> None:
     value = (value + 1) & 255
 
 

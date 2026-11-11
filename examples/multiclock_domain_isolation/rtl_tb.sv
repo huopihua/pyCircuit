@@ -1,11 +1,8 @@
 module tb;
   logic clk_a=0,rst_a=1,clk_b=0,rst_b=0;
   wire [7:0] a_count,b_count;
-  // pyc_root takes the two domain records as packed structs; the harness drives
-  // their clk/rst fields with the same two independent physical pins.
-  wire pycircuit_types::ac_example_multiclock_domain_isolation_multiclock_domain_isolation_DomainPins_t d_a,d_b;
-  assign d_a.clk=clk_a;assign d_a.rst=rst_a;
-  assign d_b.clk=clk_b;assign d_b.rst=rst_b;
+  // ports.json defines each DomainPins input as {clk[1], rst[0]}.
+  wire [1:0] d_a={clk_a,rst_a},d_b={clk_b,rst_b};
   pyc_root dut(.*);
   // `row` checks the value Work samples in this epoch, then applies the clock
   // levels. A sampled value is therefore the state committed by the PREVIOUS

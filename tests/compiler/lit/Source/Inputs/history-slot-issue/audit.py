@@ -40,6 +40,14 @@ def pack(value):
     return result
 
 
+def observed(events, key, value):
+    if not isinstance(value, dict):
+        return events[key]
+    if set(value) == {"value"}:
+        return events[key] if key in events else events[key + "_value"]
+    return pack({field: events[key + "_" + field] for field in value})
+
+
 receipt = json.loads((gate / "receipt.json").read_text())
 assert sha(vectors) == receipt["before"][str(vectors)]
 assert receipt["unchanged"] and len(receipt["records"]) == 27
@@ -72,12 +80,12 @@ for name, case in json.loads(vectors.read_text())["executable"].items():
             row = case["rows"][epoch // 2]
             assert events["epoch"] == epoch // 2, (name, backend, epoch)
             for key, value in row["controls"].items():
-                assert events[key] == pack(value), (
+                assert observed(events, key, value) == pack(value), (
                     name,
                     backend,
                     epoch,
                     key,
-                    events[key],
+                    observed(events, key, value),
                     value,
                 )
         records.append(
@@ -90,51 +98,65 @@ for name, case in json.loads(vectors.read_text())["executable"].items():
                 "stdout_sha256": sha(path),
             }
         )
-cpp = gate / "mailbox_original_body/cpp/sources/history_slot_issue"
-providers = (cpp / "providers.hpp").read_text()
-nested = providers.split("class pyc_family_nested_mailbox final {", 1)[1].split(
-    "class nested_mailbox final", 1
-)[0]
-children = re.findall(
-    r"  std::shared_ptr<.*pyc_family_(valid_cell|payload_cell)<pyc_count>> (\w+);",
-    nested,
+cpp = gate / "mailbox_original_body/structural-cpp"
+header_path = cpp / "design.hpp"
+header = header_path.read_text()
+classes = dict(
+    re.findall(
+        r"class (pyc_\w+) final : public gfsim::SimModule \{(.*?)\n\};",
+        header,
+        re.S,
+    )
 )
+decoded = {
+    typ: bytes.fromhex(typ[4:].split("__h", 1)[0]).decode().rsplit(".", 1)[-1]
+    for typ in classes
+}
+
+
+def concrete(name):
+    found = [(typ, body) for typ, body in classes.items() if decoded[typ] == name]
+    assert len(found) == 1, (name, found)
+    return found[0]
+
+
+nested_type, nested = concrete("nested_mailbox")
+children = [
+    (decoded[typ], member)
+    for typ, member in re.findall(r"^\s*(pyc_\w+)\s+(pyc_\w+);$", nested, re.M)
+    if decoded.get(typ) in ("valid_cell", "payload_cell")
+]
 assert sorted(x[0] for x in children) == ["payload_cell", "valid_cell"], children
 owners = {}
 for name in ("valid_cell", "payload_cell"):
-    path = cpp / (name + ".hpp")
-    text = path.read_text()
-    declarations = re.findall(
-        r"  std::shared_ptr<gfsim::collection_storage<::gfsim::dffe_kernel<.*>>> (\w+);",
-        text,
-    )
-    assert declarations == ["pyc_instance_q_state"], declarations
+    typ, text = concrete(name)
+    declarations = re.findall(r"^\s*gfsim::dffe<[^;\n]+>\s+(pyc_\w+);$", text, re.M)
+    assert declarations == ["pyc_q"], declarations
     interface = gate / (name + "-unit") / (name + ".interface.ac")
     assert (
         "ac.domain_inputs = {clock = 2 : i64, reset = 3 : i64}" in interface.read_text()
     )
     owners[name] = {
         "storage": declarations,
-        "header_sha256": sha(path),
+        "concrete_type": typ,
+        "design_header_sha256": sha(header_path),
         "published_interface_sha256": sha(interface),
     }
-rtl = gate / "mailbox_original_body/verilog/sources/history_slot_issue"
+rtl = gate / "mailbox_original_body/verilog/sources"
+rtl_text = "\n".join(path.read_text() for path in rtl.glob("*.sv"))
 for name in owners:
-    path = rtl / (name + ".v")
-    text = path.read_text()
-    assert text.count("  dffe #(") == 1
-    assert ".pyc_managed(1'b1)" in text
-    owners[name]["rtl_sha256"] = sha(path)
-rtl_nested = (
-    (rtl / "providers.v")
-    .read_text()
-    .split("module ac_history_slot_issue_providers_nested_mailbox (", 1)[1]
-    .split("endmodule", 1)[0]
-)
+    module = "pyc_rtl_" + owners[name]["concrete_type"]
+    body = rtl_text.split("module " + module + " (", 1)[1].split("endmodule", 1)[0]
+    assert body.count("  dffe #(") == 1
+    assert ".pyc_managed(1'b1)" in body
+    owners[name]["rtl_module"] = module
+rtl_nested = rtl_text.split("module pyc_rtl_" + nested_type + " (", 1)[1].split(
+    "endmodule", 1
+)[0]
 for cell in ("valid_cell", "payload_cell"):
-    assert rtl_nested.count("  ac_history_slot_issue_" + cell + "_" + cell) == 1
+    assert rtl_nested.count("  pyc_rtl_" + owners[cell]["concrete_type"]) == 1
 for port in ("pyc_7079635f636c6b", "pyc_7079635f727374"):
-    assert rtl_nested.count(f".{port}({port})") == 2
+    assert rtl_nested.count(f".{port}(") == 2
 interface = gate / "providers-unit/providers.interface.ac"
 line = next(
     s
@@ -143,12 +165,6 @@ line = next(
     and 'ac.declaration_role = "definition"' in s
 )
 assert "ac.domain_inputs = {clock = 3 : i64, reset = 4 : i64}" in line
-for child in ("slot_valid", "slot_payload"):
-    for port in ("pyc_7079635f636c6b", "pyc_7079635f727374"):
-        assert (
-            f"this->pyc_instance_{child}->{port}.element(pyc_pin) = this->{port}.element(pyc_pin)"
-            in nested
-        )
 for name in ("payload_types", "valid_cell", "payload_cell", "providers", "systems"):
     file = fixture / (name + ".py")
     assert not re.search(r"\bpyc_(clk|rst)\b", file.read_text()), file

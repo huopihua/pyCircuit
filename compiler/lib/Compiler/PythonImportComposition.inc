@@ -277,6 +277,16 @@ LogicalResult Importer::predeclareDirectCalls(ModuleDecl &decl, OpBuilder &at) {
               declareQueue(found->second, decl, at, nextName("__pyc_queue_"))))
         return failure();
     } else if (moduleCall(node) && !methodOwner(node.child("func")) &&
+               [&] {
+                 auto function = node.child("func");
+                 if (auto found = local.find(function.string("id"));
+                     found != local.end())
+                   return modules[found->second].sourceCallAttrs.size() == 4;
+                 auto binding = lookupBinding(function);
+                 auto view = binding ? headers.lookupModule(binding->symbol)
+                                     : ModuleInterfaceView();
+                 return view && view.hasSourceCallContract();
+               }() &&
                !structuralCallSites.contains(
                    sourceOccurrence(at, decl.symbol, node))) {
       auto callee = callable(node.child("func"));

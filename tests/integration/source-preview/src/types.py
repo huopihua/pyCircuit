@@ -1,3 +1,6 @@
-from typing import Annotated
+from pycircuit import struct, u8
 
-Word = Annotated[int, range(256)]
+
+@struct
+class CounterResult:
+    count: u8

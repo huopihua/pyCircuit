@@ -3,7 +3,7 @@ from pycircuit import log, rule, system, u8
 
 
 @rule
-def unchecked_advance(count):
+def unchecked_advance(count) -> None:
     count = count + 1
     log("info", "count", count)
 
@@ -20,12 +20,12 @@ def TwoCheckedChildren():
     right = CheckedChild()
 
     @rule
-    def drive_left():
+    def drive_left() -> None:
         left()
         log("info", "left", left.value)
 
     @rule
-    def drive_right():
+    def drive_right() -> None:
         right()
         log("info", "right", right.value)
 
@@ -34,7 +34,7 @@ def TwoCheckedChildren():
 
 
 @rule
-def unrelated_advance(count):
+def unrelated_advance(count) -> None:
     count = count + 1
     assert count < 9, "unrelated limit"
     log("info", "unrelated", count)

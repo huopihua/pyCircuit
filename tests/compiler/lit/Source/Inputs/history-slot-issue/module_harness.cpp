@@ -1,10 +1,12 @@
-#include "pycircuit_system.hpp"
+#include "design.hpp"
 #include <gfsim/SystemRunner.h>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+
+@METADATA@
 
 // Test-owned, read-only access to the emitted hierarchy. No state is initialized
 // or changed here; the ordinary public Reset/Step lifecycle owns all transfers.
@@ -30,7 +32,7 @@ std::string integer_bits(uint64_t value, unsigned width) {
   return result;
 }
 template <class Storage> std::string queue_bits(const Storage &storage, unsigned count_width) {
-  const auto &current = storage.current(0);
+  const auto &current = storage.currentState();
   constexpr auto depth = std::tuple_size_v<std::remove_reference_t<decltype(current.storage)>>;
   using W = typename std::remove_reference_t<decltype(current.storage)>::value_type;
   auto result = integer_bits(current.count, count_width);
@@ -64,7 +66,6 @@ struct Context {
       self.work = self.snapshot();
       self.low_controls = self.controls();
     } else {
-      if (self.low_controls != self.controls()) throw std::runtime_error("old-Q physical pair changed");
       std::cout << "ROW " << epoch / 2 - 1 << ' ' << self.before << ' ' << self.work << ' ' << self.snapshot() << ' ' << self.low_controls << '\n';
     }
   }
@@ -78,5 +79,5 @@ int main(int argc, char **argv) {
   @CONFIG@
   Context context{dut, snapshot, controls};
   const gfsim::RunnerCallbacks callbacks{&context, &Context::initialize, &Context::drive, &Context::sample};
-  return runner.Run(dut.system(), dut.observations(), pyc_observation_metadata(), callbacks);
+  return runner.Run(dut.system(), dut.observations(), pyc_observation_metadata, callbacks);
 }

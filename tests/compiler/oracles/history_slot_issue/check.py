@@ -9,8 +9,12 @@ import argparse
 import json
 from pathlib import Path
 
-from generate import data
-from models import packed_snapshot
+if __package__:
+    from .generate import data
+    from .models import packed_snapshot
+else:
+    from generate import data
+    from models import packed_snapshot
 
 COUNTER_FIELDS = ("pops", "pushes", "received")
 

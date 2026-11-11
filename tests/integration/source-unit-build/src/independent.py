@@ -4,7 +4,7 @@ from pycircuit import module, rule
 @module
 def Independent():
     @rule
-    def idle():
+    def idle() -> None:
         return
 
     idle()

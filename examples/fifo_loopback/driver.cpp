@@ -1,6 +1,6 @@
 #include "gfsim/SimExecutor.h"
 #include "gfsim/SystemRunner.h"
-#include "pycircuit_system.hpp"
+#include "design.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -331,8 +331,8 @@ void step(gfsim::SimExecutor &exec) {
 }
 void extensions(unsigned workers) {
   // This current-contract cold probe is not a historical native parity claim.
-  gfsim::WorkExecutor pool(workers);
-  pyc_root cold("cold", &pool);
+  pyc_dut probe(workers);
+  auto &cold = probe.root();
   cold.Build();
   cold.pyc_7079635f636c6b = cold.pyc_7079635f727374 = cold.in_valid =
       cold.out_ready = control('0');

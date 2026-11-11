@@ -20,6 +20,15 @@ def _configured_mlir_opt() -> Path:
     toolchain = os.environ.get("PYC_TOOLCHAIN_ROOT")
     if toolchain:
         candidates.append(str(Path(toolchain) / "bin/mlir-opt"))
+    native_build = os.environ.get("PYCIRCUIT_NATIVE_BUILD")
+    if native_build:
+        cache = Path(native_build) / "CMakeCache.txt"
+        if cache.is_file():
+            for line in cache.read_text(encoding="utf-8").splitlines():
+                if line.startswith("MLIR_DIR:") and "=" in line:
+                    mlir_dir = Path(line.split("=", 1)[1])
+                    candidates.append(str(mlir_dir.parents[2] / "bin/mlir-opt"))
+                    break
     candidates.append(shutil.which("mlir-opt"))
     for candidate in candidates:
         if candidate and Path(candidate).is_file():

@@ -9,9 +9,16 @@ std::optional<Import> Importer::lookupBinding(const AstNode &node) const {
     if (found != names.end() && queryBound(name))
       return std::nullopt;
     if (found != names.end() && lexicallyShadowed(node, name)) {
-      error() << "source binding is shadowed in its lexical scope: '" << name
-              << "'";
-      return std::nullopt;
+      // A module argument or local with the same spelling is a runtime value,
+      // but its annotation is resolved in the enclosing source namespace.
+      bool annotation = llvm::any_of(node.path, [](const AstStep &step) {
+        return !step.index && step.field == "annotation";
+      });
+      if (!annotation) {
+        error() << "source binding is shadowed in its lexical scope: '" << name
+                << "'";
+        return std::nullopt;
+      }
     }
     return found == names.end() ? std::nullopt
                                 : std::optional<Import>(found->second);
@@ -29,6 +36,8 @@ std::optional<Import> Importer::lookupBinding(const AstNode &node) const {
     parent->declaration = declaration;
     parent->remote = node.string("attr").str();
     parent->category = isa<func::FuncOp>(declaration) ? BindingCategory::Helper
+                       : isa<ac::TypeAliasOp>(declaration) ? BindingCategory::Alias
+                       : isa<ac::ConstantOp>(declaration) ? BindingCategory::Constant
                        : isa<ac::StructOp>(declaration) ? BindingCategory::Struct
                        : isa<ac::EnumOp>(declaration) ? BindingCategory::Enum
                        : BindingCategory::Module;
@@ -698,8 +707,11 @@ LogicalResult Importer::scanStructs() {
       auto annotation = field.child("annotation");
       bool tableAnnotation = annotation.kind() == "Subscript" &&
                              intrinsic(annotation.child("value"), "table");
+      auto annotationBinding = lookupBinding(annotation);
+      bool scalarAlias = annotationBinding &&
+                         annotationBinding->category == BindingCategory::Alias;
       if (!fixedAnnotation(annotation) && !nominalAnnotation(annotation) &&
-          !tableAnnotation)
+          !tableAnnotation && !scalarAlias)
         return error() << "struct fields require explicitly unsigned bits or "
                           "nominal structs/enums or finite tables";
       auto type = portType(annotation, symbol);

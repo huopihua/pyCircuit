@@ -1,0 +1,14 @@
+{
+  // Use the Homebrew clangd that matches the project's pinned LLVM/MLIR 22.1.8
+  // (the `opt` symlink stays stable across patch releases).
+  "clangd.path": "/opt/homebrew/opt/llvm@22/bin/clangd",
+  "clangd.arguments": [
+    "--compile-commands-dir=${workspaceFolder}/.pycircuit_out/toolchain/build",
+    "--background-index",
+    "--clang-tidy"
+  ],
+  // Microsoft C/C++ IntelliSense: reuse the same compile database so both
+  // extensions resolve the same include paths.
+  "C_Cpp.default.compileCommands": "${workspaceFolder}/.pycircuit_out/toolchain/build/compile_commands.json",
+  "C_Cpp.intelliSenseEngine": "default"
+}

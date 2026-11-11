@@ -39,8 +39,6 @@ def _compile(
     tmp_path: Path,
     stem: str,
     source_text: str,
-    *,
-    lower_numeric: bool = False,
 ) -> CompiledUnit:
     source_root = tmp_path / f"{stem}-source"
     source_root.mkdir()
@@ -68,8 +66,6 @@ def _compile(
         "--interface-out",
         str(interface),
     ]
-    if lower_numeric:
-        command.append("--lower-numeric")
     return CompiledUnit(
         subprocess.run(command, text=True, capture_output=True, check=False),
         body,
@@ -109,45 +105,30 @@ def _operation_lines(text: str, operation: str) -> list[str]:
     ]
 
 
-def _balanced_attribute(text: str, name: str, opening: str, closing: str) -> str:
-    marker = f"{name} = "
-    start = text.index(marker) + len(marker)
-    assert text[start] == opening, text[start : start + 80]
-    depth = 0
-    for index in range(start, len(text)):
-        if text[index] == opening:
-            depth += 1
-        elif text[index] == closing:
-            depth -= 1
-            if depth == 0:
-                return text[start : index + 1]
-    raise AssertionError(f"unterminated {name} attribute")
-
-
 def _assert_source_recipe(body: str, operator: str, *, compare: bool) -> None:
-    assert body.count('"ac.source.read"') == 1
-    read = _operation_lines(body, "ac.source.read")[0]
-    assert "ac.origin = {" in read
-    assert body.count("ac.math.from_bits") == 1
-    assert body.count("ac.math.constant") == 1
-    operation = "ac.math.compare" if compare else "ac.math.binary"
+    # Numeric source now lowers directly from the ac.rule block argument into
+    # finite-width ACIR.  The retired source.read/ac.math proof recipe must not
+    # reappear as a second numeric path.
+    assert body.count('"ac.rule"') == 1
+    assert '"ac.source.read"' not in body
+    assert "ac.math." not in body and "!ac.math_int" not in body
+    assert body.count('"ac.bits.constant"') == 1
+    resize_count = body.count('"ac.bits.resize"')
+    assert resize_count == 0 if compare else 1 <= resize_count <= 2
+    operation = "ac.bits.compare" if compare else "ac.bits.binary"
     assert body.count(f'"{operation}"') == 1
-    assert f'{"predicate" if compare else "operator"} = "{operator}"' in body
-
-    scope = _balanced_attribute(body, "ac.proof_scope", "{", "}")
-    assert "definition = @numeric." in scope
-    assert "arguments = []" in scope and "registration = {" in scope
-
-    required = _balanced_attribute(body, "ac.required_numeric", "[", "]")
-    assert required.count("id = {origin = {") == 3
-    assert required.count('target = {kind = "none"}') == 3
-    assert 'operator = "from_bits"' in required
-    assert 'operator = "constant"' in required
-    assert f'operator = "{operator}"' in required
-    assert 'operands = [{index = 0 : i32, kind = "input"}]' in required
-    assert required.count('kind = "node"') == 2
-    ids = re.findall(r"id = (\{origin = .*?slot = \d+ : i32\})", required)
-    assert len(ids) == 3 and len(set(ids)) == 3
+    predicate = {
+        "lt": "ult",
+        "le": "ule",
+        "gt": "ugt",
+        "ge": "uge",
+    }.get(operator, operator)
+    assert f'{"predicate" if compare else "opcode"} = "{predicate}"' in body
+    operation_line = _operation_lines(body, operation)[0]
+    assert re.search(
+        r'"ac\.bits\.(?:binary|compare)"\(%(?:arg)?\d+, %(?:arg)?\d+\)',
+        operation_line,
+    )
 
 
 @pytest.mark.parametrize(
@@ -155,6 +136,7 @@ def _assert_source_recipe(body: str, operator: str, *, compare: bool) -> None:
     [
         ("current + 7", "add", False),
         ("current - 7", "sub", False),
+        ("current * 7", "mul", False),
         ("current == 7", "eq", True),
         ("current != 7", "ne", True),
         ("current < 7", "lt", True),
@@ -187,75 +169,57 @@ def test_integer_constant_keeps_arbitrary_precision_and_is_not_a_bool(
     assert "#ac.math_int<false>" not in body
     _assert_source_recipe(body, "add", compare=False)
 
-    lowered = _compile(
-        tmp_path,
-        "wide_constant_lowered",
-        _module(f"current + {literal}"),
-        lower_numeric=True,
-    )
-    assert lowered.process.returncode == 0, lowered.process.stderr
-    lowered_body = lowered.body.read_text(encoding="utf-8")
-    assert "ac.math." not in lowered_body and "!ac.math_int" not in lowered_body
-    assert "arith.addi" in lowered_body
-    assert str(literal) in lowered_body
-
-
-def test_comparison_result_is_a_boolean_domain_after_lowering(tmp_path: Path) -> None:
-    unit = _compile(
-        tmp_path, "bool_result", _module("current == 1"), lower_numeric=True
-    )
+def test_comparison_result_is_a_one_bit_hardware_value(tmp_path: Path) -> None:
+    unit = _compile(tmp_path, "bool_result", _module("current == 1"))
 
     assert unit.process.returncode == 0, unit.process.stderr
     body = unit.body.read_text(encoding="utf-8")
-    assert "ac.math." not in body and "!ac.math_int" not in body
-    assert "arith.cmpi" in body
-    proof = _operation_lines(body, "ac.numeric.proof")
-    assert len(proof) == 1
-    assert 'result_domain = {kind = "bool"}' in proof[0]
+    assert '"ac.bits.compare"' in body
+    comparison = _operation_lines(body, "ac.bits.compare")
+    assert len(comparison) == 1 and "-> !ac.bits<" in comparison[0]
+    assert "#ac.math_int<1>" in comparison[0]
     assert "#ac.math_int<1>" in body
 
 
 @pytest.mark.parametrize(
-    ("expression", "lowered_operation", "predicate"),
+    ("expression", "lowered_operation", "opcode"),
     [
-        ("current + 7", "arith.addi", None),
-        ("current - 7", "arith.subi", None),
-        ("current == 7", "arith.cmpi", "eq"),
-        ("current != 7", "arith.cmpi", "ne"),
-        ("current < 7", "arith.cmpi", "ult"),
-        ("current <= 7", "arith.cmpi", "ule"),
-        ("current > 7", "arith.cmpi", "ugt"),
-        ("current >= 7", "arith.cmpi", "uge"),
+        ("current + 7", "ac.bits.binary", "add"),
+        ("current - 7", "ac.bits.binary", "sub"),
+        ("current * 7", "ac.bits.binary", "mul"),
+        ("current == 7", "ac.bits.compare", "eq"),
+        ("current != 7", "ac.bits.compare", "ne"),
+        ("current < 7", "ac.bits.compare", "ult"),
+        ("current <= 7", "ac.bits.compare", "ule"),
+        ("current > 7", "ac.bits.compare", "ugt"),
+        ("current >= 7", "ac.bits.compare", "uge"),
     ],
 )
 def test_private_harness_lowers_real_python_numeric_source(
     tmp_path: Path,
     expression: str,
     lowered_operation: str,
-    predicate: str | None,
+    opcode: str,
 ) -> None:
     unit = _compile(
         tmp_path,
         lowered_operation.replace(".", "_"),
         _module(expression),
-        lower_numeric=True,
     )
 
     assert unit.process.returncode == 0, unit.process.stderr
     body = unit.body.read_text(encoding="utf-8")
     assert "ac.math." not in body and "!ac.math_int" not in body
-    assert lowered_operation in body
-    assert body.count('"ac.value.binding"') == 4
-    assert body.count('"ac.numeric.proof"') == 1
-    assert 'mode = "exact"' in body
-    assert "ac.required_numeric" in body and "ac.proof_scope" in body
-    if predicate is not None:
-        comparisons = _operation_lines(body, "arith.cmpi")
-        assert len(comparisons) == 1
-        assert f"arith.cmpi {predicate}," in comparisons[0]
+    assert f'"{lowered_operation}"' in body
+    operations = _operation_lines(body, lowered_operation)
+    assert len(operations) == 1
+    attribute = "predicate" if lowered_operation.endswith("compare") else "opcode"
+    assert f'{attribute} = "{opcode}"' in operations[0]
+    assert "ac.numeric.proof" not in body
+    assert "ac.required_numeric" not in body and "ac.proof_scope" not in body
 
 
-def test_lowering_preserves_recipe_ids_and_binds_the_real_source_read(
+def test_direct_lowering_is_stable_and_binds_the_rule_argument(
     tmp_path: Path,
 ) -> None:
     source_dir = tmp_path / "source-stage"
@@ -264,96 +228,47 @@ def test_lowering_preserves_recipe_ids_and_binds_the_real_source_read(
     lowered_dir.mkdir()
     text = _module("current - 7")
     source = _compile(source_dir, "identity", text)
-    lowered = _compile(lowered_dir, "identity", text, lower_numeric=True)
+    lowered = _compile(lowered_dir, "identity", text)
 
     assert source.process.returncode == 0, source.process.stderr
     assert lowered.process.returncode == 0, lowered.process.stderr
     source_body = source.body.read_text(encoding="utf-8")
     lowered_body = lowered.body.read_text(encoding="utf-8")
-    assert _balanced_attribute(
-        source_body, "ac.required_numeric", "[", "]"
-    ) == _balanced_attribute(lowered_body, "ac.required_numeric", "[", "]")
-
-    read = _operation_lines(lowered_body, "ac.source.read")
-    bindings = _operation_lines(lowered_body, "ac.value.binding")
-    assert len(read) == 1 and len(bindings) == 4
-    read_origin = _balanced_attribute(read[0], "ac.origin", "{", "}")
-    input_id = _balanced_attribute(bindings[0], "id", "{", "}")
-    assert input_id == f"{{origin = {read_origin}, slot = 0 : i32}}"
+    assert source_body == lowered_body
+    assert '"ac.source.read"' not in lowered_body
+    rule = _operation_lines(lowered_body, "ac.rule")
+    assert len(rule) == 1 and "(%arg0)" in rule[0]
+    first_resize = _operation_lines(lowered_body, "ac.bits.resize")[0]
+    assert "(%arg1)" in first_resize
 
 
 @pytest.mark.parametrize(
     ("stem", "source", "diagnostic"),
     [
         (
-            "unsupported_operator",
-            _module("current * 7"),
-            "one supported integer literal",
-        ),
-        (
-            "two_runtime_operands",
-            _module("current + other", parameters="current: Word, other: Word"),
-            "exactly one current integer input",
-        ),
-        (
-            "consumed_temporary",
-            _module("current + 1", statements=("consumed = temporary + 2",)),
-            "one unused local assignment",
-        ),
-        (
-            "numeric_target",
-            _module(
-                "current + 1",
-                parameters="current: Word, sink: Word",
-                statements=("nonlocal sink", "sink = temporary"),
-            ),
-            "no next-state target",
-        ),
-        (
             "numeric_check",
             _module("current + 1", statements=('assert temporary, "numeric"',)),
-            "one unused local assignment",
+            "conditional requires a Boolean source condition",
         ),
         (
             "numeric_observation",
             _module("current + 1", statements=('print("numeric", temporary)',)),
-            "one unused local assignment",
-        ),
-        (
-            "mixed_statements",
-            _module("current + 1", statements=("unrelated = current",)),
-            "one unused local assignment",
+            "unsupported behavioral rule statement 'Expr'",
         ),
         (
             "bool_literal_is_not_an_integer",
             _module("current + True"),
-            "one supported integer literal",
+            "Boolean literal cannot be implicitly converted",
         ),
         (
             "bool_current_is_not_an_integer",
             _module("current + 1", parameters="current: bool"),
-            "exact integer LogicalType",
+            "requires known Integer kind and finite interval",
         ),
         (
             "chained_compare",
             _module("current < 7 < 9"),
-            "one predicate",
-        ),
-        (
-            "local_shadowing_current",
-            _module(
-                "current + 1",
-                statements=(),
-            ).replace(
-                "        temporary = current + 1\n",
-                "        current = 3\n        temporary = current + 1\n",
-            ),
-            "module connection has no registered rule or child effect",
-        ),
-        (
-            "duplicate_numeric_assignments",
-            _module("current + 1", statements=("second = current - 1",)),
-            "one unused local assignment",
+            "hardware comparisons do not support chaining",
         ),
     ],
 )
@@ -367,16 +282,17 @@ def test_unsupported_numeric_shapes_are_rejected_without_publishing_body(
     assert diagnostic.lower() in unit.process.stderr.lower()
 
 
-def test_lowering_capability_failure_does_not_publish_source_body(
+def test_wide_unused_intermediate_remains_exact_in_source_body(
     tmp_path: Path,
 ) -> None:
     unit = _compile(
         tmp_path,
         "i65_result",
         _module("current + 18446744073709551615", word_upper=2),
-        lower_numeric=True,
     )
 
-    assert unit.process.returncode != 0
-    assert not unit.body.exists()
-    assert "i65" in unit.process.stderr or "narrow" in unit.process.stderr.lower()
+    assert unit.process.returncode == 0, unit.process.stderr
+    body = unit.body.read_text(encoding="utf-8")
+    assert "#ac.math_int<65>" in body
+    assert "#ac.math_int<18446744073709551615>" in body
+    assert 'opcode = "add"' in body

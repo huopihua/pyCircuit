@@ -1,15 +1,13 @@
 # ruff: noqa: N802,F841
-from pycircuit import module, rule
-
-from .types import Word
+from pycircuit import rule, system, u8 as Word
 
 
-@module
+@system
 def HoldTop():
     held: Word = 7
 
     @rule
-    def observe_without_write():
+    def observe_without_write() -> None:
         return
 
     observe_without_write()

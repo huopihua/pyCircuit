@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,26 +35,22 @@ Phase = Annotated[int, range(8)]
 """
 
 CHILD = """\
-from pycircuit import module, rule
-from .types import Word
+@rule
+def tick_left(count, incoming, outgoing) -> None:
+    count = incoming
+    outgoing = count
 
-@module
-def Counter(incoming: Word, outgoing: Word):
-    count: Word = 0
-
-    @rule
-    def tick():
-        nonlocal count, outgoing
-        count = incoming
-        outgoing = count
-
-    tick()
+@rule
+def tick_right(count, incoming, outgoing) -> None:
+    count = incoming
+    outgoing = count
 """
 
 SYSTEM = """\
-from pycircuit import system, rule, log, report
-from .types import Word, Phase
-from .counter import Counter
+from pycircuit import system, rule, log
+from .types import Phase, Word
+
+{provider}
 
 @system
 def TestCounters():
@@ -61,59 +58,40 @@ def TestCounters():
     right_input: Word = 10
     left_output: Word = 100
     right_output: Word = 200
+    left_count: Word = 0
+    right_count: Word = 0
     phase: Phase = 0
-    left = Counter(left_input, left_output)
-    right = Counter(right_input, right_output)
+    tick_left(left_count, left_input, left_output)
+    tick_right(right_count, right_input, right_output)
 
     @rule
-    def fixture():
+    def fixture() -> None:
         nonlocal phase
-        if phase == 0:
-            assert left_output == 100 and right_output == 200, "reset values"
-        elif phase == 1:
-            assert left_output == 0 and right_output == 0, "same-rule current"
-            log("info", "left", left_output)
-            log("info", "right", right_output)
-        elif phase == 2:
-            assert left_output == 3 and right_output == 10, "next commit"
-            log("info", "left", left_output)
-            log("info", "right", right_output)
-            report("completed", 1)
-        if phase < 3:
-            phase = phase + 1
+        log("info", "left", left_output)
+        log("info", "right", right_output)
+        phase = (phase + 1) & 7
 
     fixture()
 """
 
 LOCAL_CANDIDATE_CHILD = CHILD.replace(
-    "        nonlocal count, outgoing\n        count = incoming\n        outgoing = count",
-    "        nonlocal count, outgoing\n        candidate = incoming\n        count = candidate\n        outgoing = candidate",
+    "    count = incoming\n    outgoing = count",
+    "    candidate = incoming\n    count = candidate\n    outgoing = candidate",
 )
-LOCAL_CANDIDATE_SYSTEM = SYSTEM.replace(
-    'left_output == 0 and right_output == 0, "same-rule current"',
-    'left_output == 3 and right_output == 10, "local candidate reuse"',
-)
+LOCAL_CANDIDATE_SYSTEM = SYSTEM
 ENABLED_CHILD = CHILD.replace(
-    "def Counter(incoming: Word, outgoing: Word):",
-    "def Counter(incoming: Word, outgoing: Word, enabled: bool):",
+    "(count, incoming, outgoing) -> None:",
+    "(count, incoming, outgoing, enabled) -> None:",
 ).replace(
-    "        outgoing = count",
-    "        if enabled:\n            outgoing = count",
+    "    outgoing = count",
+    "    if enabled:\n        outgoing = count",
 )
 ENABLED_SYSTEM = (
     SYSTEM.replace(
-        "    phase: Phase = 0\n    left = Counter(left_input, left_output)\n    right = Counter(right_input, right_output)",
+        "    phase: Phase = 0\n    tick_left(left_count, left_input, left_output)\n    tick_right(right_count, right_input, right_output)",
         "    phase: Phase = 0\n    left_enable: bool = True\n    right_enable: bool = False\n"
-        "    left = Counter(left_input, left_output, left_enable)\n"
-        "    right = Counter(right_input, right_output, right_enable)",
-    )
-    .replace(
-        'left_output == 0 and right_output == 0, "same-rule current"',
-        'left_output == 0 and right_output == 200, "independent enables"',
-    )
-    .replace(
-        'left_output == 3 and right_output == 10, "next commit"',
-        'left_output == 3 and right_output == 200, "independent enable holds"',
+        "    tick_left(left_count, left_input, left_output, left_enable)\n"
+        "    tick_right(right_count, right_input, right_output, right_enable)",
     )
 )
 
@@ -137,6 +115,29 @@ def _tool(env_name: str, name: str) -> str:
 
 def _source_parts_harness() -> str:
     return _tool("PYCIRCUIT_EMITTER", "pycircuit-emit")
+
+
+def _optimizer() -> str:
+    return _tool("PYCIRCUIT_OPT", "pycircuit-opt")
+
+
+def _emit_hwir(final: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    with tempfile.TemporaryDirectory(prefix="pycircuit-test-hwir-") as temporary:
+        hwir = Path(temporary) / "design.hwir.mlir"
+        lowered = subprocess.run(
+            [_optimizer(), str(final), "--ac-final-to-hwir", "-o", str(hwir)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if lowered.returncode != 0:
+            return lowered
+        return subprocess.run(
+            [_source_parts_harness(), str(hwir), *arguments],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
 
 
 def _compile(
@@ -176,8 +177,6 @@ def _link(units: list[SourceUnit], final: Path) -> subprocess.CompletedProcess[s
             "demo.test_counters.TestCounters",
             "--target",
             "final",
-            "--role",
-            "testbench",
             "--output",
             str(final),
         )
@@ -186,24 +185,29 @@ def _link(units: list[SourceUnit], final: Path) -> subprocess.CompletedProcess[s
 
 
 def _emit(final: Path, target: str, output: Path) -> subprocess.CompletedProcess[str]:
+    native_target = "structural-cpp" if target == "cpp" else target
     # This subprocess reparses the persisted final program; no in-memory linked
     # module is passed from the test process.
-    return subprocess.run(
-        [
-            _tool("PYCIRCUIT_LINKER", "pycircuit-link"),
-            "--design",
-            str(final),
-            "--target",
-            target,
-            "--role",
-            "testbench",
-            "--output",
-            str(output),
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
+    result = _emit_hwir(
+        final,
+        "--target",
+        native_target,
+        "--format",
+        "json" if target == "cpp" else "source",
     )
+    if result.returncode == 0:
+        if target == "cpp":
+            payload = json.loads(result.stdout)
+            header = payload["structural_cpp_header"]
+            output.write_text(header, encoding="utf-8")
+            (output.parent / "design.hpp").write_text(header, encoding="utf-8")
+            for group in payload["structural_cpp_groups"]:
+                path = output.parent / group["path"]
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(group["text"], encoding="utf-8")
+        else:
+            output.write_text(result.stdout, encoding="utf-8")
+    return result
 
 
 def _build_final(
@@ -212,8 +216,12 @@ def _build_final(
     source_root = tmp_path / "source"
     source_root.mkdir()
     (source_root / "types.py").write_text(TYPES, encoding="utf-8")
-    (source_root / "counter.py").write_text(child_source, encoding="utf-8")
-    (source_root / "test_counters.py").write_text(system_source, encoding="utf-8")
+    (source_root / "counter.py").write_text(
+        '"""Reserved provider source unit."""\n', encoding="utf-8"
+    )
+    (source_root / "test_counters.py").write_text(
+        system_source.format(provider=child_source), encoding="utf-8"
+    )
     types = _compile(source_root / "types.py", source_root, tmp_path / "units/types")
     counter = _compile(
         source_root / "counter.py",
@@ -242,17 +250,25 @@ def _run_cpp(tmp_path: Path, model: Path) -> list[int]:
 #include \"model.hpp\"
 #include <iostream>
 int main() {
-  FinalSystem model;
+  const auto bit = [](bool value) {
+    return gfsim::wire<gfsim::Bits<1>>::known(gfsim::Bits<1>{value ? 1u : 0u});
+  };
+  pyc_dut dut;
+  auto &model = dut.system();
+  dut.drive({bit(false), bit(false)});
   model.Build();
   for (int run = 0; run != 2; ++run) {
+    dut.drive({bit(false), bit(false)});
     model.Reset();
-    for (int i = 0; i != 4; ++i) {
+    for (int i = 0; i != 3; ++i) {
+      dut.drive({bit(false), bit(false)});
+      if (model.Step() != gfsim::SimStepResult::Running) return 5;
+      dut.drive({bit(true), bit(false)});
       auto step = model.Step();
-      for (const auto &event : model.Observations().Events())
+      for (const auto &event : dut.observations().Events())
         std::cout << event.value.bits << \"\\n\";
       if (step == gfsim::SimStepResult::Failed ||
           step == gfsim::SimStepResult::InvalidState) return 5;
-      if (step == gfsim::SimStepResult::Quiescent) break;
     }
   }
 }
@@ -266,8 +282,11 @@ int main() {
             _tool("CXX", "clang++"),
             "-std=c++20",
             "-I",
+            str(tmp_path),
+            "-I",
             str(GFSIM_INCLUDE),
             str(driver),
+            *(str(path) for path in sorted(tmp_path.glob("source_unit_*.cpp"))),
             "-o",
             str(binary),
         ],
@@ -282,113 +301,77 @@ int main() {
 
 
 def _run_verilog(tmp_path: Path, model: Path) -> list[int]:
-    testbench = tmp_path / "tb.sv"
-    testbench.write_text(
-        """\
-module tb;
-  logic clk = 1'b0;
-  logic reset = 1'b1;
-  FinalModelSim dut(.clk(clk), .reset(reset));
-  task automatic tick;
-    begin #1 clk = 1'b1; #1 clk = 1'b0; #1; end
-  endtask
-  initial begin
-    tick(); reset = 1'b0; repeat (5) tick();
-    reset = 1'b1; tick(); reset = 1'b0; repeat (5) tick();
-    $finish;
-  end
-endmodule
-""",
-        encoding="utf-8",
-    )
     binary = tmp_path / "rtl.vvp"
     compiled = subprocess.run(
         [
             _tool("IVERILOG", "iverilog"),
             "-g2012",
             "-s",
-            "tb",
+            "pycircuit_sim",
             "-o",
             str(binary),
             str(model),
-            str(testbench),
+            str(ROOT / "include/verilog/dff.v"),
+            str(ROOT / "include/verilog/dffe.v"),
         ],
         text=True,
         capture_output=True,
         check=False,
     )
     assert compiled.returncode == 0, compiled.stderr
-    ran = subprocess.run(
-        [_tool("VVP", "vvp"), str(binary)], text=True, capture_output=True, check=False
-    )
-    assert ran.returncode == 0, ran.stderr
-    return [
-        int(fields[5])
-        for line in ran.stdout.splitlines()
-        if len(fields := line.split()) == 8 and fields[0] == "AC_OBS"
-    ]
+    result: list[int] = []
+    for _ in range(2):
+        ran = subprocess.run(
+            [_tool("VVP", "vvp"), str(binary), "+cycles=3"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert ran.returncode == 0, ran.stderr
+        values = [
+            int(value["value"])
+            for line in ran.stdout.splitlines()
+            if line.startswith('{"kind":"log"')
+            for value in json.loads(line)["values"]
+        ]
+        # Two observations per edge and two edges per logical cycle.
+        result.extend(
+            value
+            for edge in range(1, 6, 2)
+            for value in values[edge * 2 : edge * 2 + 2]
+        )
+    return result
 
 
 def _run_grouped_cpp(tmp_path: Path, final: Path) -> str:
-    emitted = subprocess.run(
-        [_source_parts_harness(), str(final)],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    emitted = _emit_hwir(final, "--target", "structural-cpp", "--format", "json")
     assert emitted.returncode == 0, emitted.stderr
     payload = json.loads(emitted.stdout)
-    assert set(payload) == {"support_header", "system_header", "source_groups"}
+    assert "structural_cpp_header" in payload
+    assert "structural_cpp_groups" in payload
     output = tmp_path / "grouped"
     output.mkdir()
-    (output / "pycircuit_support.hpp").write_text(
-        payload["support_header"], encoding="utf-8"
+    (output / "design.hpp").write_text(
+        payload["structural_cpp_header"], encoding="utf-8"
     )
-    (output / "pycircuit_system.hpp").write_text(
-        payload["system_header"], encoding="utf-8"
-    )
-    groups = payload["source_groups"]
+    groups = payload["structural_cpp_groups"]
     owners = [(group["source"]["package"], group["source"]["path"]) for group in groups]
     assert sorted(owners) == [
         ("demo", "counter.py"),
         ("demo", "test_counters.py"),
         ("demo", "types.py"),
     ]
-    declaration_group = next(
-        group for group in groups if group["source"]["path"] == "types.py"
-    )
-    assert declaration_group["source_path"] is None
-    assert declaration_group["implementation"] is None
-    child_group = next(
-        group for group in groups if group["source"]["path"] == "counter.py"
-    )
-    assert len(re.findall(r"SimDFFE<[^>]+>\s+q_count_", child_group["header"])) == 1
-    assert "q_outgoing_" not in child_group["header"]
     for group in groups:
-        for key in ("header_path", "source_path"):
-            if group[key] is None:
-                assert key == "source_path" and group["implementation"] is None
-                continue
-            relative = Path(group[key])
-            assert not relative.is_absolute() and ".." not in relative.parts
-        for key, field in (
-            ("header_path", "header"),
-            ("source_path", "implementation"),
-        ):
-            if group[key] is None:
-                assert field == "implementation" and group[field] is None
-                continue
-            path = output / group[key]
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(group[field], encoding="utf-8")
+        relative = Path(group["path"])
+        assert not relative.is_absolute() and ".." not in relative.parts
+        path = output / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(group["text"], encoding="utf-8")
     includes = ["-I", str(output), "-I", str(GFSIM_INCLUDE)]
     cxx = _tool("CXX", "clang++")
     objects = []
     for index, group in enumerate(groups):
-        if group["source_path"] is None:
-            assert group["implementation"] is None
-            continue
-        source = output / group["source_path"]
+        source = output / group["path"]
         obj = tmp_path / f"group-{index}.o"
         compiled = subprocess.run(
             [cxx, "-std=c++20", *includes, "-c", str(source), "-o", str(obj)],
@@ -401,24 +384,31 @@ def _run_grouped_cpp(tmp_path: Path, final: Path) -> str:
     driver = tmp_path / "grouped.cpp"
     driver.write_text(
         """\
-#include \"pycircuit_system.hpp\"
+#include \"design.hpp\"
 #include <iostream>
-static int run(FinalSystem &model, const char *tag) {
+static auto bit(bool value) {
+  return gfsim::wire<gfsim::Bits<1>>::known(gfsim::Bits<1>{value ? 1u : 0u});
+}
+static int run(pyc_dut &dut, const char *tag) {
+  auto &model = dut.system();
+  dut.drive({bit(false), bit(false)});
   model.Reset();
-  for (int i = 0; i != 5; ++i) {
+  for (int i = 0; i != 3; ++i) {
+    dut.drive({bit(false), bit(false)});
+    if (model.Step() != gfsim::SimStepResult::Running) return 5;
+    dut.drive({bit(true), bit(false)});
     auto step = model.Step();
-    for (const auto &event : model.Observations().Events())
+    for (const auto &event : dut.observations().Events())
       std::cout << tag << \" EV \" << event.value.bits << \"\\n\";
     if (step == gfsim::SimStepResult::Failed ||
         step == gfsim::SimStepResult::InvalidState) return 5;
-    if (step == gfsim::SimStepResult::Quiescent) break;
   }
   return 0;
 }
 int main() {
-  FinalSystem model; model.Build();
-  if (int rc = run(model, \"A\")) return rc;
-  if (int rc = run(model, \"B\")) return rc;
+  pyc_dut dut; dut.drive({bit(false), bit(false)}); dut.system().Build();
+  if (int rc = run(dut, \"A\")) return rc;
+  if (int rc = run(dut, \"B\")) return rc;
 }
 """,
         encoding="utf-8",
@@ -544,19 +534,25 @@ def _corrupt_second_target(text: str, *, duplicate_id: bool) -> str:
 @pytest.mark.parametrize(
     ("child_source", "system_source", "expected_one_run", "serialized_regs"),
     [
-        pytest.param(CHILD, SYSTEM, [0, 0, 3, 10], 6, id="persistent-current-next"),
+        pytest.param(
+            CHILD,
+            SYSTEM,
+            [100, 200, 3, 10, 3, 10],
+            7,
+            id="persistent-current-next",
+        ),
         pytest.param(
             LOCAL_CANDIDATE_CHILD,
             LOCAL_CANDIDATE_SYSTEM,
-            [3, 10, 3, 10],
-            6,
+            [100, 200, 3, 10, 3, 10],
+            7,
             id="local-candidate-reuse",
         ),
         pytest.param(
             ENABLED_CHILD,
             ENABLED_SYSTEM,
-            [0, 200, 3, 200],
-            8,
+            [100, 200, 3, 200, 3, 200],
+            9,
             id="independent-yield-enables",
         ),
     ],
@@ -572,7 +568,12 @@ def test_multi_assignment_saved_final_cpp_and_rtl(
     # Five parent registers plus one owned count per child. Aliased output
     # connections must not create relay state; repeated child definitions must
     # retain separate count state and output targets.
-    assert final.read_text(encoding="utf-8").count('"ac.reg"') == serialized_regs
+    assert (
+        final.read_text(encoding="utf-8").count(
+            "callee = @pycircuit.__builtins__.dffe"
+        )
+        == serialized_regs
+    )
 
     cpp = tmp_path / "model.generated.hpp"
     rtl = tmp_path / "model.sv"
@@ -585,42 +586,64 @@ def test_multi_assignment_saved_final_cpp_and_rtl(
     assert _cpp_trace(grouped_out, "A") == expected_one_run
     assert _cpp_trace(grouped_out, "B") == expected_one_run
 
-    # RTL strobes both log events and the phase-two report gauge per run.
-    per_run = expected_one_run + [1]
+    # Unconditional observations keep the structural child composition route.
+    per_run = expected_one_run
     rtl_values = _run_verilog(tmp_path, rtl)
     assert rtl_values == per_run * 2, rtl_values
 
 
 @pytest.mark.parametrize(
-    ("label", "duplicate_id"),
-    [("redirect-second-target", False), ("duplicate-second-use-id", True)],
+    ("label", "mutate", "expected_diagnostic"),
+    [
+        (
+            "duplicate-entry",
+            lambda text: "".join(
+                line * 2 if line.lstrip().startswith("hwir.system ") else line
+                for line in text.splitlines(keepends=True)
+            ),
+            "requires exactly one hwir.system",
+        ),
+        (
+            "invalid-root-kind",
+            lambda text: text.replace(
+                'hwir.root_kind = "system"', 'hwir.root_kind = "module"', 1
+            ),
+            "structural C++ root_kind must be system",
+        ),
+    ],
 )
-def test_multi_assignment_use_proofs_fail_closed(
-    tmp_path: Path, label: str, duplicate_id: bool
+def test_multi_assignment_hwir_contract_fails_closed(
+    tmp_path: Path, label: str, mutate, expected_diagnostic: str
 ) -> None:
-    """A verified multi-use final must reject redirected or duplicate proofs."""
+    """Both backends reject corrupt independent-HWIR package contracts."""
     final = _build_final(tmp_path)
-    text = final.read_text(encoding="utf-8")
-    mutated = _corrupt_second_target(text, duplicate_id=duplicate_id)
+    lowered = subprocess.run(
+        [_optimizer(), str(final), "--ac-final-to-hwir"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert lowered.returncode == 0, lowered.stderr
+    text = lowered.stdout
+    mutated = mutate(text)
     assert mutated != text
-    candidate = tmp_path / f"{label}.final.ac"
+    candidate = tmp_path / f"{label}.hwir.mlir"
     candidate.write_text(mutated, encoding="utf-8")
 
-    output = tmp_path / f"{label}.cpp"
-    result = _emit(candidate, "cpp", output)
-    assert result.returncode == 1, f"{label}: {result.returncode}: {result.stderr}"
-    expected_diagnostic = (
-        "generic final RequiredUse is malformed"
-        if duplicate_id
-        else "generic final YieldBinding is stale or redirected"
-    )
-    assert expected_diagnostic in result.stderr, result.stderr
-    assert not output.exists(), "rejected final must not publish partial output"
-
-    rtl_output = tmp_path / f"{label}.sv"
-    rtl_result = _emit(candidate, "verilog", rtl_output)
-    assert (
-        rtl_result.returncode == 1
-    ), f"{label}: {rtl_result.returncode}: {rtl_result.stderr}"
-    assert expected_diagnostic in rtl_result.stderr, rtl_result.stderr
-    assert not rtl_output.exists(), "rejected final must not publish partial output"
+    for target in ("structural-cpp", "verilog"):
+        result = subprocess.run(
+            [
+                _source_parts_harness(),
+                str(candidate),
+                "--target",
+                target,
+                "--format",
+                "source",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 1, f"{label}/{target}: {result.returncode}"
+        assert expected_diagnostic in result.stderr, result.stderr
+        assert not result.stdout, "rejected HWIR must not publish partial output"

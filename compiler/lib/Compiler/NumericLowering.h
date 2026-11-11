@@ -26,6 +26,12 @@ struct NumericLoweringSite {
   mlir::DictionaryAttr origin, sourceSpan;
 };
 
+struct CheckedIntegerBoundary {
+  mlir::Value value;
+  std::optional<mlir::Value> condition;
+  IntegerInterval interval;
+};
+
 enum class SelectArm { Then, Else };
 struct PreparedIntegerSelect {
   NumericValue whenTrue, whenFalse;
@@ -65,6 +71,10 @@ lowerExactIntegerShiftRight(mlir::OpBuilder &, const NumericLoweringSite &,
 mlir::FailureOr<mlir::Value>
 lowerExactIntegerBoundary(mlir::OpBuilder &, const NumericLoweringSite &,
                           const NumericValue &, ac::BitsType destination);
+mlir::FailureOr<CheckedIntegerBoundary> lowerCheckedIntegerBoundary(
+    mlir::OpBuilder &, const NumericLoweringSite &, const NumericValue &,
+    ac::BitsType destination,
+    const std::optional<IntegerInterval> &destinationInterval);
 
 } // namespace acir::compiler
 

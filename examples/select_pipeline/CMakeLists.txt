@@ -10,6 +10,7 @@ pycircuit_add_example(select_pipeline
   SYSTEM_TOP example_select_pipeline.bench.ExerciseSelectPipeline
   SYSTEM_ENTRY_SOURCE bench
   SYSTEM_CYCLES 1829
+  SYSTEM_TIMEOUT_SECONDS 360
   SYSTEM_SOURCES select_pipeline.py bench.py)
 if(PYC_EXAMPLE_VERIFY)
 

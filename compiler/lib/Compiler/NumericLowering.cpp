@@ -534,4 +534,109 @@ FailureOr<Value> lowerExactIntegerBoundary(OpBuilder &builder,
                    value.value, destination, "mode",
                    *sourceWidth > *targetWidth ? "trunc" : "zext");
 }
+
+FailureOr<CheckedIntegerBoundary> lowerCheckedIntegerBoundary(
+    OpBuilder &builder, const NumericLoweringSite &site,
+    const NumericValue &value, ac::BitsType destination,
+    const std::optional<IntegerInterval> &declaredInterval) {
+  if (failed(verifySite(site)))
+    return failure();
+  auto sourceWidth = checkValue(value, site);
+  auto targetWidth = widthOf(
+      destination, value.value ? valueSite(value.value) : nullptr, site);
+  if (failed(sourceWidth) || failed(targetWidth))
+    return failure();
+  if (*targetWidth == std::numeric_limits<unsigned>::max())
+    return diagnostic(site)()
+           << "integer boundary exceeds compiler representation capacity";
+
+  APInt power(*targetWidth + 1, 0);
+  power.setBit(*targetWidth);
+  IntegerInterval representation{APSInt::getUnsigned(0),
+                                 APSInt(std::move(power), true)};
+  const IntegerInterval &bounds = declaredInterval ? *declaredInterval
+                                                   : representation;
+  if (APSInt::compareValues(bounds.lower, bounds.upper) >= 0 ||
+      bounds.lower.isNegative() ||
+      APSInt::compareValues(bounds.upper, representation.upper) > 0)
+    return diagnostic(site)()
+           << "declared integer bounds do not fit destination representation";
+
+  bool lowerProven =
+      APSInt::compareValues(value.interval->lower, bounds.lower) >= 0;
+  bool upperProven =
+      APSInt::compareValues(value.interval->upper, bounds.upper) <= 0;
+  if (auto closed = dyn_cast_or_null<ac::MathIntAttr>(
+          value.closedSourceConstant)) {
+    APSInt integer(closed.getCanonicalValue());
+    if (APSInt::compareValues(integer, bounds.lower) < 0 ||
+        APSInt::compareValues(integer, bounds.upper) >= 0)
+      return diagnostic(site)()
+             << "static integer value is outside declared destination bounds";
+    lowerProven = upperProven = true;
+  }
+
+  std::optional<Value> condition;
+  if (!lowerProven || !upperProven) {
+    // Dynamic mathematical candidates wider than the executable scalar
+    // profile remain unsupported. Explicit low-bit operations may still prove
+    // a 64-bit destination without requiring this runtime comparison.
+    if (*sourceWidth > 64)
+      return diagnostic(site)()
+             << "dynamic integer boundary requires at most 64 candidate bits";
+    bool signedComparison = value.interval->lower.isNegative();
+    auto encodedConstant = [&](const APSInt &integer) -> FailureOr<Value> {
+      APInt encoded = integer.extOrTrunc(*sourceWidth);
+      APSInt physical(std::move(encoded), true);
+      OperationState state(site.location,
+                           ac::BitsConstantOp::getOperationName());
+      state.addTypes(value.value.getType());
+      state.addAttribute("value", integerExpression(builder, physical, site));
+      return builder.create(state)->getResult(0);
+    };
+    auto compare = [&](const APSInt &bound,
+                       StringRef predicate) -> FailureOr<Value> {
+      auto constant = encodedConstant(bound);
+      if (failed(constant))
+        return failure();
+      return operation(builder, site.location,
+                       ac::BitsCompareOp::getOperationName(),
+                       {value.value, *constant}, bitsType(builder, 1, site),
+                       "predicate", predicate);
+    };
+    if (!lowerProven) {
+      auto lower = compare(bounds.lower,
+                           signedComparison ? "sge" : "uge");
+      if (failed(lower))
+        return failure();
+      condition = *lower;
+    }
+    if (!upperProven) {
+      auto upper = compare(bounds.upper,
+                           signedComparison ? "slt" : "ult");
+      if (failed(upper))
+        return failure();
+      if (condition)
+        condition = operation(builder, site.location,
+                              ac::BitsBinaryOp::getOperationName(),
+                              {*condition, *upper}, bitsType(builder, 1, site),
+                              "opcode", "and");
+      else
+        condition = *upper;
+    }
+  }
+
+  Value converted = value.value;
+  if (*sourceWidth == *targetWidth) {
+    if (!ac::areEquivalentHardwareTypes(value.value.getType(), destination))
+      return diagnostic(site)() << "integer boundary representation proof "
+                                   "requires normalized equal-width types";
+  } else {
+    converted = operation(
+        builder, site.location, ac::BitsResizeOp::getOperationName(),
+        value.value, destination, "mode",
+        *sourceWidth > *targetWidth ? "trunc" : "zext");
+  }
+  return CheckedIntegerBoundary{converted, condition, bounds};
+}
 } // namespace acir::compiler

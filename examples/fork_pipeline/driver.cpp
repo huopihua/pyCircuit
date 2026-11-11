@@ -1,6 +1,6 @@
 #include "gfsim/SimExecutor.h"
 #include "gfsim/SystemRunner.h"
-#include "pycircuit_system.hpp"
+#include "design.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -350,8 +350,8 @@ void fourState(unsigned workers) {
   c.finish();
 }
 void probes(unsigned workers) {
-  gfsim::WorkExecutor pool(workers);
-  pyc_root root("fork-discard", &pool);
+  pyc_dut probe(workers);
+  auto &root = probe.root();
   root.Build();
   Golden golden;
   auto r = Row{0, 0, 0, zero(), {0, 0}};

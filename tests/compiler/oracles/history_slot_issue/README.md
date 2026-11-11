@@ -109,7 +109,7 @@ python3 tests/compiler/oracles/history_slot_issue/check.py \
 
 ```sh
 python3 -m unittest discover \
-  -s tests/compiler/oracles/history_slot_issue -p test_models.py -v
+  -s tests/compiler/oracles/history_slot_issue -p test_history_slot_issue_models.py -v
 python3 tests/compiler/oracles/history_slot_issue/rivals.py \
   --output /tmp/history-slot-issue-rivals.json
 ```

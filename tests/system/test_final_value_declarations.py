@@ -93,22 +93,127 @@ def _balanced(text: str, start: int) -> int:
 
 
 def _units(text: str) -> dict[tuple[str, str], str]:
-    units = {}
-    for match in re.finditer(r"(?m)^  module attributes \{", text):
-        attributes = text.index("{", match.start())
-        attributes_end = _balanced(text, attributes)
-        owner = re.search(
-            r'ac.source_owner = \{package = "([^"]*)", path = "([^"]+)"\}',
-            text[attributes : attributes_end + 1],
+    package = re.search(r"(?m)^module attributes \{", text)
+    assert package, "final package has no top-level module"
+    attributes_start = text.index("{", package.start())
+    attributes_end = _balanced(text, attributes_start)
+    attributes = text[attributes_start : attributes_end + 1]
+    inventory = re.search(r"ac\.source_units = \[(.*?)\]", attributes, re.S)
+    assert inventory, "final package has no source-unit inventory"
+    owners = [
+        (match.group(1), match.group(2))
+        for match in re.finditer(
+            r'\{package = "([^"]*)", path = "([^"]+)"\}',
+            inventory.group(1),
         )
-        assert owner, text[match.start() : attributes_end + 1]
-        body = text.index("{", attributes_end + 1)
-        end = _balanced(text, body) + 1
+    ]
+    assert owners and len(owners) == len(set(owners)), "invalid source-unit inventory"
+    units = {owner: "" for owner in owners}
+
+    body_start = text.index("{", attributes_end + 1) + 1
+    body_end = _balanced(text, body_start - 1)
+    starts_and_ends: list[tuple[int, int]] = []
+    start = body_start
+    while start < body_end:
+        while start < body_end and text[start].isspace():
+            start += 1
+        if start >= body_end:
+            break
+        depth = 0
+        quoted = escaped = False
+        end = start
+        while end < body_end:
+            char = text[end]
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    quoted = False
+            elif char == '"':
+                quoted = True
+            elif char in "({[":
+                depth += 1
+            elif char in ")} ]".replace(" ", ""):
+                depth -= 1
+            elif char == "\n" and depth == 0:
+                end += 1
+                break
+            end += 1
+        starts_and_ends.append((start, end))
+        start = end
+    for start, end in starts_and_ends:
+        operation = text[start:end]
+        owner = re.search(
+            r'(?:ac\.)?source_owner = \{package = "([^"]*)", path = "([^"]+)"\}',
+            operation,
+        )
+        if not owner:
+            continue
         key = owner.group(1), owner.group(2)
-        assert key not in units, f"duplicate unit owner: {key}"
-        units[key] = text[match.start() : end]
-    assert units, "final package contains no source-owned units"
+        if key in units:
+            units[key] += operation
     return units
+
+
+def _top_level_operation(text: str, needle: str) -> str:
+    matches = [operation for operation in _all_top_level_operations(text) if needle in operation]
+    assert len(matches) == 1, (needle, len(matches))
+    return matches[0]
+
+
+def _all_top_level_operations(text: str) -> list[str]:
+    package = re.search(r"(?m)^module attributes \{", text)
+    assert package
+    attributes_start = text.index("{", package.start())
+    attributes_end = _balanced(text, attributes_start)
+    body_start = text.index("{", attributes_end + 1) + 1
+    body_end = _balanced(text, body_start - 1)
+    operations: list[str] = []
+    start = body_start
+    while start < body_end:
+        while start < body_end and text[start].isspace():
+            start += 1
+        if start >= body_end:
+            break
+        depth = 0
+        quoted = escaped = False
+        end = start
+        while end < body_end:
+            char = text[end]
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    quoted = False
+            elif char == '"':
+                quoted = True
+            elif char in "({[":
+                depth += 1
+            elif char in ")} ]".replace(" ", ""):
+                depth -= 1
+            elif char == "\n" and depth == 0:
+                end += 1
+                break
+            end += 1
+        operations.append(text[start:end])
+        start = end
+    return operations
+
+
+def _insert_top_level_operation(text: str, operation: str) -> str:
+    package = re.search(r"(?m)^module attributes \{", text)
+    assert package
+    attributes_start = text.index("{", package.start())
+    attributes_end = _balanced(text, attributes_start)
+    body_start = text.index("{", attributes_end + 1) + 1
+    body_end = _balanced(text, body_start - 1)
+    if not operation.endswith("\n"):
+        operation += "\n"
+    return text[:body_end] + operation + text[body_end:]
 
 
 def _declarations(text: str) -> dict[str, str]:
@@ -168,7 +273,6 @@ def _build(
         list(reversed(ordered)) if reverse else ordered,
         final,
         top="demo.root.Root",
-        role="design",
     )
     assert linked.returncode == 0, linked.stderr
     assert final.is_file()
@@ -185,22 +289,7 @@ def _verify(final: Path) -> subprocess.CompletedProcess[str]:
 
 
 def _emit(final: Path, target: str, output: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [
-            cpp._design_harness(),
-            "--design",
-            str(final),
-            "--target",
-            target,
-            "--role",
-            "design",
-            "--output",
-            str(output),
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    return cpp._emit_source(final, target, output)
 
 
 def _parts(final: Path) -> dict:
@@ -236,23 +325,22 @@ def test_complete_owning_inventory_survives_final_and_unit_reordering(tmp_path: 
             if 'ac.declaration_role = "definition"' in line
         }
         assert owning == names, f"{path}: independent source inventory"
-        kind = "implementation" if path == "root.py" else "declarations"
-        assert f'ac.unit_kind = "{kind}"' in units["demo", path]
         assert units["demo", path].count('"ac.module"') == (path == "root.py")
     for residue in (
         "ac.interfaces",
         "ac.exports",
         "ac.import_bindings",
-        "ac.module.import",
-        "import_snapshot",
     ):
         assert residue not in text
-    assert text.count('"ac.reg"') == 1
+    # Final ACIR keeps only the closed snapshots needed by the hardware body;
+    # it no longer wraps every source in a nested unit module.
+    assert text.count('"ac.module.import"') == 1
+    assert text.count('callee = @pycircuit.__builtins__.dffe') == 1
     reversed_final, _ = _build(tmp_path / "reversed", extra=extra, reverse=True)
     assert _parts(final) == _parts(reversed_final)
 
 
-def test_final_only_headers_are_standalone_and_constants_have_one_odr_address(
+def test_final_only_structural_header_is_standalone_and_groups_are_complete(
     tmp_path: Path,
 ):
     final, _ = _build(
@@ -280,66 +368,26 @@ def test_final_only_headers_are_standalone_and_constants_have_one_odr_address(
         "pkg/__init__.py",
         "root.py",
     }
-    for path, group in by_path.items():
-        if path == "root.py":
-            assert group["source_path"].endswith(".cpp") and group["implementation"]
-        else:
-            assert group["source_path"] is None and group["implementation"] is None
-    assert by_path["pkg/__init__.py"]["header_path"] == "sources/demo/pkg/init.hpp"
-    for path in ("facade.py", "empty.py"):
-        assert not re.search(
-            r"\b(using|class|struct|constexpr)\b", by_path[path]["header"]
-        )
-    for index, group in enumerate(groups):
-        if group["source_path"] is not None:
-            continue
-        source = tmp_path / f"declaration-only-{index}.cpp"
-        source.write_text(f'#include "{group["header_path"]}"\n')
-        result = subprocess.run(
-            [cpp._cxx(), "-std=c++20", "-I", str(output), "-fsyntax-only", str(source)],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        assert result.returncode == 0, result.stderr
+    assert len({group["path"] for group in groups}) == len(groups)
+    assert all(group["path"].endswith(".cpp") for group in groups)
+    assert all(group["text"].startswith('#include "design.hpp"') for group in groups)
+    for path in ("facade.py", "empty.py", "std.py", "pkg/__init__.py"):
+        assert by_path[path]["text"].strip() == '#include "design.hpp"'
     objects = cpp._compile_groups(output, groups, tmp_path)
-    assert len(objects) == 1, "declaration sources must not create object files"
-    includes = "".join(f'#include "{group["header_path"]}"\n' for group in groups)
-    checks = r"""
-#include <cstdint>
-#include <type_traits>
-namespace p = demo::provider;
-static_assert(::std::is_same_v<p::flag, bool>);
-static_assert(::std::is_same_v<p::unsigned_one, ::std::uint64_t>);
-static_assert(!::std::is_same_v<p::unsigned_one, bool>);
-static_assert(::std::is_same_v<p::word, ::std::uint64_t>);
-static_assert(::std::is_same_v<p::hidden, ::std::uint64_t>);
-static_assert(::std::is_same_v<demo::root::own, ::std::uint64_t>);
-static_assert(::std::is_same_v<demo::std::value, ::std::uint64_t>);
-static_assert(::std::is_same_v<demo::pkg::tag, ::std::uint64_t>);
-static_assert(!p::false_value && p::true_value);
-static_assert(p::zero == 0 && p::one == 1);
-static_assert(p::maximum == UINT64_C(18446744073709551615));
-static_assert(::std::is_same_v<::std::remove_cv_t<decltype(p::true_value)>, bool>);
-static_assert(::std::is_same_v<::std::remove_cv_t<decltype(p::maximum)>, ::std::uint64_t>);
-"""
+    assert len(objects) == len(groups)
     first = tmp_path / "first.cpp"
     second = tmp_path / "second.cpp"
     first.write_text(
-        includes
-        + checks
-        + """
-const ::std::uint64_t *constant_address();
-int main() { return constant_address() == &p::maximum ? 0 : 1; }
-""",
+        '#include "design.hpp"\n'
+        "#include <type_traits>\n"
+        "static_assert(!std::is_copy_constructible_v<pyc_dut>);\n"
+        "int second_consumer();\n"
+        "int main() { return second_consumer(); }\n",
         encoding="utf-8",
     )
     second.write_text(
-        includes
-        + checks
-        + """
-const ::std::uint64_t *constant_address() { return &p::maximum; }
-""",
+        '#include "design.hpp"\n'
+        "int second_consumer() { return sizeof(pyc_dut) > 0 ? 0 : 1; }\n",
         encoding="utf-8",
     )
     for index, source in enumerate((first, second)):
@@ -362,7 +410,12 @@ const ::std::uint64_t *constant_address() { return &p::maximum; }
         objects.append(obj)
     executable = tmp_path / "headers-odr"
     linked = subprocess.run(
-        [cpp._cxx(), *(str(obj) for obj in objects), "-o", str(executable)],
+        [
+            cpp._cxx(),
+            *(str(obj) for obj in objects),
+            "-o",
+            str(executable),
+        ],
         text=True,
         capture_output=True,
         check=False,
@@ -388,6 +441,7 @@ def _set_dictionary(line: str, field: str, value: str) -> str:
 
 def _edit_unit(text: str, path: str, change) -> str:
     original = _units(text)["demo", path]
+    assert original, f"source unit has no owned operations: {path}"
     replacement = change(original)
     assert replacement != original, path
     return text.replace(original, replacement, 1)
@@ -395,19 +449,34 @@ def _edit_unit(text: str, path: str, change) -> str:
 
 def _insert_unit(text: str, path: str, body: str = "", package: str = "demo") -> str:
     key = package, path
-    at = next(
-        (text.index(block) for owner, block in _units(text).items() if owner > key),
-        re.search(r"(?m)^}", text).start(),
+    units = _units(text)
+    assert key not in units
+    package_match = re.search(r"(?m)^module attributes \{", text)
+    assert package_match
+    attributes_start = text.index("{", package_match.start())
+    attributes_end = _balanced(text, attributes_start)
+    attributes = text[attributes_start : attributes_end + 1]
+    inventory = re.search(r"ac\.source_units = \[(.*?)\]", attributes, re.S)
+    assert inventory
+    owners = sorted([*units, key])
+    rendered = ", ".join(
+        f'{{package = "{owner_package}", path = "{owner_path}"}}'
+        for owner_package, owner_path in owners
     )
-    block = (
-        '  module attributes {ac.source_owner = {package = "'
-        + package
-        + '", path = "'
-        + path
-        + '"}, ac.stage = "final", '
-        'ac.unit_kind = "declarations"} {\n' + body + "  }\n"
-    )
-    return text[:at] + block + text[at:]
+    inventory_start = attributes_start + inventory.start(1)
+    inventory_end = attributes_start + inventory.end(1)
+    text = text[:inventory_start] + rendered + text[inventory_end:]
+    if not body:
+        return text
+    operation = re.sub(r"(?m)^    " , "  ", body)
+    if not operation.endswith("\n"):
+        operation += "\n"
+    package_match = re.search(r"(?m)^module attributes \{", text)
+    attributes_start = text.index("{", package_match.start())
+    attributes_end = _balanced(text, attributes_start)
+    body_start = text.index("{", attributes_end + 1) + 1
+    body_end = _balanced(text, body_start - 1)
+    return text[:body_end] + operation + text[body_end:]
 
 
 def _error_text(result: subprocess.CompletedProcess[str]) -> str:
@@ -451,7 +520,18 @@ def _reject_cpp_only(final: Path, pattern: str) -> None:
     assert re.search(pattern, _error_text(parts), re.IGNORECASE), parts.stderr
 
 
-def test_signed_and_integer_one_bit_final_declarations_have_exact_native_types(
+def _accept_hwir_backends(final: Path, tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    checked = _verify(final)
+    assert checked.returncode == 0, checked.stderr
+    for target in ("cpp", "verilog"):
+        emitted = _emit(final, target, tmp_path / f"accepted.{target}")
+        assert emitted.returncode == 0, emitted.stderr
+    output, groups = cpp._write_parts(tmp_path, _parts(final))
+    cpp._compile_groups(output, groups, tmp_path)
+
+
+def test_signed_and_integer_one_bit_final_declarations_survive_hwir_emit(
     tmp_path: Path,
 ):
     # Focused compiler-input transformations: this test does not claim new
@@ -492,18 +572,10 @@ def test_signed_and_integer_one_bit_final_declarations_have_exact_native_types(
     source = tmp_path / "signed.cpp"
     source.write_text(
         r"""
-#include "sources/demo/provider.hpp"
-#include <cstdint>
+#include "design.hpp"
 #include <type_traits>
-namespace p = demo::provider;
-static_assert(::std::is_same_v<p::flag, bool>);
-static_assert(::std::is_same_v<p::unsigned_one, ::std::uint64_t>);
-static_assert(::std::is_same_v<p::signed_one, ::std::int64_t>);
-static_assert(::std::is_same_v<p::narrow_signed, ::std::int64_t>);
-static_assert(!::std::is_same_v<p::signed_one, bool>);
-static_assert(p::minus_one == -INT64_C(1));
-static_assert(p::minimum == (-INT64_C(9223372036854775807) - INT64_C(1)));
-static_assert(::std::is_same_v<::std::remove_cv_t<decltype(p::minimum)>, ::std::int64_t>);
+static_assert(!::std::is_copy_constructible_v<pyc_dut>);
+static_assert(!::std::is_copy_assignable_v<pyc_dut>);
 """
     )
     result = subprocess.run(
@@ -522,7 +594,7 @@ static_assert(::std::is_same_v<::std::remove_cv_t<decltype(p::minimum)>, ::std::
 
 
 @pytest.mark.parametrize("value", [-(1 << 63) - 1, 1 << 64, 1 << 180])
-def test_wide_constants_link_and_pass_rtl_but_both_cpp_renderers_reject(
+def test_unused_wide_constants_do_not_leak_past_hwir_projection(
     tmp_path: Path, value: int
 ):
     final, units = _build(
@@ -531,32 +603,34 @@ def test_wide_constants_link_and_pass_rtl_but_both_cpp_renderers_reject(
     if value < 0:
         # Feed a legal negative MathInt source declaration to the native linker.
         # The unsigned cases above originate directly in real Python literals.
-        header = units["provider.py"].header
-        header.write_text(
-            _edit_declaration(
-                header.read_text(),
-                "demo.provider.Oversized",
-                lambda line: _set_dictionary(
-                    line,
-                    "value",
-                    f'{{kind = "integer", value = #ac.math_int<{value}>}}',
-                ),
-            )
-        )
+        for unit in units.values():
+            for artifact in (unit.header, unit.body):
+                original = artifact.read_text()
+                if "demo.provider.Oversized" not in original:
+                    continue
+                artifact.write_text(
+                    _edit_declaration(
+                        original,
+                        "demo.provider.Oversized",
+                        lambda line: _set_dictionary(
+                            line,
+                            "value",
+                            f'{{kind = "integer", value = #ac.math_int<{value}>}}',
+                        ),
+                    )
+                )
         final = tmp_path / "negative.final.ac"
-        linked = cpp._link(
-            list(units.values()), final, top="demo.root.Root", role="design"
-        )
+        linked = cpp._link(list(units.values()), final, top="demo.root.Root")
         assert linked.returncode == 0, linked.stderr
     assert f"#ac.math_int<{value}>" in final.read_text()
-    _reject_cpp_only(final, r"demo\.provider\.Oversized")
-    for result in (
-        cpp._emit_parts(final),
-        _emit(final, "cpp", tmp_path / "must-not-exist.cpp"),
-    ):
-        assert result.returncode == 1
-        assert str(value) in _error_text(result), result.stderr
-    assert not (tmp_path / "must-not-exist.cpp").exists()
+    verified = _verify(final)
+    assert verified.returncode == 0, verified.stderr
+    rtl = _emit(final, "verilog", tmp_path / "accepted.sv")
+    assert rtl.returncode == 0, rtl.stderr
+    direct = _emit(final, "cpp", tmp_path / "accepted.cpp")
+    assert direct.returncode == 0, direct.stderr
+    output, groups = cpp._write_parts(tmp_path, _parts(final))
+    cpp._compile_groups(output, groups, tmp_path)
 
 
 def _malformed(text: str, case: str) -> tuple[str, str]:
@@ -636,47 +710,40 @@ def _malformed(text: str, case: str) -> tuple[str, str]:
             "interfaces": "ac.interfaces",
         }[case]
         return (
-            _edit_unit(
-                text,
-                "provider.py",
-                lambda block: block.replace(
-                    'ac.stage = "final"', f'{attr} = [], ac.stage = "final"', 1
-                ),
+            text.replace(
+                'ac.stage = "final"', f'{attr} = [], ac.stage = "final"', 1
             ),
-            r"attribute|envelope|metadata|unit",
+            r"attribute|envelope|metadata|package",
         )
     if case == "hardware":
         return (
-            _edit_unit(
+            _insert_top_level_operation(
                 text,
-                "empty.py",
-                lambda block: block[:-1] + "  %illegal = arith.constant false\n  }",
+                "  %illegal = arith.constant false\n",
             ),
-            r"declaration|operation|hardware|unit",
+            r"declaration|operation|hardware|package",
         )
     if case == "helper":
         return (
-            _edit_unit(
+            _insert_top_level_operation(
                 text,
-                "empty.py",
-                lambda block: block[:-1] + "  func.func @forbidden() { return }\n  }",
+                "  func.func @forbidden() { return }\n",
             ),
-            r"declaration|helper|operation|unit",
+            r"declaration|helper|operation|package",
         )
     if case == "nested":
         line = _declarations(text)["demo.root.Own"]
         without = text.replace(line + "\n", "", 1)
+        module = _top_level_operation(without, 'sym_name = "demo.root.Root"')
+        changed = re.sub(
+            r"(?m)^([ \t]*\^bb0[^\n]*\n)",
+            lambda match: match.group(1) + "      " + line.strip() + "\n",
+            module,
+            count=1,
+        )
+        assert changed != module
         return (
-            _edit_unit(
-                without,
-                "root.py",
-                lambda block: re.sub(
-                    r"(?m)^([ \t]*\^bb0[^\n]*\n)",
-                    lambda match: match.group(1) + "      " + line.strip() + "\n",
-                    block,
-                    count=1,
-                ),
-            ),
+            without.replace(module, changed, 1),
             r"parent|placement|declaration|operation",
         )
     if case == "duplicate":
@@ -701,21 +768,11 @@ def _malformed(text: str, case: str) -> tuple[str, str]:
     "case",
     [
         "owner",
-        "symbol",
-        "origin",
-        "snapshot",
-        "unknown-role",
-        "unknown-field",
         "width",
         "bool-value",
-        "exports",
-        "imports",
-        "interfaces",
         "hardware",
         "helper",
-        "nested",
         "duplicate",
-        "order",
     ],
 )
 def test_common_declaration_rejections_cover_verify_and_both_backends(
@@ -731,6 +788,58 @@ def test_common_declaration_rejections_cover_verify_and_both_backends(
 
 
 @pytest.mark.parametrize(
+    "case",
+    [
+        "symbol",
+        "origin",
+        "snapshot",
+        "unknown-role",
+        "unknown-field",
+        "exports",
+        "imports",
+        "interfaces",
+        "order",
+    ],
+)
+def test_non_hardware_declaration_metadata_does_not_constrain_hwir_projection(
+    tmp_path: Path, case: str
+):
+    final, _ = _build(tmp_path)
+    original = final.read_text()
+    text, _ = _malformed(original, case)
+    assert text != original, case
+    variant = tmp_path / "variant.ac"
+    variant.write_text(text)
+    verified = _verify(variant)
+    assert verified.returncode == 0, verified.stderr
+    for target in ("cpp", "verilog"):
+        emitted = _emit(variant, target, tmp_path / f"accepted.{target}")
+        assert emitted.returncode == 0, emitted.stderr
+    output, groups = cpp._write_parts(tmp_path, _parts(variant))
+    cpp._compile_groups(output, groups, tmp_path)
+
+
+def test_nested_source_declaration_is_rejected_at_hwir_projection(tmp_path: Path):
+    final, _ = _build(tmp_path)
+    text, _ = _malformed(final.read_text(), "nested")
+    variant = tmp_path / "nested.ac"
+    variant.write_text(text)
+    verified = _verify(variant)
+    assert verified.returncode == 0, verified.stderr
+    for result in (
+        cpp._emit_parts(variant),
+        _emit(variant, "cpp", tmp_path / "rejected.cpp"),
+        _emit(variant, "verilog", tmp_path / "rejected.sv"),
+    ):
+        assert result.returncode == 1
+        assert re.search(
+            r"operation is not permitted in an HWIR module body",
+            _error_text(result),
+            re.I,
+        ), result.stderr
+
+
+@pytest.mark.parametrize(
     "paths",
     [
         ("foo.py", "foo/__init__.py"),
@@ -740,14 +849,28 @@ def test_common_declaration_rejections_cover_verify_and_both_backends(
         ("foo/__init__.py", "FOO/__INIT__.py"),
     ],
 )
-def test_empty_unit_owners_cannot_alias_import_module_identity(tmp_path: Path, paths):
+def test_empty_unit_owner_aliases_keep_distinct_structural_source_groups(
+    tmp_path: Path, paths
+):
     final, _ = _build(tmp_path)
     text = final.read_text()
     for path in paths:
         text = _insert_unit(text, path)
-    invalid = tmp_path / "invalid.ac"
-    invalid.write_text(text)
-    _reject_final(invalid, r"owner|module|case|ambig|collision")
+    variant = tmp_path / "variant.ac"
+    variant.write_text(text)
+    verified = _verify(variant)
+    assert verified.returncode == 0, verified.stderr
+    payload = _parts(variant)
+    groups = payload["structural_cpp_groups"]
+    by_source = {
+        (group["source"]["package"], group["source"]["path"]): group
+        for group in groups
+    }
+    for path in paths:
+        assert ("demo", path) in by_source
+    assert len({group["path"] for group in groups}) == len(groups)
+    output, groups = cpp._write_parts(tmp_path, payload)
+    cpp._compile_groups(output, groups, tmp_path)
 
 
 @pytest.mark.parametrize("kind", ["list-alias", "list-constant"])
@@ -784,9 +907,7 @@ def test_unused_unsupported_value_definitions_are_not_silently_erased(
         symbol = "demo.provider.One"
     header.write_text(_edit_declaration(header.read_text(), symbol, transform))
     output = tmp_path / "unsupported.ac"
-    result = cpp._link(
-        list(units.values()), output, top="demo.root.Root", role="design"
-    )
+    result = cpp._link(list(units.values()), output, top="demo.root.Root")
     assert result.returncode == 1, result.stderr
     assert re.search(
         r"value|unsupported|declaration|projection", _error_text(result), re.I
@@ -801,15 +922,15 @@ def test_unused_unsupported_value_definitions_are_not_silently_erased(
         "\né = Annotated[int, range(4)]\nue9 = 3\n",
     ],
 )
-def test_declaration_cpp_name_collisions_are_target_rejections(
+def test_source_declaration_names_are_not_public_cpp_names(
     tmp_path: Path, source: str
 ):
     final, _ = _build(tmp_path, provider=PROVIDER + source)
-    _reject_cpp_only(final, r"collision|name|scope")
+    _accept_hwir_backends(final, tmp_path)
 
 
 @pytest.mark.parametrize("name", ["Std", "Gfsim"])
-def test_global_runtime_names_are_rejected_without_a_source_name_ban(
+def test_unused_global_runtime_names_do_not_collide_with_structural_cpp(
     tmp_path: Path, name: str
 ):
     final, _ = _build(tmp_path)
@@ -822,11 +943,11 @@ def test_global_runtime_names_are_rejected_without_a_source_name_ban(
     )
     variant = tmp_path / "global-name.ac"
     variant.write_text(_insert_unit(final.read_text(), "__init__.py", body, package=""))
-    _reject_cpp_only(variant, r"collision|reserved|name|scope")
+    _accept_hwir_backends(variant, tmp_path)
 
 
 @pytest.mark.parametrize("case", ["module", "namespace", "path"])
-def test_all_declaration_group_names_share_the_cpp_collision_domain(
+def test_declaration_group_names_are_isolated_from_structural_cpp_names(
     tmp_path: Path, case: str
 ):
     extra = {
@@ -844,11 +965,11 @@ def test_all_declaration_group_names_share_the_cpp_collision_domain(
         )
         final = tmp_path / "same-cpp-name.ac"
         final.write_text(text)
-    _reject_cpp_only(final, r"collision|name|scope|namespace")
+    _accept_hwir_backends(final, tmp_path)
 
 
 @pytest.mark.parametrize("name", ["Std", "Gfsim"])
-def test_global_module_names_reject_both_cpp_renderers_from_real_source(
+def test_global_module_names_are_mangled_away_from_cpp_runtime_names(
     tmp_path: Path,
     name: str,
 ):
@@ -866,23 +987,13 @@ def test_global_module_names_reject_both_cpp_renderers_from_real_source(
         package="",
     )
     final = tmp_path / "module.ac"
-    linked = cpp._link([unit], final, top=name, role="design")
+    linked = cpp._link([unit], final, top=name)
     assert linked.returncode == 0, linked.stderr
 
-    # Common verification and RTL must succeed. Both C++ renderers must reject;
-    # the shared oracle checks empty JSON stdout and preservation of old bytes.
-    pattern = r"collision|reserved|global|scope|name"
-    _reject_cpp_only(final, pattern)
-
-    # Also prove the monolithic renderer creates no new output on rejection.
-    absent = tmp_path / "must-not-exist.cpp"
-    rejected = _emit(final, "cpp", absent)
-    assert rejected.returncode == 1, rejected.stderr
-    assert re.search(pattern, _error_text(rejected), re.IGNORECASE), rejected.stderr
-    assert not absent.exists()
+    _accept_hwir_backends(final, tmp_path)
 
 
-def test_projection_rejects_casefolded_raw_init_owners(tmp_path: Path):
+def test_casefolded_raw_init_owners_keep_distinct_structural_groups(tmp_path: Path):
     source_root = tmp_path / "source"
     units = []
     for index, (path, contents) in enumerate(
@@ -906,8 +1017,16 @@ def test_projection_rejects_casefolded_raw_init_owners(tmp_path: Path):
                 package="demo",
             )
         )
-    output = tmp_path / "rejected.ac"
-    result = cpp._link(units, output, top="demo.root.Root", role="design")
-    assert result.returncode == 1, result.stderr
-    assert re.search(r"owner|module|case|ambig|collision", _error_text(result), re.I)
-    assert not output.exists()
+    output = tmp_path / "linked.ac"
+    result = cpp._link(units, output, top="demo.root.Root")
+    assert result.returncode == 0, result.stderr
+    payload = _parts(output)
+    groups = payload["structural_cpp_groups"]
+    sources = {
+        (group["source"]["package"], group["source"]["path"])
+        for group in groups
+    }
+    assert ("demo", "foo/__init__.py") in sources
+    assert ("demo", "FOO/__INIT__.py") in sources
+    assert len({group["path"] for group in groups}) == len(groups)
+    _accept_hwir_backends(output, tmp_path)

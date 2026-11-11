@@ -9,6 +9,9 @@ set(PYCIRCUIT_NATIVE_BUILD
     CACHE PATH "Native helpers built from this checkout")
 set(PYCIRCUIT_DESIGN "design_top" CACHE STRING "Checked-in preview design")
 set(PYCIRCUIT_TEST_CONSUMER "" CACHE FILEPATH "Optional external testbench consumer")
+set(PYCIRCUIT_COMPILER_INSTALL
+    "${PYCIRCUIT_REPOSITORY_ROOT}/.pycircuit_out/toolchain/install"
+    CACHE PATH "Installed Runtime package for generated simulation bundles")
 set(_designs design_top hold_top zero_rule_top failure_top value_probe_top
     report_probe_top duplicate_report_top)
 if(NOT PYCIRCUIT_DESIGN IN_LIST _designs)
@@ -125,13 +128,16 @@ add_custom_target(preview-build
     -B "${CMAKE_BINARY_DIR}/model-cpp" -G Ninja
     "-DPYCIRCUIT_RUNTIME_ROOT=${PYCIRCUIT_REPOSITORY_ROOT}/runtime"
     "-DPYCIRCUIT_TEST_CONSUMER=${PYCIRCUIT_TEST_CONSUMER}"
+    "-DCMAKE_PREFIX_PATH=${PYCIRCUIT_COMPILER_INSTALL}"
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-  COMMAND "${CMAKE_COMMAND}" --build "${CMAKE_BINARY_DIR}/model-cpp" --parallel 4
+  COMMAND "${CMAKE_COMMAND}" --build "${CMAKE_BINARY_DIR}/model-cpp" --parallel 2
   COMMAND "${CMAKE_COMMAND}" -S "${_artifacts}/verilog"
     -B "${CMAKE_BINARY_DIR}/model-verilog" -G Ninja
     "-DPYCIRCUIT_RUNTIME_ROOT=${PYCIRCUIT_REPOSITORY_ROOT}/runtime"
     "-DPYCIRCUIT_TEST_CONSUMER=${PYCIRCUIT_TEST_CONSUMER}"
+    "-DCMAKE_PREFIX_PATH=${PYCIRCUIT_COMPILER_INSTALL}"
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-  COMMAND "${CMAKE_COMMAND}" --build "${CMAKE_BINARY_DIR}/model-verilog" --parallel 4
+  COMMAND "${CMAKE_COMMAND}" --build "${CMAKE_BINARY_DIR}/model-verilog"
+    --target pycircuit_sim --parallel 2
   DEPENDS preview-artifacts
   USES_TERMINAL VERBATIM)

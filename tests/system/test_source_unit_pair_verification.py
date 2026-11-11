@@ -37,7 +37,7 @@ def Counter():
     total: Word = 0
 
     @rule
-    def tick():
+    def tick() -> None:
         nonlocal total
         total = (total + 1) & 255
 
@@ -51,7 +51,7 @@ from .types import Word
 @module
 def Counter(enabled: bool, incoming: Word, outgoing: Word):
     @rule
-    def update():
+    def update() -> None:
         nonlocal outgoing
         if enabled and incoming != 0:
             outgoing = (incoming + 1) & 255

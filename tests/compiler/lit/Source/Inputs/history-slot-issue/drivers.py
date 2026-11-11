@@ -73,50 +73,73 @@ def scheduled_source(template, case):
     return "".join(lines[:start]) + "\n".join(body) + "".join(lines[node.end_lineno :])
 
 
-def family(header, name):
-    section = header.split(f"class pyc_family_{name} final", 1)[1]
-    return section.split(f"class {name} final", 1)[0]
-
-
-def child(section, name):
-    found = re.findall(
-        rf"std::shared_ptr<[^;\n]*pyc_family_{name}<pyc_count>> (\w+);", section
+def concrete_classes(header):
+    return dict(
+        re.findall(
+            r"class (pyc_\w+) final : public gfsim::SimModule \{(.*?)\n\};",
+            header,
+            re.S,
+        )
     )
+
+
+def decoded_classes(classes):
+    return {
+        typ: bytes.fromhex(typ[4:].split("__h", 1)[0]).decode().rsplit(".", 1)[-1]
+        for typ in classes
+    }
+
+
+def class_for(classes, decoded, name):
+    matches = [typ for typ, actual in decoded.items() if actual == name]
+    assert len(matches) == 1, (name, matches)
+    return matches[0], classes[matches[0]]
+
+
+def children(section, decoded):
+    return [
+        (decoded.get(typ), name)
+        for typ, name in re.findall(r"^\s*(pyc_\w+)\s+(pyc_\w+);$", section, re.M)
+        if typ in decoded
+    ]
+
+
+def child(section, decoded, name):
+    found = [member for actual, member in children(section, decoded) if actual == name]
     assert len(found) == 1, (name, found)
     return found[0]
 
 
 def queues(section):
-    found = re.findall(
-        r"std::shared_ptr<gfsim::collection_storage<gfsim::fifo_kernel<[^;\n]+>>> (\w+);",
-        section,
-    )
+    found = re.findall(r"^\s*gfsim::fifo<[^;\n]+>\s+(pyc_\w+);$", section, re.M)
     assert len(found) in (3, 4), found
     return found
 
 
-def cpp_config(system_header, provider_header, kind):
+def cpp_config(header, kind):
     """Locate actual emitted owners by their types; never supply expected data."""
-    root = "dut.root_->pyc_implementation"
-    section = family(
-        system_header, "slot_rule_mailbox" if kind == "mailbox" else "resident_issue"
+    classes = concrete_classes(header)
+    decoded = decoded_classes(classes)
+    _root_type, section = class_for(
+        classes, decoded, "slot_rule_mailbox" if kind == "mailbox" else "resident_issue"
     )
+    root = "dut.root()"
     if kind == "mailbox":
         fifo = queues(section)
-        left = root + "->" + child(section, "explicit_mailbox")
-        right = root + "->" + child(section, "nested_mailbox")
-        nested_section = family(provider_header, "nested_mailbox")
+        left = root + "." + child(section, decoded, "explicit_mailbox")
+        right = root + "." + child(section, decoded, "nested_mailbox")
+        _nested_type, nested_section = class_for(classes, decoded, "nested_mailbox")
         right_valid = (
             right
-            + "->"
-            + child(nested_section, "valid_cell")
-            + "->pyc_instance_q_state"
+            + "."
+            + child(nested_section, decoded, "valid_cell")
+            + ".pyc_q"
         )
         right_payload = (
             right
-            + "->"
-            + child(nested_section, "payload_cell")
-            + "->pyc_instance_q_state"
+            + "."
+            + child(nested_section, decoded, "payload_cell")
+            + ".pyc_q"
         )
         image = []
         for path, incoming, outgoing in (
@@ -124,10 +147,10 @@ def cpp_config(system_header, provider_header, kind):
             (right, fifo[1], fifo[3]),
         ):
             image += [
-                f"queue_bits(*{root}->{incoming}, 1)",
-                f"bits({right_valid if path == right else path + '->pyc_instance_slot_valid_state'}->current(0).q)",
-                f"bits({right_payload if path == right else path + '->pyc_instance_slot_payload_state'}->current(0).q)",
-                f"queue_bits(*{root}->{outgoing}, 1)",
+                f"queue_bits({root}.{incoming}, 1)",
+                f"bits({right_valid if path == right else path + '.pyc_slot_valid'}.currentState().q)",
+                f"bits({right_payload if path == right else path + '.pyc_slot_payload'}.currentState().q)",
+                f"queue_bits({root}.{outgoing}, 1)",
             ]
         control_wires = {}
         for side, path, incoming, outgoing in (
@@ -142,10 +165,10 @@ def cpp_config(system_header, provider_header, kind):
                     ("head", "out_data"),
                 ):
                     control_wires[f"{side}_{port}_{label}"] = (
-                        f"{root}->{base}_{actual}.element(0)"
+                        f"{root}.{incoming if port == 'in' else outgoing}.{actual}"
                     )
             if side == "left":
-                result = f"{path}->result.element(0).packed()"
+                result = f"{path}.result.packed()"
                 control_wires.update(
                     {
                         f"{side}_capture": f"gfsim::wire<gfsim::Bits<1>>::fromPacked(gfsim::extract<1>({result}, 9))",
@@ -156,30 +179,30 @@ def cpp_config(system_header, provider_header, kind):
             else:
                 control_wires.update(
                     {
-                        f"{side}_capture": f"{path}->incoming_take.element(0)",
-                        f"{side}_publish": f"{path}->outgoing_valid.element(0)",
-                        f"{side}_publish_data": f"{path}->outgoing_data.element(0)",
+                        f"{side}_capture": f"{path}.incoming_take",
+                        f"{side}_publish": f"{path}.outgoing_valid",
+                        f"{side}_publish_data": f"{path}.outgoing_data",
                     }
                 )
 
     else:
-        root += "->" + child(section, "issue")
-        section = family(provider_header, "issue")
+        root += "." + child(section, decoded, "issue")
+        _issue_type, section = class_for(classes, decoded, "issue")
         fifo = queues(section)
-        core = root + "->" + child(section, "issue_core")
+        core = root + "." + child(section, decoded, "issue_core")
         image = [
-            f"queue_bits(*{root}->{fifo[1]}, 2)",
-            f"queue_bits(*{root}->{fifo[0]}, 2)",
-            f"bits({core}->pyc_instance_wakeup_valid_state->current(0).q)",
-            f"bits({core}->pyc_instance_wakeup_payload_state->current(0).q)",
-            f"bits({core}->pyc_instance_allocation_valid_state->current(0).q)",
-            f"bits({core}->pyc_instance_allocation_payload_state->current(0).q)",
+            f"queue_bits({root}.{fifo[1]}, 2)",
+            f"queue_bits({root}.{fifo[0]}, 2)",
+            f"bits({core}.pyc_wakeup_valid.currentState().q)",
+            f"bits({core}.pyc_wakeup_payload.currentState().q)",
+            f"bits({core}.pyc_allocation_valid.currentState().q)",
+            f"bits({core}.pyc_allocation_payload.currentState().q)",
         ]
         image += [
-            f"bits({core}->pyc_instance_entries_state->current({i}).q)"
+            f"bits({core}.pyc_entries_{i}.currentState().q)"
             for i in range(4)
         ]
-        image += [f"queue_bits(*{root}->{fifo[2]}, 1)"]
+        image += [f"queue_bits({root}.{fifo[2]}, 1)"]
         names = (
             "allocation_ready",
             "allocation_available",
@@ -198,7 +221,7 @@ def cpp_config(system_header, provider_header, kind):
             "publish",
             "publish_data",
         )
-        control_wires = {name: f"{root}->{name}.element(0)" for name in names}
+        control_wires = {name: f"{root}.{name}" for name in names}
     controls = "\n".join(
         f'out += "{name}=" + std::to_string(unsigned_value({wire})) + ";";'
         for name, wire in control_wires.items()
@@ -239,14 +262,34 @@ def parse_controls(text, kind):
     return result
 
 
-def verilog_config(system_header, provider_header, kind):
-    root = "dut.dut"
-    section = family(
-        system_header, "slot_rule_mailbox" if kind == "mailbox" else "resident_issue"
+def declarations(section, decoded):
+    result = []
+    pattern = re.compile(
+        r"^\s*((?:pyc_\w+)|(?:gfsim::fifo<[^;\n]+>)|(?:gfsim::dffe<[^;\n]+>))\s+(pyc_\w+);$",
+        re.M,
     )
+    for typ, member in pattern.findall(section):
+        result.append((decoded.get(typ), member, typ))
+    return result
 
-    def queue_name(name):
-        return "pyc_instance_" + name.removeprefix("pyc_queue_").removesuffix("_state")
+
+def instance(section, decoded, member):
+    found = [
+        f"pyc_instance_{index}"
+        for index, (_actual, candidate, _typ) in enumerate(declarations(section, decoded))
+        if candidate == member
+    ]
+    assert len(found) == 1, (member, found)
+    return found[0]
+
+
+def verilog_config(header, kind):
+    classes = concrete_classes(header)
+    decoded = decoded_classes(classes)
+    root = "dut.dut"
+    _root_type, section = class_for(
+        classes, decoded, "slot_rule_mailbox" if kind == "mailbox" else "resident_issue"
+    )
 
     def queue_image(path, depth, width, count_width):
         values = [f"{count_width}'({path}.count)"]
@@ -257,16 +300,31 @@ def verilog_config(system_header, provider_header, kind):
         return "{" + ", ".join(values) + "}"
 
     if kind == "mailbox":
-        fifo = [queue_name(q) for q in queues(section)]
-        left = root + "." + child(section, "explicit_mailbox")
-        right = root + "." + child(section, "nested_mailbox")
-        nested_section = family(provider_header, "nested_mailbox")
+        fifo = [instance(section, decoded, q) for q in queues(section)]
+        left_member = child(section, decoded, "explicit_mailbox")
+        right_member = child(section, decoded, "nested_mailbox")
+        left = root + "." + instance(section, decoded, left_member)
+        right = root + "." + instance(section, decoded, right_member)
+        _nested_type, nested_section = class_for(classes, decoded, "nested_mailbox")
+        valid_member = child(nested_section, decoded, "valid_cell")
+        payload_member = child(nested_section, decoded, "payload_cell")
+        _valid_type, valid_section = class_for(classes, decoded, "valid_cell")
+        _payload_type, payload_section = class_for(classes, decoded, "payload_cell")
         right_valid = (
-            right + "." + child(nested_section, "valid_cell") + ".pyc_instance_q"
+            right
+            + "."
+            + instance(nested_section, decoded, valid_member)
+            + "."
+            + instance(valid_section, decoded, "pyc_q")
         )
         right_payload = (
-            right + "." + child(nested_section, "payload_cell") + ".pyc_instance_q"
+            right
+            + "."
+            + instance(nested_section, decoded, payload_member)
+            + "."
+            + instance(payload_section, decoded, "pyc_q")
         )
+        _explicit_type, explicit_section = class_for(classes, decoded, "explicit_mailbox")
         image = []
         control_wires = {}
         for side, path, incoming, outgoing in (
@@ -275,8 +333,8 @@ def verilog_config(system_header, provider_header, kind):
         ):
             image += [
                 queue_image(f"{root}.{incoming}", 1, 8, 1),
-                f"{right_valid if side == 'right' else path + '.pyc_instance_slot_valid'}.q_current",
-                f"{right_payload if side == 'right' else path + '.pyc_instance_slot_payload'}.q_current",
+                f"{right_valid if side == 'right' else path + '.' + instance(explicit_section, decoded, 'pyc_slot_valid')}.q_current",
+                f"{right_payload if side == 'right' else path + '.' + instance(explicit_section, decoded, 'pyc_slot_payload')}.q_current",
                 queue_image(f"{root}.{outgoing}", 1, 8, 1),
             ]
             for port, queue in (("in", incoming), ("out", outgoing)):
@@ -286,26 +344,37 @@ def verilog_config(system_header, provider_header, kind):
                     ("head", "out_data"),
                 ):
                     control_wires[f"{side}_{port}_{label}"] = f"{root}.{queue}.{actual}"
-            value = path + (".result" if side == "left" else "")
-            control_wires.update(
-                {
-                    f"{side}_capture": value + ".incoming_take",
-                    f"{side}_publish": value + ".outgoing_valid",
-                    f"{side}_publish_data": value + ".outgoing_data",
-                }
-            )
+            if side == "left":
+                control_wires.update(
+                    {
+                        "left_capture": path + ".result[9]",
+                        "left_publish": path + ".result[8]",
+                        "left_publish_data": path + ".result[7:0]",
+                    }
+                )
+            else:
+                control_wires.update(
+                    {
+                        "right_capture": path + ".incoming_take",
+                        "right_publish": path + ".outgoing_valid",
+                        "right_publish_data": path + ".outgoing_data",
+                    }
+                )
         width = 54
     else:
-        root += "." + child(section, "issue")
-        section = family(provider_header, "issue")
-        fifo = [queue_name(q) for q in queues(section)]
-        core = root + "." + child(section, "issue_core")
+        issue_member = child(section, decoded, "issue")
+        root += "." + instance(section, decoded, issue_member)
+        _issue_type, section = class_for(classes, decoded, "issue")
+        fifo = [instance(section, decoded, q) for q in queues(section)]
+        core_member = child(section, decoded, "issue_core")
+        core = root + "." + instance(section, decoded, core_member)
+        _core_type, core_section = class_for(classes, decoded, "issue_core")
         image = [
             queue_image(root + "." + fifo[1], 2, 9, 2),
             queue_image(root + "." + fifo[0], 2, 27, 2),
         ]
         image += [
-            f"{core}.pyc_instance_{name}.q_current"
+            f"{core}.{instance(core_section, decoded, 'pyc_' + name)}.q_current"
             for name in (
                 "wakeup_valid",
                 "wakeup_payload",
@@ -314,7 +383,7 @@ def verilog_config(system_header, provider_header, kind):
             )
         ]
         image += [
-            f"{core}.pyc_instances_entries[{i}].pyc_instance_entries.q_current"
+            f"{core}.{instance(core_section, decoded, 'pyc_entries_' + str(i))}.q_current"
             for i in range(4)
         ]
         image += [queue_image(root + "." + fifo[2], 1, 27, 1)]

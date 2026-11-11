@@ -1,6 +1,6 @@
 #include "gfsim/SimExecutor.h"
 #include "gfsim/SystemRunner.h"
-#include "pycircuit_system.hpp"
+#include "design.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -406,8 +406,8 @@ void fourState(unsigned workers) {
 }
 
 void discardAndFailure(unsigned workers) {
-  gfsim::WorkExecutor pool(workers);
-  pyc_root root("latency-discard", &pool);
+  pyc_dut probe(workers);
+  auto &root = probe.root();
   root.Build();
   auto p = inputs({0, 0, 0, zero(), 0});
   auto driveRoot = [&] {

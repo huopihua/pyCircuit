@@ -4,8 +4,12 @@ import argparse
 import json
 from pathlib import Path
 
-from generate import data
-from models import flow_counters, packed_snapshot
+if __package__:
+    from .generate import data
+    from .models import flow_counters, packed_snapshot
+else:
+    from generate import data
+    from models import flow_counters, packed_snapshot
 
 
 def wanted_packed(row, phase):

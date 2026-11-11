@@ -100,7 +100,17 @@ struct StateOwner {
   Operation *op;
   AstNode node;
 };
-enum class BindingCategory { Module, Struct, Enum, Helper, Marker, Namespace, Other };
+enum class BindingCategory {
+  Module,
+  Struct,
+  Enum,
+  Helper,
+  Alias,
+  Constant,
+  Marker,
+  Namespace,
+  Other
+};
 struct Import {
   FlatSymbolRefAttr symbol;
   Operation *declaration = nullptr;
@@ -215,6 +225,9 @@ struct SourceCheckCapture {
   AstNode statement;
   Value condition, path;
   StringAttr message;
+  // Empty means an authored assertion. Compiler-generated dynamic integer
+  // boundaries use the same suffix contract with kind `range`.
+  StringAttr checkKind;
   // Non-null only for a source observation. `observationKind` is `log` or
   // `report`, `observationSpec` is the same closed static spec the pure-module
   // instrumentation pass emits, and `observationRule` is the rule definition
@@ -920,8 +933,10 @@ private:
                llvm::StringMap<Instance *> &instances,
                llvm::StringMap<SmallVector<Value>> *captures = nullptr);
   LogicalResult scanModules();
+  LogicalResult scanDeclarations();
   LogicalResult scanSourceCallables();
   bool intrinsic(const AstNode &node, StringRef name) const;
+  FailureOr<StringRef> fourStatePattern(const AstNode &node);
   bool fixedAnnotation(const AstNode &node) const;
   bool hasDecorator(const AstNode &node, StringRef name) const;
   LogicalResult scanStructs();
@@ -1118,7 +1133,8 @@ private:
   FailureOr<Value> applyBindingBoundary(Value value,
                                         const BindingBoundary &binding,
                                         const AstNode &node, OpBuilder &at,
-                                        FlatSymbolRefAttr owner);
+                                        FlatSymbolRefAttr owner,
+                                        Value checkPath = {});
   FailureOr<Value> tableUpdate(Value table, Value index, Value replacement,
                                ArrayRef<Attribute> fieldPath,
                                const AstNode &node, OpBuilder &at,
@@ -1247,8 +1263,9 @@ private:
   LogicalResult emitModule(ModuleDecl &decl);
   FailureOr<DictionaryAttr> moduleSignatureAttrs(const ModuleDecl &target);
   FailureOr<SmallVector<Attribute>> bindParameters(DictionaryAttr calleeAttrs,
-                                                 const AstNode &call,
-                                                 FlatSymbolRefAttr parent);
+                                                    const AstNode &call,
+                                                    FlatSymbolRefAttr parent,
+                                                    bool directCall = false);
   FailureOr<SmallVector<Attribute>>
   bindTypeArguments(DictionaryAttr calleeAttrs, const AstNode &call,
                     FlatSymbolRefAttr parent);
@@ -1315,6 +1332,7 @@ private:
   std::string prefix;
   OwningOpRef<ModuleOp> body;
   llvm::StringMap<Import> names;
+  llvm::DenseSet<DictionaryAttr> declarationStatements;
   llvm::StringSet<> helperOwnerBindings;
   llvm::StringMap<AstNode> structs, behavioralRules;
   llvm::StringMap<llvm::StringMap<SourceCallableDecl>> sourceMethods;
@@ -1378,6 +1396,15 @@ ArrayAttr portNames(OpBuilder &b, ArrayRef<Port> ports);
 
 std::optional<ac::detail::ValueKind>
 Importer::annotationKind(const AstNode &node) {
+  if (auto binding = lookupBinding(node);
+      binding && binding->category == BindingCategory::Alias) {
+    auto alias = dyn_cast_or_null<ac::TypeAliasOp>(binding->declaration);
+    auto kind = alias ? alias.getTarget().getAs<StringAttr>("kind") : StringAttr();
+    if (kind && kind.getValue() == "bool")
+      return ac::detail::ValueKind::Boolean;
+    if (kind && kind.getValue() == "integer")
+      return ac::detail::ValueKind::Integer;
+  }
   if (nominalAnnotation(node))
     return std::nullopt;
   if (node.kind() == "Name" && node.string("id") == "bool")
@@ -1967,7 +1994,8 @@ FailureOr<Value> Importer::applyBindingBoundary(Value value,
                                                 const BindingBoundary &binding,
                                                 const AstNode &node,
                                                 OpBuilder &at,
-                                                FlatSymbolRefAttr ownerSymbol) {
+                                                FlatSymbolRefAttr ownerSymbol,
+                                                Value checkPath) {
   using ac::detail::ValueKind;
   const Port &contract = binding.contract;
   auto info = valueInfo(value);
@@ -1992,13 +2020,51 @@ FailureOr<Value> Importer::applyBindingBoundary(Value value,
                   "type";
       return value;
     }
-    auto converted =
-        lowerExactIntegerBoundary(at, numericSite(node, ownerSymbol), info,
-                                  dyn_cast<ac::BitsType>(contract.type));
+    FailureOr<Value> converted = failure();
+    std::optional<IntegerInterval> checkedInterval;
+    if (checkPath && activeRule) {
+      std::optional<IntegerInterval> declaredInterval;
+      if (auto declaration = lookupBinding(contract.node);
+          declaration && declaration->category == BindingCategory::Alias) {
+        auto alias = dyn_cast_or_null<ac::TypeAliasOp>(declaration->declaration);
+        auto target = alias ? alias.getTarget() : DictionaryAttr();
+        auto lower = target ? target.getAs<ac::MathIntAttr>("lower")
+                            : ac::MathIntAttr();
+        auto upper = target ? target.getAs<ac::MathIntAttr>("upper")
+                            : ac::MathIntAttr();
+        if (lower && upper)
+          declaredInterval = IntegerInterval{
+              llvm::APSInt(lower.getCanonicalValue()),
+              llvm::APSInt(upper.getCanonicalValue())};
+      }
+      auto checked = lowerCheckedIntegerBoundary(
+          at, numericSite(node, ownerSymbol), info,
+          dyn_cast<ac::BitsType>(contract.type), declaredInterval);
+      if (failed(checked))
+        return failure();
+      converted = checked->value;
+      checkedInterval = checked->interval;
+      Value condition;
+      if (checked->condition)
+        condition = *checked->condition;
+      else {
+        auto one = trueValue(node, at, ownerSymbol);
+        if (failed(one))
+          return failure();
+        condition = *one;
+      }
+      activeRule->checks.push_back(
+          {node, condition, checkPath, {}, at.getStringAttr("range")});
+    } else {
+      converted = lowerExactIntegerBoundary(
+          at, numericSite(node, ownerSymbol), info,
+          dyn_cast<ac::BitsType>(contract.type));
+    }
     if (failed(converted))
       return failure();
-    if (*converted != value) {
-      remember(*converted, info.sourceKind, info.interval,
+    if (*converted != value || checkedInterval) {
+      remember(*converted, info.sourceKind,
+               checkedInterval ? checkedInterval : info.interval,
                info.closedSourceConstant);
       if (arithmeticValues.contains(value))
         arithmeticValues.insert(*converted);
@@ -2307,8 +2373,23 @@ LogicalResult Importer::scanImports() {
     auto encodedLevel = dyn_cast_or_null<DictionaryAttr>(stmt.get("level"));
     auto level =
         encodedLevel ? encodedLevel.getAs<StringAttr>("integer") : StringAttr();
-    if (!module || !level || level.getValue() != "0")
+    if (!module || !level ||
+        (level.getValue() != "0" && level.getValue() != "1"))
       return error() << "relative imports are unsupported";
+    std::string importedModule = module.getValue().str();
+    if (level.getValue() == "1") {
+      std::string current = moduleName(owner);
+      StringRef path = owner.getAs<StringAttr>("path").getValue();
+      if (!path.ends_with("/__init__.py") && path != "__init__.py") {
+        size_t separator = current.rfind('.');
+        current = separator == std::string::npos
+                      ? std::string()
+                      : current.substr(0, separator);
+      }
+      importedModule = current.empty()
+                           ? module.getValue().str()
+                           : (Twine(current) + "." + module.getValue()).str();
+    }
     for (size_t j = 0; j < stmt.array("names").size(); ++j) {
       AstNode alias = stmt.item("names", j);
       StringRef remote = alias.string("name");
@@ -2356,23 +2437,28 @@ LogicalResult Importer::scanImports() {
             builtin.symbol, builtin.declaration, alias, {}, remote.str(), true};
         continue;
       }
-      auto symbol = headers.lookupExport(module.getValue(), remote);
-      auto provider = headers.ownerForModule(module.getValue());
+      auto symbol = headers.lookupExport(importedModule, remote);
+      auto provider = headers.ownerForModule(importedModule);
       Operation *declaration =
           symbol ? headers.lookupDeclaration(symbol) : nullptr;
       if (!symbol || !provider ||
-          !isa_and_nonnull<ac::ModuleImportOp, ac::StructOp, ac::EnumOp, func::FuncOp>(
-              declaration))
-        return error() << "imported declaration '" << module.getValue() << "."
+          !isa_and_nonnull<ac::TypeAliasOp, ac::ConstantOp, ac::ModuleImportOp,
+                           ac::StructOp, ac::EnumOp, func::FuncOp>(declaration))
+        return error() << "imported declaration '" << importedModule << "."
                        << remote << "' is absent from explicit headers";
       auto category = isa<func::FuncOp>(declaration) ? BindingCategory::Helper
+                      : isa<ac::TypeAliasOp>(declaration)
+                          ? BindingCategory::Alias
+                      : isa<ac::ConstantOp>(declaration)
+                          ? BindingCategory::Constant
                       : isa<ac::EnumOp>(declaration) ? BindingCategory::Enum
                       : isa<ac::StructOp>(declaration)
                           ? BindingCategory::Struct
                           : BindingCategory::Module;
       names[name] = {symbol,       declaration, alias,   provider,
                      remote.str(), false,       category};
-      auto closure = headers.interfacesForModule(module.getValue());
+      names[name].importedModule = importedModule;
+      auto closure = headers.interfacesForModule(importedModule);
       if (!closure)
         return error()
                << "imported provider lacks its admitted interface closure";
@@ -2478,7 +2564,8 @@ LogicalResult Importer::stageImports() {
     if (!llvm::is_contained(dependencies, provider))
       continue;
     for (Operation &declaration : header.getBody()->getOperations())
-      if (isa<ac::ModuleImportOp, ac::StructOp, ac::EnumOp, func::FuncOp>(declaration))
+      if (isa<ac::TypeAliasOp, ac::ConstantOp, ac::ModuleImportOp, ac::StructOp,
+              ac::EnumOp, func::FuncOp>(declaration))
         retain(&declaration);
   }
   return success();
@@ -2610,6 +2697,18 @@ Importer::staticExpr(const AstNode &node, FlatSymbolRefAttr ownerSymbol) {
 FailureOr<Type> Importer::portType(const AstNode &node,
                                    FlatSymbolRefAttr ownerSymbol) {
   auto binding = lookupBinding(node);
+  if (binding && binding->category == BindingCategory::Alias) {
+    auto alias = dyn_cast_or_null<ac::TypeAliasOp>(binding->declaration);
+    auto target = alias ? alias.getTarget() : DictionaryAttr();
+    auto kind = target ? target.getAs<StringAttr>("kind") : StringAttr();
+    if (!kind || (kind.getValue() != "bool" && kind.getValue() != "integer"))
+      return error() << "source alias is not a scalar logical type";
+    auto storage = target.getAs<TypeAttr>("storage");
+    auto integer = storage ? dyn_cast<IntegerType>(storage.getValue()) : IntegerType();
+    if (!integer || !integer.isSignless() || !integer.getWidth())
+      return error() << "source alias has invalid physical storage";
+    return bits(integer.getWidth(), node, ownerSymbol);
+  }
   if (binding && (binding->category == BindingCategory::Enum ||
                   binding->category == BindingCategory::Struct)) {
     auto nominal = resolveNominalType(
@@ -2630,7 +2729,12 @@ FailureOr<Type> Importer::portType(const AstNode &node,
     auto width = staticExpr(node.child("slice"), ownerSymbol);
     if (failed(width))
       return failure();
-    return Type(ac::BitsType::get(b.getContext(), *width));
+    auto type = ac::BitsType::getChecked(
+        [&] { return mlir::emitError(node.location(b.getContext(), source.path)); },
+        b.getContext(), *width);
+    if (!type)
+      return failure();
+    return Type(type);
   }
   if (node.kind() == "Subscript" && intrinsic(node.child("value"), "table")) {
     auto tuple = node.child("slice");
@@ -2646,8 +2750,12 @@ FailureOr<Type> Importer::portType(const AstNode &node,
       return failure();
     if (!isa<ac::BitsType, ac::StructType, ac::EnumType>(*element))
       return error() << "table element must be finite bits, struct or enum";
-    return Type(ac::TableType::get(b.getContext(), b.getArrayAttr({*extent}),
-                                   *element));
+    auto type = ac::TableType::getChecked(
+        [&] { return mlir::emitError(node.location(b.getContext(), source.path)); },
+        b.getContext(), b.getArrayAttr({*extent}), *element);
+    if (!type)
+      return failure();
+    return Type(type);
   }
   if (node.kind() == "Name" && node.string("id") == "bool") {
     auto one = parseStaticInteger(b, "1", error);
@@ -2667,7 +2775,9 @@ FailureOr<Type> Importer::portType(const AstNode &node,
   }
   if (node.kind() != "Subscript" || node.child("value").kind() != "Name" ||
       node.child("value").string("id") != "Annotated")
-    return error() << "ports require bool or Annotated[int, range(1 << WIDTH)]";
+    return error() << "ports require bool or Annotated[int, range(1 << WIDTH)]; got '"
+                   << (node.kind() == "Name" ? node.string("id") : node.kind())
+                   << "'";
   AstNode tuple = node.child("slice");
   if (tuple.kind() != "Tuple" || tuple.array("elts").size() != 2 ||
       tuple.item("elts", 0).kind() != "Name" ||
@@ -2688,7 +2798,12 @@ FailureOr<Type> Importer::portType(const AstNode &node,
   auto width = staticExpr(bound.child("right"), ownerSymbol);
   if (failed(width))
     return failure();
-  return Type(ac::BitsType::get(b.getContext(), *width));
+  auto type = ac::BitsType::getChecked(
+      [&] { return mlir::emitError(node.location(b.getContext(), source.path)); },
+      b.getContext(), *width);
+  if (!type)
+    return failure();
+  return Type(type);
 }
 
 FailureOr<ModuleDecl> Importer::signature(const AstNode &node) {
@@ -2747,8 +2862,6 @@ FailureOr<ModuleDecl> Importer::signature(const AstNode &node) {
   AstNode returns = node.child("returns");
   if (result.system && returns)
     return error() << "@system cannot declare a result";
-  if (!result.system && !returns && !result.transactionEffects)
-    return error() << "module requires a return annotation";
   std::optional<Import> returnBinding;
   if (returns)
     returnBinding = lookupBinding(returns);
@@ -2836,6 +2949,7 @@ LogicalResult Importer::scanModules() {
     AstNode stmt = source.module.item("body", i);
     if (docstring(stmt) || stmt.kind() == "ImportFrom" ||
         stmt.kind() == "Import" ||
+        declarationStatements.contains(stmt.value) ||
         (stmt.kind() == "ClassDef" && (structs.contains(stmt.string("name")) ||
                                        enums.contains(stmt.string("name")))))
       continue;
@@ -2859,6 +2973,130 @@ LogicalResult Importer::scanModules() {
     local[name] = modules.size();
     names[name] = {parsed->symbol, nullptr, stmt, {}, name.str(), false};
     modules.push_back(std::move(*parsed));
+  }
+  return success();
+}
+
+LogicalResult Importer::scanDeclarations() {
+  struct Pending {
+    std::string name;
+    AstNode statement;
+    AstNode value;
+    bool alias = false;
+    DictionaryAttr type;
+    DictionaryAttr constant;
+  };
+  SmallVector<Pending> pending;
+  llvm::StringMap<DictionaryAttr> localAliases;
+  llvm::StringSet<> localNames;
+  auto logicalType = [&](const AstNode &value) -> FailureOr<DictionaryAttr> {
+    if (value.kind() == "Name" && value.string("id") == "bool")
+      return b.getDictionaryAttr(
+          {b.getNamedAttr("kind", b.getStringAttr("bool")),
+           b.getNamedAttr("storage", TypeAttr::get(b.getI1Type()))});
+    if (value.kind() == "Subscript" && value.child("value").kind() == "Name" &&
+        value.child("value").string("id") == "Annotated") {
+      AstNode tuple = value.child("slice");
+      if (tuple.kind() != "Tuple" || tuple.array("elts").size() != 2 ||
+          tuple.item("elts", 0).kind() != "Name" ||
+          tuple.item("elts", 0).string("id") != "int")
+        return error() << "type alias requires Annotated[int, range(UPPER)]";
+      AstNode range = tuple.item("elts", 1);
+      if (range.kind() != "Call" || range.child("func").kind() != "Name" ||
+          range.child("func").string("id") != "range" ||
+          range.array("args").size() != 1 || !range.array("keywords").empty())
+        return error() << "integer type alias requires one positional range upper bound";
+      AstNode upperNode = range.item("args", 0);
+      auto encoded = upperNode.kind() == "Constant"
+                         ? dyn_cast_or_null<DictionaryAttr>(upperNode.get("value"))
+                         : DictionaryAttr();
+      auto spelling = encoded ? encoded.getAs<StringAttr>("integer") : StringAttr();
+      auto upper = spelling ? parseStaticInteger(b, spelling.getValue(), error)
+                            : FailureOr<ac::MathIntAttr>(failure());
+      if (failed(upper))
+        return error() << "integer type alias range upper bound must be a positive literal";
+      llvm::APSInt amount((*upper).getCanonicalValue());
+      if (amount.isNegative() || amount.isZero())
+        return error() << "integer type alias range upper bound must be positive";
+      unsigned width = std::max(1u, (amount - 1).getActiveBits());
+      if (width > 64)
+        return error() << "integer type alias requires at most 64 storage bits";
+      return b.getDictionaryAttr(
+          {b.getNamedAttr("kind", b.getStringAttr("integer")),
+           b.getNamedAttr("storage", TypeAttr::get(b.getIntegerType(width))),
+           b.getNamedAttr("lower", ac::MathIntAttr::get(
+                                           b.getContext(), llvm::APSInt::getUnsigned(0))),
+           b.getNamedAttr("upper", *upper),
+           b.getNamedAttr("interpretation", b.getStringAttr("unsigned"))});
+    }
+    if (auto binding = lookupBinding(value);
+        binding && binding->category == BindingCategory::Alias) {
+      auto alias = dyn_cast_or_null<ac::TypeAliasOp>(binding->declaration);
+      if (alias)
+        return alias.getTarget();
+    }
+    if (value.kind() == "Name") {
+      auto found = localAliases.find(value.string("id"));
+      if (found != localAliases.end())
+        return found->second;
+    }
+    return failure();
+  };
+  for (size_t index = 0; index < source.module.array("body").size(); ++index) {
+    AstNode statement = source.module.item("body", index);
+    if (statement.kind() != "Assign" || statement.array("targets").size() != 1 ||
+        statement.item("targets", 0).kind() != "Name")
+      continue;
+    StringRef name = statement.item("targets", 0).string("id");
+    AstNode value = statement.child("value");
+    auto type = logicalType(value);
+    DictionaryAttr constant;
+    bool alias = succeeded(type);
+    if (!alias && value.kind() == "Constant")
+      constant = staticValue(b, value.get("value"), error);
+    if (!alias && !constant)
+      continue;
+    if (names.contains(name) || structs.contains(name) || enums.contains(name) ||
+        !localNames.insert(name).second)
+      return error() << "source declaration name is duplicated or shadowed: '"
+                     << name << "'";
+    pending.push_back({name.str(), statement, value, alias,
+                       alias ? *type : DictionaryAttr(), constant});
+    if (alias)
+      localAliases[name] = *type;
+    declarationStatements.insert(statement.value);
+  }
+  llvm::sort(pending, [](const Pending &left, const Pending &right) {
+    return StringRef(left.name) < StringRef(right.name);
+  });
+  for (const Pending &item : pending) {
+    auto symbol = FlatSymbolRefAttr::get(b.getContext(), qualify(item.name));
+    SmallVector<NamedAttribute> attributes{
+        b.getNamedAttr("sym_name", b.getStringAttr(symbol.getValue())),
+        b.getNamedAttr("ac.source_owner", owner),
+        b.getNamedAttr("ac.origin", sourceOccurrence(b, symbol, item.statement)),
+        b.getNamedAttr("ac.declaration_role", b.getStringAttr("definition"))};
+    StringRef operationName;
+    if (item.alias) {
+      operationName = ac::TypeAliasOp::getOperationName();
+      attributes.push_back(b.getNamedAttr("target", item.type));
+    } else {
+      operationName = ac::ConstantOp::getOperationName();
+      auto kind = item.constant.getAs<StringAttr>("kind");
+      attributes.push_back(b.getNamedAttr(
+          "type", b.getDictionaryAttr(
+                      {b.getNamedAttr("kind", b.getStringAttr(kind.getValue()))})));
+      attributes.push_back(b.getNamedAttr("value", item.constant));
+    }
+    b.setInsertionPointToEnd(body->getBody());
+    Operation *declaration = createOp(
+        b, item.statement.location(b.getContext(), source.path), operationName,
+        {}, {}, attributes);
+    if (failed(verify(declaration)))
+      return failure();
+    names[item.name] = {symbol, declaration, item.statement, {}, item.name,
+                        false, item.alias ? BindingCategory::Alias
+                                          : BindingCategory::Constant};
   }
   return success();
 }
@@ -2898,10 +3136,10 @@ Importer::moduleSignatureAttrs(const ModuleDecl &target) {
 
 FailureOr<SmallVector<Attribute>>
 Importer::bindParameters(DictionaryAttr calleeAttrs, const AstNode &call,
-                         FlatSymbolRefAttr parent) {
+                         FlatSymbolRefAttr parent, bool directCall) {
   ArrayAttr formals = calleeAttrs.getAs<ArrayAttr>("parameters");
   SmallVector<std::optional<Attribute>> values(formals.size());
-  if (!call.array("args").empty())
+  if (!directCall && !call.array("args").empty())
     return error() << "instance parameters are keyword-only";
   for (size_t i = 0; i < call.array("keywords").size(); ++i) {
     AstNode kw = call.item("keywords", i);
@@ -2909,6 +3147,13 @@ Importer::bindParameters(DictionaryAttr calleeAttrs, const AstNode &call,
     auto typeFormals = calleeAttrs.getAs<ArrayAttr>("type_parameters");
     if (name && typeFormals && llvm::is_contained(typeFormals, name))
       continue;
+    if (directCall && name) {
+      auto hardware = calleeAttrs.getAs<ArrayAttr>("ac.parameters");
+      if (hardware && llvm::any_of(hardware, [&](Attribute raw) {
+            return cast<DictionaryAttr>(raw).getAs<StringAttr>("name") == name;
+          }))
+        continue;
+    }
     size_t ordinal = formals.size();
     for (size_t j = 0; name && j < formals.size(); ++j)
       if (cast<DictionaryAttr>(formals[j])
@@ -3841,6 +4086,15 @@ FailureOr<Type> Importer::expressionType(const AstNode &node,
       return failure();
     return shape->resultType;
   }
+  if (node.kind() == "Call" && intrinsic(node.child("func"), "four_state")) {
+    auto pattern = fourStatePattern(node);
+    if (failed(pattern))
+      return failure();
+    return Type(bits(pattern->size(), node, ownerSymbol));
+  }
+  if (node.kind() == "Call" && (intrinsic(node.child("func"), "case_eq") ||
+                                intrinsic(node.child("func"), "is_known")))
+    return Type(bits(1, node, ownerSymbol));
   if (concatCall(node)) {
     if (failed(validateConcatCall(node)))
       return failure();
@@ -4226,7 +4480,8 @@ LogicalResult Importer::publishSourceChecks(Operation *rule,
            at.getNamedAttr("check",
                            sourceOccurrence(at, symbol, check.statement)),
            at.getNamedAttr("obligation", at.getI64IntegerAttr(0))});
-      auto kind = at.getStringAttr("assert");
+      auto kind = check.checkKind ? check.checkKind
+                                  : at.getStringAttr("assert");
       auto location = sourceSpan(at, source.path, check.statement);
       required.push_back(at.getDictionaryAttr(
           {at.getNamedAttr("id", identity), at.getNamedAttr("kind", kind),
@@ -5439,7 +5694,8 @@ LogicalResult Importer::preflightQueryCallback(
     if (node.kind() == "Call") {
       auto function = node.child("func");
       bool pure = false;
-      for (StringRef name : {"concat", "popcount", "count_leading_zeros",
+      for (StringRef name : {"concat", "four_state", "case_eq", "is_known",
+                             "popcount", "count_leading_zeros",
                              "count_trailing_zeros", "enum_to_bits"})
         pure |= intrinsic(function, name);
       auto binding = lookupBinding(function);
@@ -5878,7 +6134,8 @@ LogicalResult Importer::prepare() {
   Location loc = source.module.location(b.getContext(), source.path);
   body = unit(b.getContext(), loc, owner, "declarations",
               b.getArrayAttr(interfaces));
-  if (failed(stageImports()) || failed(stageEnums()) || failed(scanStructs()))
+  if (failed(stageImports()) || failed(stageEnums()) ||
+      failed(scanDeclarations()) || failed(scanStructs()))
     return failure();
   for (auto &item : structs) {
     b.setInsertionPointToEnd(body->getBody());
@@ -5938,6 +6195,32 @@ LogicalResult Importer::prepare() {
     return failure();
   return success(!diagnosticFailed);
 }
+FailureOr<StringRef> Importer::fourStatePattern(const AstNode &node) {
+  if (node.array("args").size() != 1 || !node.array("keywords").empty())
+    return mlir::emitError(node.location(b.getContext(), source.path))
+           << "four_state requires one nonempty source string literal "
+              "containing only 0/1/x/X/z/Z";
+  auto argument = node.item("args", 0);
+  auto pattern = dyn_cast_or_null<StringAttr>(argument.get("value"));
+  if (argument.kind() != "Constant" || !pattern || pattern.getValue().empty() ||
+      !llvm::all_of(pattern.getValue(), [](char bit) {
+        return bit == '0' || bit == '1' || bit == 'x' || bit == 'X' ||
+               bit == 'z' || bit == 'Z';
+      }))
+    return mlir::emitError(node.location(b.getContext(), source.path))
+           << "four_state requires one nonempty source string literal "
+              "containing only 0/1/x/X/z/Z";
+  TableQueryCharge charge;
+  std::string reason;
+  if (!TableQueryBudget::add(charge, TableQueryResource::ConstantBytes,
+                             pattern.getValue().size()) ||
+      !TableQueryBudget::add(charge, TableQueryResource::Work,
+                             pattern.getValue().size()) ||
+      !queryBudget.reserve(charge, reason))
+    return error() << "four_state pattern budget exceeded: " << reason;
+  return pattern.getValue();
+}
+
 FailureOr<OwningOpRef<ModuleOp>> Importer::lower() {
   grantProof =
       std::make_unique<OwnerEnableProof>(*body, ruleWrites.spentWork());
@@ -5961,7 +6244,9 @@ FailureOr<OwningOpRef<ModuleOp>> Importer::lower() {
     if (item.category != BindingCategory::Module &&
         item.category != BindingCategory::Struct &&
         item.category != BindingCategory::Enum &&
-        item.category != BindingCategory::Helper)
+        item.category != BindingCategory::Helper &&
+        item.category != BindingCategory::Alias &&
+        item.category != BindingCategory::Constant)
       continue;
     exports.push_back(b.getDictionaryAttr(
         {b.getNamedAttr("name", b.getStringAttr(name)),

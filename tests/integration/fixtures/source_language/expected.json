@@ -71,7 +71,12 @@
     },
     {
       "expression": "255 + 1 -> range(256)",
-      "expected_failure": "dynamic range failure before DriveNext"
+      "expected_failure": "runtime precommit range failure",
+      "candidate": 256,
+      "q_before_failure": 255,
+      "q_after_failure": 255,
+      "cycle_advance": 0,
+      "requires_reset": true
     },
     {
       "expression": "7 // 0",

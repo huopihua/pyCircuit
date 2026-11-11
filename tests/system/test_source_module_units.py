@@ -1,8 +1,9 @@
-"""Source-module tests using the active source-language fixtures."""
+"""Current source module, nominal result, and header-only composition tests."""
 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -13,36 +14,32 @@ from pycircuit._source_capture import _capture_source_file
 from pycircuit._source_transport import _emit_source_transport
 
 pytestmark = pytest.mark.system
-
 ROOT = Path(__file__).resolve().parents[2]
-FIXTURES = ROOT / "tests/integration/fixtures/source_language"
+PACKET_FIXTURE = ROOT / "tests/integration/fixtures/source_language/packet.py"
 
-ACCUMULATOR_PROBE = """\
+PROBE = """\
 from pycircuit import module, rule
-from .packet import Request, Word
+from .packet import ProbeResult, Request
 
 @module
-def AccumulatorProbe(request: Request, result: Word):
-    total: Word = 0
-
+def AccumulatorProbe(request: Request) -> ProbeResult:
     @rule
-    def forward():
-        nonlocal result
-        result = request.value
+    def forward() -> ProbeResult:
+        return ProbeResult(value=request.value)
 
-    forward()
+    return forward()
 """
 
-PROBE_ROOT = """\
+ROOT_SOURCE = """\
 from pycircuit import module
-from .packet import Request, Word
+from .packet import ProbeResult, Request
 from .accumulator_probe import AccumulatorProbe
 
 @module
-def ProbeRoot():
-    request: Request = Request(3, True)
-    result: Word = 0
-    child = AccumulatorProbe(request, result)
+def ProbeRoot() -> ProbeResult:
+    request = Request(value=3, valid=1)
+    child = AccumulatorProbe(request)
+    return ProbeResult(value=child.value)
 """
 
 
@@ -55,15 +52,15 @@ class Unit:
 
 
 def _harness() -> Path:
-    candidates: list[str | None] = [os.environ.get("PYCIRCUIT_SOURCE_COMPILER")]
-    toolchain = os.environ.get("PYC_TOOLCHAIN_ROOT")
-    if toolchain:
-        candidates.append(str(Path(toolchain) / "bin/pycircuit-source-unit"))
+    candidates = [os.environ.get("PYCIRCUIT_SOURCE_COMPILER")]
+    root = os.environ.get("PYC_TOOLCHAIN_ROOT")
+    if root:
+        candidates.append(str(Path(root) / "bin/pycircuit-source-unit"))
     candidates.append(shutil.which("pycircuit-source-unit"))
     for candidate in candidates:
         if candidate and Path(candidate).is_file():
             return Path(candidate).resolve()
-    raise AssertionError("set PYCIRCUIT_SOURCE_COMPILER for source module system tests")
+    raise AssertionError("set PYCIRCUIT_SOURCE_COMPILER for source module tests")
 
 
 def _compile(
@@ -74,11 +71,13 @@ def _compile(
     headers: tuple[Path, ...] = (),
 ) -> Unit:
     output.mkdir(parents=True, exist_ok=True)
-    capture = _capture_source_file(source, source_root=root)
     transport = output / f"{source.stem}.transport.mlir"
     body = output / f"{source.stem}.body.mlir"
     interface = output / f"{source.stem}.interface.mlir"
-    transport.write_text(_emit_source_transport(capture), encoding="utf-8")
+    transport.write_text(
+        _emit_source_transport(_capture_source_file(source, source_root=root)),
+        encoding="utf-8",
+    )
     command = [
         str(_harness()),
         "--capture",
@@ -99,502 +98,224 @@ def _compile(
     )
 
 
-def _prepare(tmp_path: Path) -> Path:
+def _workspace(tmp_path: Path) -> Path:
     source = tmp_path / "source"
     source.mkdir()
-    shutil.copy2(FIXTURES / "packet.py", source / "packet.py")
-    (source / "accumulator_probe.py").write_text(ACCUMULATOR_PROBE, encoding="utf-8")
-    (source / "probe_root.py").write_text(PROBE_ROOT, encoding="utf-8")
+    shutil.copy2(PACKET_FIXTURE, source / "packet.py")
+    (source / "accumulator_probe.py").write_text(PROBE, encoding="utf-8")
+    (source / "probe_root.py").write_text(ROOT_SOURCE, encoding="utf-8")
     return source
 
 
 def _compile_probe(tmp_path: Path) -> tuple[Path, Unit, Unit]:
-    source = _prepare(tmp_path)
-    packet = _compile(source / "packet.py", root=source, output=tmp_path / "packet-out")
+    source = _workspace(tmp_path)
+    packet = _compile(source / "packet.py", root=source, output=tmp_path / "packet")
     assert packet.completed.returncode == 0, packet.completed.stderr
     probe = _compile(
         source / "accumulator_probe.py",
         root=source,
-        output=tmp_path / "probe-out",
+        output=tmp_path / "probe",
         headers=(packet.interface,),
     )
     assert probe.completed.returncode == 0, probe.completed.stderr
     return source, packet, probe
 
 
-def _operation_line(text: str, operation: str) -> str:
-    matches = [line.strip() for line in text.splitlines() if operation in line]
+def _operation_lines(text: str, operation: str) -> list[str]:
+    quoted = f'"{operation}"'
+    custom = re.compile(rf"(?:^|\s){re.escape(operation)}(?:\s|\()")
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if quoted in line or custom.search(line)
+    ]
+
+
+def _module_declaration(text: str, symbol: str) -> str:
+    matches = [
+        line
+        for line in _operation_lines(text, "ac.module.import")
+        if f'sym_name = "{symbol}"' in line
+    ]
     assert len(matches) == 1, matches
     return matches[0]
 
 
-def _module_attribute(text: str, name: str, following: str) -> str:
-    return text.split(f"{name} = ", 1)[1].split(f", {following} = ", 1)[0]
-
-
-def _balanced(text: str, start: int, opening: str, closing: str) -> tuple[int, int]:
-    assert text[start] == opening
-    depth = 0
-    for index in range(start, len(text)):
-        if text[index] == opening:
-            depth += 1
-        elif text[index] == closing:
-            depth -= 1
-            if depth == 0:
-                return start, index + 1
-    raise AssertionError(f"unclosed {opening}{closing} record")
-
-
-def _top_level_records(array_text: str) -> list[str]:
-    records: list[str] = []
-    index = 1
-    while index < len(array_text) - 1:
-        if array_text[index] in " ,":
-            index += 1
-            continue
-        start, end = _balanced(array_text, index, "{", "}")
-        records.append(array_text[start:end])
-        index = end
-    return records
-
-
-def _replace_balanced_field(record: str, field: str, replacement: str) -> str:
-    marker = f"{field} = "
-    start = record.index(marker) + len(marker)
-    _, end = _balanced(record, start, "{", "}")
-    return record[:start] + replacement + record[end:]
-
-
-def _mutate_module_header(
-    interface: Path,
-    output: Path,
-    *,
-    static_default: bool | None = None,
-    connection_default: bool = False,
-) -> Path:
-    text = interface.read_text(encoding="utf-8")
-    lines = text.splitlines(keepends=True)
-    line_index = next(i for i, line in enumerate(lines) if "ac.module.import" in line)
-    line = lines[line_index]
-    marker = "parameters = "
-    array_start = line.index(marker) + len(marker)
-    _, array_end = _balanced(line, array_start, "[", "]")
-    array_text = line[array_start:array_end]
-    parameters = _top_level_records(array_text)
-    assert len(parameters) == 2
-    if static_default is not None:
-        static_parameter = parameters[1].replace('name = "result"', 'name = "scale"')
-        static_parameter = static_parameter.replace(
-            'category = "connection"', 'category = "static"'
-        )
-        static_parameter = _replace_balanced_field(
-            static_parameter, "type", '{kind = "integer"}'
-        )
-        default = (
-            '{present = true, value = {kind = "integer", value = #ac.math_int<4>}}'
-            if static_default
-            else "{present = false}"
-        )
-        static_parameter = _replace_balanced_field(static_parameter, "default", default)
-        replacement = array_text[:-1] + ", " + static_parameter + "]"
-        line = line[:array_start] + replacement + line[array_end:]
-    if connection_default:
-        old = "default = {present = false}"
-        first = line.index(old)
-        second = line.index(old, first + len(old))
-        replacement = (
-            'default = {present = true, value = {kind = "integer", '
-            "value = #ac.math_int<0>}}"
-        )
-        line = line[:second] + replacement + line[second + len(old) :]
-    lines[line_index] = line
-    output.write_text("".join(lines), encoding="utf-8")
-    return output
-
-
-def _compile_root_source(
-    tmp_path: Path,
-    source: Path,
-    packet: Unit,
-    probe_header: Path,
-    text: str,
-    stem: str,
-) -> Unit:
-    path = source / f"{stem}.py"
-    path.write_text(text, encoding="utf-8")
-    return _compile(
-        path,
-        root=source,
-        output=tmp_path / f"{stem}-out",
-        headers=(packet.interface, probe_header),
-    )
-
-
-def test_real_packet_then_probe_emit_body_and_interface(tmp_path: Path) -> None:
+def test_packet_and_probe_emit_body_interface_and_exact_transport(tmp_path: Path) -> None:
     source, packet, probe = _compile_probe(tmp_path)
-
-    assert packet.interface.is_file()
-    assert probe.body.is_file()
-    assert probe.interface.is_file()
+    assert packet.interface.is_file() and probe.body.is_file() and probe.interface.is_file()
     assert probe.transport.read_text(encoding="utf-8") == _emit_source_transport(
         _capture_source_file(source / "accumulator_probe.py", source_root=source)
     )
 
 
 def test_class_self_module_authoring_is_an_explicit_negative(tmp_path: Path) -> None:
-    source = _prepare(tmp_path)
+    source = _workspace(tmp_path)
     retired = source / "retired.py"
     retired.write_text(
-        "from pycircuit import module\n\n"
-        "@module\n"
-        "class Retired:\n"
-        "    def __init__(self):\n"
-        "        self.value: int = 0\n",
+        "from pycircuit import module\n\n@module\nclass Retired:\n"
+        "    def __init__(self):\n        self.value: int = 0\n",
         encoding="utf-8",
     )
-    result = _compile(
-        retired,
-        root=source,
-        output=tmp_path / "retired-out",
-    )
-
+    result = _compile(retired, root=source, output=tmp_path / "retired")
     assert result.completed.returncode != 0
-    assert "class/self authoring has been retired" in result.completed.stderr
+    assert "source top level supports imports, @module, and @system definitions" in result.completed.stderr
 
 
-def test_probe_header_matches_the_approved_c2_module_contract(
-    tmp_path: Path,
-) -> None:
+def test_probe_interface_publishes_typed_nominal_result_contract(tmp_path: Path) -> None:
     _, _, probe = _compile_probe(tmp_path)
     interface = probe.interface.read_text(encoding="utf-8")
-    declaration = _operation_line(interface, "ac.module.import")
-
-    assert "demo.accumulator_probe.AccumulatorProbe" in declaration
-    assert 'path = "accumulator_probe.py"' in declaration
-    assert declaration.index('name = "request"') < declaration.index('name = "result"')
-    assert declaration.count('category = "connection"') == 2
-    assert declaration.count('binding = "positional_or_keyword"') == 2
-    assert declaration.count("default = {present = false}") == 2
-    assert declaration.count('precision = "exact"') == 2
-    assert declaration.count("{ordinal, origins") == 2
-    assert declaration.count("read = true") == 1
-    assert declaration.count("read = false") == 1
-    assert declaration.count("write = true") == 1
-    assert declaration.count("write = false") == 1
-    assert "demo.packet.Request" in declaration
-    assert "demo.packet.Word" not in declaration
-    assert 'kind = "integer"' in declaration
-    assert "storage = i8" in declaration
-    assert "lower = #ac.math_int<0>" in declaration
-    assert "upper = #ac.math_int<256>" in declaration
-    imports = _module_attribute(interface, "ac.import_bindings", "ac.interfaces")
-    assert 'name = "Word"' in imports
-    assert "target = @demo.packet.Word" in imports
+    declaration = _module_declaration(
+        interface, "demo.accumulator_probe.AccumulatorProbe"
+    )
+    assert 'input_names = ["request"]' in declaration
+    assert 'output_names = ["result"]' in declaration
+    assert 'parameters = []' in declaration
+    assert '!ac.struct<"demo.packet.Request">' in declaration
+    assert '!ac.struct<"demo.packet.ProbeResult">' in declaration
 
 
-def test_probe_body_and_header_mirror_unit_metadata(tmp_path: Path) -> None:
+def test_probe_body_contains_import_snapshots_and_typed_rule_dataflow(
+    tmp_path: Path,
+) -> None:
     _, _, probe = _compile_probe(tmp_path)
     body = probe.body.read_text(encoding="utf-8")
-    interface = probe.interface.read_text(encoding="utf-8")
-
-    for name, following in (
-        ("ac.exports", "ac.import_bindings"),
-        ("ac.import_bindings", "ac.interfaces"),
-        ("ac.interfaces", "ac.source_owner"),
-    ):
-        assert _module_attribute(body, name, following) == _module_attribute(
-            interface, name, following
-        )
-    assert "ac.module.import" not in body
-    assert "ac.module.import" in interface
-    assert 'ac.type_alias "demo.packet.Word"' in body
     assert 'ac.struct "demo.packet.Request"' in body
+    assert 'ac.struct "demo.packet.ProbeResult"' in body
     assert 'ac.declaration_role = "import_snapshot"' in body
-    assert 'path = "packet.py"' in _module_attribute(
-        interface, "ac.interfaces", "ac.source_owner"
-    )
+    assert body.count('"ac.rule"') == 1
+    assert "ac.struct.get" in body
+    assert "ac.struct.create" in body
+    assert '"ac.source.read"' not in body
+    assert '"ac.source.use"' not in body
 
 
-def test_rule_member_read_uses_member_identity_not_argument_index(
-    tmp_path: Path,
-) -> None:
-    source = _prepare(tmp_path)
-    packet = _compile(source / "packet.py", root=source, output=tmp_path / "packet-out")
-    assert packet.completed.returncode == 0, packet.completed.stderr
-    path = source / "member_read_probe.py"
-    path.write_text(
-        "from pycircuit import module, rule\n"
-        "from .packet import Word\n\n"
-        "@module\n"
-        "def MemberReadProbe(result: Word):\n"
-        "    total: Word = 0\n"
-        "    alias = total\n\n"
-        "    @rule\n"
-        "    def forward():\n"
-        "        nonlocal result\n"
-        "        result = alias\n\n"
-        "    forward()\n",
-        encoding="utf-8",
-    )
-
-    result = _compile(
-        path,
-        root=source,
-        output=tmp_path / "member-read-out",
-        headers=(packet.interface,),
-    )
-
-    assert result.completed.returncode == 0, result.completed.stderr
-    body = result.body.read_text(encoding="utf-8")
-    input_bindings = body.split("ac.input_bindings = ", 1)[1].split(
-        ", ac.input_types = ", 1
-    )[0]
-    assert input_bindings.count('kind = "owned"') == 1
-    assert 'parameter = "result"' not in input_bindings
-
-
-def test_nonlocal_proposal_target_is_not_a_current_value_read(tmp_path: Path) -> None:
-    source = _prepare(tmp_path)
-    packet = _compile(source / "packet.py", root=source, output=tmp_path / "packet-out")
-    assert packet.completed.returncode == 0, packet.completed.stderr
-    path = source / "store_target_probe.py"
-    path.write_text(
-        "from pycircuit import module, rule\n"
-        "from .packet import Request, Word\n\n"
-        "@module\n"
-        "def StoreTargetProbe(request: Request, result: Word):\n"
-        "    @rule\n"
-        "    def forward():\n"
-        "        nonlocal result\n"
-        "        if request.valid:\n"
-        "            result = request.value\n\n"
-        "    forward()\n",
-        encoding="utf-8",
-    )
-
-    result = _compile(
-        path,
-        root=source,
-        output=tmp_path / "store-target-out",
-        headers=(packet.interface,),
-    )
-
-    assert result.completed.returncode == 0, result.completed.stderr
-    declaration = _operation_line(
-        result.interface.read_text(encoding="utf-8"), "ac.module.import"
-    )
-    assert 'read = true, write = false}], parameter = "request"' in declaration
-    assert 'read = false, write = true}], parameter = "result"' in declaration
-
-
-def test_probe_root_uses_headers_without_provider_source_or_body(
-    tmp_path: Path,
-) -> None:
+def test_header_only_parent_compiles_to_current_child_instance(tmp_path: Path) -> None:
     source, packet, probe = _compile_probe(tmp_path)
     (source / "packet.py").unlink()
     (source / "accumulator_probe.py").unlink()
     packet.body.unlink()
     probe.body.unlink()
-
     root = _compile(
         source / "probe_root.py",
         root=source,
-        output=tmp_path / "root-out",
+        output=tmp_path / "root",
         headers=(packet.interface, probe.interface),
     )
-
     assert root.completed.returncode == 0, root.completed.stderr
     body = root.body.read_text(encoding="utf-8")
-    assert "ac.instance" in body
-    assert "demo.accumulator_probe.AccumulatorProbe" in body
-    assert 'ac.module.import "demo.accumulator_probe.AccumulatorProbe"' in body
-    assert 'ac.declaration_role = "import_snapshot"' in body
-    assert 'parameter = "request"' in body
-    assert 'parameter = "result"' in body
-    assert "@demo.packet.Request.__init__" in body
-    assert "#ac.math_int<3>" in body
-    assert "value = true" in body
-    assert "#ac.math_int<0>" in body
+    assert 'callee = @demo.accumulator_probe.AccumulatorProbe' in body
+    assert "ac.struct.create" in body
+    assert "ac.struct.get" in body
+    assert '#ac.math_int<3>' in body
 
 
 @pytest.mark.parametrize(
     "inactive_body",
-    [
+    (
         "        return\n",
-        "        print(item.value)\n        return item.value\n",
-        "        return self.missing\n",
-        "        return missing\n",
-        "        return False\n",
-    ],
+        "        return ProbeResult(value=request.value)\n",
+        "        missing = request.value\n        return ProbeResult(value=missing)\n",
+    ),
 )
-def test_malformed_unregistered_rules_are_rejected(
+def test_unregistered_rules_are_rejected(
     tmp_path: Path, inactive_body: str
 ) -> None:
-    source = _prepare(tmp_path)
-    packet = _compile(source / "packet.py", root=source, output=tmp_path / "packet-out")
+    source = _workspace(tmp_path)
+    packet = _compile(source / "packet.py", root=source, output=tmp_path / "packet")
     assert packet.completed.returncode == 0, packet.completed.stderr
-    malformed = ACCUMULATOR_PROBE.replace(
-        "    forward()\n",
-        "    @rule\n    def inactive(item: Request) -> Word:\n"
+    text = PROBE.replace(
+        "    return forward()\n",
+        "    @rule\n    def inactive() -> ProbeResult:\n"
         + inactive_body
-        + "\n    forward()\n",
+        + "\n    return forward()\n",
     )
-    path = source / "inactive_probe.py"
-    path.write_text(malformed, encoding="utf-8")
-
+    path = source / "unregistered.py"
+    path.write_text(text, encoding="utf-8")
     result = _compile(
-        path,
-        root=source,
-        output=tmp_path / "inactive-out",
-        headers=(packet.interface,),
+        path, root=source, output=tmp_path / "unregistered", headers=(packet.interface,)
     )
-
     assert result.completed.returncode != 0
-    assert result.completed.stderr.strip()
+    assert "Rule declaration must be registered exactly once" in result.completed.stderr
 
 
-def test_valid_unregistered_rule_is_inactive(tmp_path: Path) -> None:
-    source = _prepare(tmp_path)
-    packet = _compile(source / "packet.py", root=source, output=tmp_path / "packet-out")
-    assert packet.completed.returncode == 0, packet.completed.stderr
-    valid = ACCUMULATOR_PROBE.replace(
-        "    forward()\n",
-        "    @rule\n" "    def inactive():\n" "        return\n\n" "    forward()\n",
-    )
-    path = source / "inactive_probe.py"
-    path.write_text(valid, encoding="utf-8")
+def test_duplicate_rule_registration_is_rejected(tmp_path: Path) -> None:
+    source = _workspace(tmp_path)
+    packet = _compile(source / "packet.py", root=source, output=tmp_path / "packet")
+    text = PROBE.replace("    return forward()\n", "    forward()\n    return forward()\n")
+    path = source / "duplicate.py"
+    path.write_text(text, encoding="utf-8")
     result = _compile(
-        path,
-        root=source,
-        output=tmp_path / "inactive-out",
-        headers=(packet.interface,),
+        path, root=source, output=tmp_path / "duplicate", headers=(packet.interface,)
     )
-
-    assert result.completed.returncode == 0, result.completed.stderr
-    body = result.body.read_text(encoding="utf-8")
-    assert body.count('name = "forward"') == 1
-    assert 'name = "inactive"' not in body
-    interface = result.interface.read_text(encoding="utf-8")
-    declaration = _operation_line(interface, "ac.module.import")
-    assert 'parameter = "result"' in declaration
-    assert declaration.count("read = true") == 1
-    assert declaration.count("write = true") == 1
+    assert result.completed.returncode != 0
+    assert "Rule declaration must be registered exactly once" in result.completed.stderr
 
 
 @pytest.mark.parametrize(
     "expression",
-    [
-        "False",
-        "Missing(3, True)",
-        "Word(3)",
-        "Request(3, value=4)",
+    (
         "Request(unknown=3)",
-    ],
+        "Request(value=3, missing=1)",
+        "Request(value=3)",
+        "Request(3, 1, 0)",
+        "Request(value=3, valid=1, value=4)",
+    ),
 )
-def test_invalid_source_reset_expressions_are_rejected(
+def test_invalid_nominal_constructor_bindings_are_rejected(
     tmp_path: Path, expression: str
 ) -> None:
     source, packet, probe = _compile_probe(tmp_path)
-    root_text = PROBE_ROOT.replace("Request(3, True)", expression)
-    result = _compile_root_source(
-        tmp_path, source, packet, probe.interface, root_text, "invalid_reset"
-    )
-
-    assert result.completed.returncode != 0
-    assert result.completed.stderr.strip()
-
-
-def test_wrong_nominal_record_reset_is_rejected(tmp_path: Path) -> None:
-    source, packet, probe = _compile_probe(tmp_path)
-    other = source / "other.py"
-    other.write_text(
-        "class Other:\n"
-        "    value: Word\n"
-        "    valid: bool\n"
-        "    def __init__(self, value: Word = 0, valid: bool = False):\n"
-        "        self.value = value\n"
-        "        self.valid = valid\n",
-        encoding="utf-8",
-    )
-    other_source = other.read_text(encoding="utf-8").replace(
-        "class Other:", "from .packet import Word\n\nclass Other:"
-    )
-    other.write_text(other_source, encoding="utf-8")
-    other_unit = _compile(
-        other,
-        root=source,
-        output=tmp_path / "other-out",
-        headers=(packet.interface,),
-    )
-    assert other_unit.completed.returncode == 0, other_unit.completed.stderr
-    root_text = PROBE_ROOT.replace(
-        "from .accumulator_probe import AccumulatorProbe",
-        "from .accumulator_probe import AccumulatorProbe\nfrom .other import Other",
-    ).replace("Request(3, True)", "Other(3, True)")
-    path = source / "wrong_nominal.py"
-    path.write_text(root_text, encoding="utf-8")
+    text = ROOT_SOURCE.replace("Request(value=3, valid=1)", expression)
+    path = source / "invalid_constructor.py"
+    path.write_text(text, encoding="utf-8")
     result = _compile(
         path,
         root=source,
-        output=tmp_path / "wrong-nominal-out",
+        output=tmp_path / "invalid-constructor",
+        headers=(packet.interface, probe.interface),
+    )
+    assert result.completed.returncode != 0
+    assert result.completed.stderr.strip()
+
+
+def test_wrong_nominal_child_argument_is_rejected(tmp_path: Path) -> None:
+    source, packet, probe = _compile_probe(tmp_path)
+    other = source / "other.py"
+    other.write_text(
+        "from pycircuit import struct, u1, u8\n\n@struct\nclass Other:\n"
+        "    value: u8\n    valid: u1\n",
+        encoding="utf-8",
+    )
+    other_unit = _compile(other, root=source, output=tmp_path / "other")
+    assert other_unit.completed.returncode == 0, other_unit.completed.stderr
+    text = ROOT_SOURCE.replace(
+        "from .packet import ProbeResult, Request",
+        "from .packet import ProbeResult, Request\nfrom .other import Other",
+    ).replace("Request(value=3, valid=1)", "Other(value=3, valid=1)")
+    path = source / "wrong_nominal.py"
+    path.write_text(text, encoding="utf-8")
+    result = _compile(
+        path,
+        root=source,
+        output=tmp_path / "wrong-nominal",
         headers=(packet.interface, probe.interface, other_unit.interface),
     )
-
     assert result.completed.returncode != 0
     assert result.completed.stderr.strip()
 
 
-@pytest.mark.parametrize(
-    ("static_default", "call"),
-    [
-        (False, "AccumulatorProbe(request, result)"),
-        (True, "AccumulatorProbe(request, result)"),
-        (False, "AccumulatorProbe(request, result, 4)"),
-    ],
-)
-def test_child_static_parameters_never_lower_to_empty_static_args(
-    tmp_path: Path, static_default: bool, call: str
-) -> None:
+def test_child_call_accepts_header_declared_positional_connection(tmp_path: Path) -> None:
     source, packet, probe = _compile_probe(tmp_path)
-    mutated = _mutate_module_header(
-        probe.interface,
-        tmp_path / "probe-static.interface.mlir",
-        static_default=static_default,
+    path = source / "positional_parent.py"
+    path.write_text(ROOT_SOURCE, encoding="utf-8")
+    result = _compile(
+        path,
+        root=source,
+        output=tmp_path / "positional-parent",
+        headers=(packet.interface, probe.interface),
     )
-    root_text = PROBE_ROOT.replace("AccumulatorProbe(request, result)", call)
-    result = _compile_root_source(
-        tmp_path, source, packet, mutated, root_text, "static_parent"
+    assert result.completed.returncode == 0, result.completed.stderr
+    assert 'callee = @demo.accumulator_probe.AccumulatorProbe' in result.body.read_text(
+        encoding="utf-8"
     )
-
-    assert result.completed.returncode != 0
-    assert result.completed.stderr.strip()
-
-
-def test_connection_default_metadata_requires_an_explicit_handle(
-    tmp_path: Path,
-) -> None:
-    source, packet, probe = _compile_probe(tmp_path)
-    mutated = _mutate_module_header(
-        probe.interface,
-        tmp_path / "probe-default.interface.mlir",
-        connection_default=True,
-    )
-    explicit = _compile_root_source(
-        tmp_path, source, packet, mutated, PROBE_ROOT, "explicit_parent"
-    )
-    assert explicit.completed.returncode == 0, explicit.completed.stderr
-
-    for stem, call in (
-        ("omitted_parent", "AccumulatorProbe(request)"),
-        ("literal_parent", "AccumulatorProbe(request, 0)"),
-    ):
-        result = _compile_root_source(
-            tmp_path,
-            source,
-            packet,
-            mutated,
-            PROBE_ROOT.replace("AccumulatorProbe(request, result)", call),
-            stem,
-        )
-        assert result.completed.returncode != 0
-        assert result.completed.stderr.strip()

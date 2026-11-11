@@ -138,10 +138,12 @@ def test_canonical_source_record_produces_body_and_interface(
     assert packet.interface.is_file()
     interface = packet.interface.read_text(encoding="utf-8")
     assert "demo.packet.Request" in interface
-    assert "demo.packet.Request.__init__" in interface
+    assert "demo.packet.ProbeResult" in interface
+    assert "ac.struct" in interface
+    assert ".__init__" not in interface
 
 
-def test_header_only_consumer_uses_defaults_kwargs_constructor_body_and_field_read(
+def test_header_only_consumer_uses_nominal_constructor_and_field_read(
     tmp_path: Path,
 ) -> None:
     source_root = _prepare_sources(tmp_path)
@@ -179,11 +181,11 @@ def test_header_only_consumer_uses_defaults_kwargs_constructor_body_and_field_re
     "expression, expected_terms",
     [
         ("Request(unknown=1)", ("unknown", "keyword")),
-        ("Request(True, valid=False)", ("duplicate", "valid")),
-        ("Request(False, 1, 2)", ("too many", "positional")),
+        ("Request(1, valid=0)", ("keyword", "only")),
+        ("Request(value=1)", ("missing", "valid")),
         ("Required()", ("missing", "value")),
-        ("Modes(positional=1, keyword=2)", ("positional", "keyword")),
-        ("Modes(1, 2)", ("keyword", "positional")),
+        ("Modes(positional=1)", ("missing", "keyword")),
+        ("Modes(1, 2)", ("keyword", "only")),
     ],
 )
 def test_constructor_binding_errors_fail_at_native_import(
@@ -285,7 +287,7 @@ def test_malformed_keyword_node_fails_with_diagnostic_not_crash(
     consumer.write_text(
         "from .packet import Request\n\n"
         "def construct() -> Request:\n"
-        "    return Request(valid=True)\n",
+        "    return Request(value=0, valid=1)\n",
         encoding="utf-8",
     )
     captured = _capture_source_file(consumer, source_root=source_root)

@@ -1,6 +1,6 @@
 #include "gfsim/SimExecutor.h"
 #include "gfsim/SystemRunner.h"
-#include "pycircuit_system.hpp"
+#include "design.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -211,9 +211,9 @@ struct Context {
 };
 constexpr std::string_view config=R"({"deadlock_window":null,"max_domain_cycles":{},"max_ticks":6000,"schema":"pycircuit-model-config","version":"1"})";
 void configure(gfsim::SimExecutor &e){require(e.ConfigureJson(reinterpret_cast<const std::uint8_t*>(config.data()),config.size())==PYCIRCUIT_MODEL_STATUS_V1_OK);}
-void driveRoot(pyc_root &root,const Row &r){auto p=ports(r);root.pyc_7079635f636c6b=p.pyc_7079635f636c6b;root.pyc_7079635f727374=p.pyc_7079635f727374;root.control_valid=p.control_valid;root.control=p.control;root.lane0_valid=p.lane0_valid;root.lane1_valid=p.lane1_valid;root.lane0_data=p.lane0_data;root.lane1_data=p.lane1_data;root.take=p.take;}
+template<class Root>void driveRoot(Root &root,const Row &r){auto p=ports(r);root.pyc_7079635f636c6b=p.pyc_7079635f636c6b;root.pyc_7079635f727374=p.pyc_7079635f727374;root.control_valid=p.control_valid;root.control=p.control;root.lane0_valid=p.lane0_valid;root.lane1_valid=p.lane1_valid;root.lane0_data=p.lane0_data;root.lane1_data=p.lane1_data;root.take=p.take;}
 void owner(unsigned workers,bool fail){
-  gfsim::WorkExecutor pool(workers);pyc_root root("owner",&pool);root.Build();Golden g;
+  pyc_dut probe(workers);auto &root=probe.root();root.Build();Golden g;
   Row r;driveRoot(root,r);root.Reset();root.Xfer();
   auto step=[&](Row x){driveRoot(root,x);root.Work();check(root.result.packed(),g.read(x));root.Xfer();g.commit(x);};
   auto edge=[&](Row x){x.clock=false;step(x);x.clock=true;step(x);};
@@ -250,7 +250,7 @@ void owner(unsigned workers,bool fail){
 }
 void safe(unsigned workers){
   for(unsigned mode=0;mode<2;++mode)for(bool z:{false,true})for(bool latent:{false,true}){
-    gfsim::WorkExecutor pool(workers);pyc_root root("safe",&pool);root.Build();Golden g;Row r;
+    pyc_dut probe(workers);auto &root=probe.root();root.Build();Golden g;Row r;
     driveRoot(root,r);root.Reset();root.Xfer();
     auto step=[&](Row x){driveRoot(root,x);root.Work();check(root.result.packed(),g.read(x));root.Xfer();g.commit(x);};
     auto edge=[&](Row x){x.clock=false;step(x);x.clock=true;step(x);};

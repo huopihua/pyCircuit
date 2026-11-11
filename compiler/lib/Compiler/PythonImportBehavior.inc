@@ -500,11 +500,17 @@ Importer::preflightForCapabilities(const AstNode &statement,
       if (failed(chargeSourceWalk(function, inspected)) ||
           !pureCheckedAdd(summary.nodes, 1))
         return failure();
+      if (intrinsic(function, "four_state")) {
+        auto pattern = fourStatePattern(node);
+        return success(succeeded(pattern));
+      }
       auto binding = lookupBinding(function);
       bool constructor =
           binding && binding->category == BindingCategory::Struct;
       if (!constructor && !concatCall(node) &&
-          !intrinsic(function, "enum_to_bits")) {
+          !intrinsic(function, "enum_to_bits") &&
+          !intrinsic(function, "case_eq") &&
+          !intrinsic(function, "is_known")) {
         auto helper = resolveValueHelper(function, activeBehavioralDecl ?
             activeBehavioralDecl->symbol : FlatSymbolRefAttr());
         if (failed(helper) || !*helper)
@@ -872,6 +878,23 @@ FailureOr<LoopResourceShape> Importer::describeLoopExpression(
   }
   if (node.kind() == "Call") {
     auto function = node.child("func");
+    if (intrinsic(function, "four_state")) {
+      auto pattern = fourStatePattern(node);
+      if (failed(pattern) || !operation(1) ||
+          !TableQueryBudget::add(envelope.reservation,
+                                 TableQueryResource::ConstantBytes,
+                                 pattern->size()))
+        return failure();
+      return scalar(pattern->size());
+    }
+    if (intrinsic(function, "case_eq") || intrinsic(function, "is_known")) {
+      for (size_t i = 0; i < node.array("args").size(); ++i)
+        if (failed(visit(node.item("args", i))))
+          return failure();
+      if (!operation(3))
+        return failure();
+      return scalar(1);
+    }
     auto binding = lookupBinding(function);
     if (binding && binding->category == BindingCategory::Struct) {
       auto type = ac::StructType::get(
@@ -1336,7 +1359,12 @@ Importer::auditLoopStatement(Block &block, Operation *previous,
     for (Value result : operation.getResults())
       if (failed(inspectValue(result, rows)))
         return failure();
-    if (isa<ac::BitsConstantOp>(operation))
+    if (auto pattern = dyn_cast<ac::BitsConstant4Op>(operation)) {
+      if (!TableQueryBudget::addProduct(
+              measured, TableQueryResource::ConstantBytes,
+              pattern.getPattern().size(), rows))
+        return failure();
+    } else if (isa<ac::BitsConstantOp>(operation))
       for (Value result : operation.getResults()) {
         auto weight = loopStorageWords(result.getType(), analysis, site);
         if (failed(weight) ||
@@ -1879,6 +1907,7 @@ LogicalResult Importer::lowerLiteralFor(const AstNode &statement, OpBuilder &at,
       if (!sameSourceSite(current.statement, saved.statement) ||
           current.condition != saved.condition || current.path != saved.path ||
           current.message != saved.message ||
+          current.checkKind != saved.checkKind ||
           current.observationKind != saved.observationKind ||
           current.observationSpec != saved.observationSpec ||
           !sameSourceSite(current.observationRule, saved.observationRule) ||
@@ -2099,6 +2128,11 @@ LogicalResult Importer::statements(const AstNode &parent, StringRef field,
       environment = std::move(*joined);
       continue;
     }
+    // `nonlocal` declares which persistent owner an assignment targets; it
+    // has no runtime effect of its own. The module preflight already rejects
+    // names that do not resolve to an enclosing state owner.
+    if (stmt.kind() == "Nonlocal")
+      continue;
     if (stmt.kind() != "Assign" && stmt.kind() != "AnnAssign")
       return mlir::emitError(loc)
              << "unsupported behavioral rule statement '" << stmt.kind() << "'";
@@ -2185,24 +2219,38 @@ LogicalResult Importer::statements(const AstNode &parent, StringRef field,
       return failure();
     if (!binding)
       binding = inferredBoundary(assignmentRoot(target), *value, stmt);
-    auto converted =
-        applyBindingBoundary(*value, *binding, stmt.child("value"), at, symbol);
+    StringRef name = assignmentRoot(target);
+    Value writePath;
+    Value boundaryPath;
+    if (owners.contains(name)) {
+      auto enabled = constant(bits(1, stmt, symbol), 1, stmt, at, symbol);
+      if (failed(enabled))
+        return failure();
+      writePath = environment.continuation ? environment.continuation
+                                           : *enabled;
+      if (environment.ambient && environment.continuation) {
+        auto reached = checkAnd(environment.ambient, environment.continuation,
+                                stmt, at, symbol);
+        if (failed(reached))
+          return failure();
+        boundaryPath = *reached;
+      } else {
+        boundaryPath = writePath;
+      }
+    }
+    auto converted = applyBindingBoundary(*value, *binding,
+                                          stmt.child("value"), at, symbol,
+                                          boundaryPath);
     if (failed(converted))
       return failure();
     value = *converted;
-    StringRef name = assignmentRoot(target);
     if (name.empty() ||
         failed(updateAssignment(target, *value, stmt, at, symbol, values)))
       return failure();
     if (target.kind() == "Name")
       environment.boundaries[name] = *binding;
     if (owners.contains(name)) {
-      auto enabled = constant(bits(1, stmt, symbol), 1, stmt, at, symbol);
-      if (failed(enabled))
-        return failure();
-      auto writeEnable =
-          environment.continuation ? environment.continuation : *enabled;
-      auto normalized = unsignedBoundary(writeEnable, bits(1, stmt, symbol),
+      auto normalized = unsignedBoundary(writePath, bits(1, stmt, symbol),
                                          stmt, at, symbol);
       if (failed(normalized))
         return failure();
@@ -2259,7 +2307,7 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
   llvm::StringMap<Instance *> structuralInstances;
   llvm::StringMap<AstNode> structuralRules;
   SmallVector<AstNode> structuralRegistrations;
-  if (decl.system) {
+  {
     size_t capacity = 0;
     for (size_t i = 0; i < decl.node.array("body").size(); ++i) {
       auto stmt = decl.node.item("body", i);
@@ -2293,9 +2341,6 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
       }
       if (callable)
         continue;
-      if (!call.array("args").empty() || !call.array("keywords").empty())
-        return error() << "structural module declaration requires an empty "
-                          "constructor; bind authored inputs in a rule";
       DictionaryAttr calleeAttrs = binding->declaration
                                        ? binding->declaration->getAttrDictionary()
                                        : DictionaryAttr();
@@ -2326,7 +2371,7 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
       instance.node = stmt;
       instance.callee = binding->symbol;
       instance.declaration = binding->declaration;
-      auto parameters = bindParameters(calleeAttrs, call, decl.symbol);
+      auto parameters = bindParameters(calleeAttrs, call, decl.symbol, true);
       auto typeArguments = bindTypeArguments(calleeAttrs, call, decl.symbol);
       if (failed(parameters) || failed(typeArguments))
         return failure();
@@ -2376,6 +2421,61 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
           &structuralStorage.back();
     }
   }
+  // Bind a structural constructor at its lexical statement, after preceding
+  // module-local state declarations have entered the value environment.
+  // Physical clock/reset pins remain inferred and are never source actuals.
+  auto bindStructuralConstructor = [&](Instance &instance,
+                                       const AstNode &call) -> LogicalResult {
+    if (call.array("args").empty() && call.array("keywords").empty())
+      return success();
+    SmallVector<AstNode> actuals(instance.inputs.size());
+    size_t authoredInputs = instance.inputs.size() -
+                            unsigned(instance.clockInput.has_value()) -
+                            unsigned(instance.resetInput.has_value());
+    if (call.array("args").size() > authoredInputs)
+      return error() << "too many structural module arguments";
+    for (size_t index = 0; index < call.array("args").size(); ++index)
+      actuals[index] = call.item("args", index);
+    for (size_t index = 0; index < call.array("keywords").size(); ++index) {
+      auto keyword = call.item("keywords", index);
+      auto name = dyn_cast_or_null<StringAttr>(keyword.get("arg"));
+      size_t ordinal = authoredInputs;
+      for (size_t input = 0; name && input < authoredInputs; ++input)
+        if (instance.inputs[input].name == name.getValue())
+          ordinal = input;
+      if (ordinal == authoredInputs || actuals[ordinal])
+        return error() << "unknown or repeated structural module argument";
+      actuals[ordinal] = keyword.child("value");
+    }
+    SmallVector<Value> operands;
+    for (size_t index = 0; index < instance.inputs.size(); ++index) {
+      if (instance.clockInput == index || instance.resetInput == index) {
+        StringRef pin = instance.clockInput == index ? "pyc_clk" : "pyc_rst";
+        auto found = values.find(pin);
+        if (found == values.end())
+          return error() << "structural module binding lacks inferred physical "
+                            "domain";
+        operands.push_back(found->second);
+        continue;
+      }
+      if (!actuals[index])
+        return error() << "missing structural module argument '"
+                       << instance.inputs[index].name << "'";
+      auto value = expression(actuals[index], at, decl.symbol, values,
+                              structuralInstances,
+                              instance.inputs[index].type);
+      if (failed(value))
+        return failure();
+      auto converted = boundary(*value, instance.inputs[index], actuals[index],
+                                at, decl.symbol);
+      if (failed(converted))
+        return failure();
+      operands.push_back(*converted);
+    }
+    instance.op->setOperands(operands);
+    instance.bound = true;
+    return success();
+  };
   SmallVector<std::string> computationalRules;
   for (const auto &entry : structuralRules) {
     bool structural = true;
@@ -2431,10 +2531,19 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
       else if (failed(noteNestedRuleDeclaration(stmt))) return failure();
       continue;
     }
-    if (decl.system && stmt.kind() == "Assign" &&
+    if (stmt.kind() == "Assign" &&
         structuralCallSites.contains(
-            sourceOccurrence(at, decl.symbol, stmt.child("value"))))
+            sourceOccurrence(at, decl.symbol, stmt.child("value")))) {
+      auto target = stmt.item("targets", 0);
+      auto found = target.kind() == "Name"
+                       ? structuralInstances.find(target.string("id"))
+                       : structuralInstances.end();
+      if (found == structuralInstances.end() ||
+          failed(bindStructuralConstructor(*found->second,
+                                           stmt.child("value"))))
+        return failure();
       continue;
+    }
     if (stmt.kind() == "Expr") {
       auto call = stmt.child("value");
       if (call.kind() == "Call") {
@@ -2760,11 +2869,13 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
       return error() << "unbound instance '" << instance.name << "'";
   if (decl.system && returned && returned.child("value"))
     return error() << "@system cannot return a value";
-  if (!returned && !decl.system)
-    return error() << "behavioral module requires a return";
   SmallVector<Value> outputs;
   auto node = returned ? returned.child("value") : AstNode();
   if (decl.system) {
+    outputs.clear();
+  } else if (!returned) {
+    if (!decl.outputs.empty())
+      return error() << "behavioral module with outputs requires a return";
     outputs.clear();
   } else if (decl.returnShape == ReturnShape::Mapping &&
              node.kind() == "Call" && node.child("func").kind() == "Name" &&

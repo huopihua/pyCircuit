@@ -1,6 +1,6 @@
 // Independent three-stage scoreboard: expected values never come from a DUT.
 #include "gfsim/SystemRunner.h"
-#include "pycircuit_system.hpp"
+#include "design.hpp"
 #include <array>
 #include <cstdint>
 #include <cstdlib>
@@ -122,8 +122,8 @@ struct RunnerContext {
   }
 };
 void directDiscard(unsigned workers) {
-  gfsim::WorkExecutor pool(workers);
-  pyc_root root("discard_probe",&pool);
+  pyc_dut probe(workers);
+  auto &root = probe.root();
   Golden golden;
   drive(root,inputs({}));root.Reset();root.Xfer();
   auto work = [&](Row row) {
@@ -187,7 +187,7 @@ void nativeFourState(unsigned workers) {
     {{0,0,65535},{0,65535,0},{1,1,0},{0,0,0,0,0}},
   };
   for (const auto &row : cases) {
-    gfsim::WorkExecutor pool(workers);pyc_root root("four_state_probe",&pool);
+    pyc_dut probe(workers);auto &root=probe.root();
     auto input = inputs({});input.a=masked<16>(row.a);input.b=masked<16>(row.b);input.sel=masked<1>(row.sel);
     drive(root,input);root.Reset();root.Xfer();
     std::array<Expected,3> expected{{{0,1,0,65535,0},{0,1,0,65535,0},{0,1,0,65535,0}}};

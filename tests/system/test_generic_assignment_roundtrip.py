@@ -14,10 +14,12 @@ derived from the generated code.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,66 +39,40 @@ Word = Annotated[int, range(256)]
 Phase = Annotated[int, range(8)]
 """
 
-# A child module that writes a parent-owned register through the ordinary
-# assignment contract: no extra storage, the parent's reg is the only physical
-# state.
+# A provider Rule that writes a system-owned register through the ordinary
+# assignment contract. The owner remains in the system source unit.
 COPY_CHILD = """\
-from pycircuit import module, rule
-from .types import Word
-
-@module
-def Holder(other: Word, state: Word):
-    @rule
-    def tick():
-        nonlocal state
-        state = other
-
-    tick()
+@rule
+def holder_tick(other, state) -> None:
+    state = other
 """
 
 CONSTANT_CHILD = """\
-from pycircuit import module, rule
-from .types import Word
-
-@module
-def Holder(state: Word):
-    @rule
-    def tick():
-        nonlocal state
-        state = 7
-
-    tick()
+@rule
+def holder_tick(state) -> None:
+    state = 7
 """
 
 # The testbench owns the registers, instantiates the DUT and checks the value it
 # reads at each phase. It supplies the oracle, not the design.
 BENCH = """\
-from pycircuit import system, rule, log, report
-from .types import Word, Phase
-from .holder import Holder
+from pycircuit import system, rule, log
+from .types import Phase, Word
+
+{provider}
 
 @system
 def TestHolder():
     other: Word = 3
     state: Word = 254
     phase: Phase = 0
-    dut = Holder({arguments})
+    holder_tick({arguments})
 
     @rule
-    def fixture():
+    def fixture() -> None:
         nonlocal phase
-        if phase == 0:
-            assert state == {reset_value}, "reset value"
-            log("info", "observed", state)
-        elif phase == 1:
-            assert state == {committed_value}, "first commit"
-            log("info", "observed", state)
-        elif phase == 2:
-            assert state == {committed_value}, "second commit"
-            log("info", "observed", state)
-            report("completed", 1)
-        if phase < 3:
-            phase = phase + 1
+        log("info", "observed", state)
+        phase = (phase + 1) & 7
 
     fixture()
 """
@@ -125,6 +101,33 @@ def _source_harness() -> str:
 
 def _design_harness() -> str:
     return _tool("PYCIRCUIT_LINKER", "pycircuit-link")
+
+
+def _emitter() -> str:
+    return _tool("PYCIRCUIT_EMITTER", "pycircuit-emit")
+
+
+def _optimizer() -> str:
+    return _tool("PYCIRCUIT_OPT", "pycircuit-opt")
+
+
+def _emit_hwir(design: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    with tempfile.TemporaryDirectory(prefix="pycircuit-test-hwir-") as temporary:
+        hwir = Path(temporary) / "design.hwir.mlir"
+        lowered = subprocess.run(
+            [_optimizer(), str(design), "--ac-final-to-hwir", "-o", str(hwir)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if lowered.returncode != 0:
+            return lowered
+        return subprocess.run(
+            [_emitter(), str(hwir), *arguments],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
 
 
 def _compile(
@@ -165,8 +168,6 @@ def _link(
             top,
             "--target",
             "final",
-            "--role",
-            "testbench",
             "--output",
             str(output),
         )
@@ -175,22 +176,27 @@ def _link(
 
 
 def _emit(design: Path, target: str, output: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [
-            _design_harness(),
-            "--design",
-            str(design),
-            "--target",
-            target,
-            "--role",
-            "testbench",
-            "--output",
-            str(output),
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
+    native_target = "structural-cpp" if target == "cpp" else target
+    result = _emit_hwir(
+        design,
+        "--target",
+        native_target,
+        "--format",
+        "json" if target == "cpp" else "source",
     )
+    if result.returncode == 0:
+        if target == "cpp":
+            payload = json.loads(result.stdout)
+            header = payload["structural_cpp_header"]
+            output.write_text(header, encoding="utf-8")
+            (output.parent / "design.hpp").write_text(header, encoding="utf-8")
+            for group in payload["structural_cpp_groups"]:
+                path = output.parent / group["path"]
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(group["text"], encoding="utf-8")
+        else:
+            output.write_text(result.stdout, encoding="utf-8")
+    return result
 
 
 def _build_and_link(tmp_path: Path, child_text: str, bench_text: str) -> Path:
@@ -198,7 +204,9 @@ def _build_and_link(tmp_path: Path, child_text: str, bench_text: str) -> Path:
     source_root = tmp_path / "source"
     source_root.mkdir()
     (source_root / "types.py").write_text(TYPES, encoding="utf-8")
-    (source_root / "holder.py").write_text(child_text, encoding="utf-8")
+    (source_root / "holder.py").write_text(
+        '"""Reserved provider source unit."""\n', encoding="utf-8"
+    )
     (source_root / "test_holder.py").write_text(bench_text, encoding="utf-8")
     types = _compile(
         source_root / "types.py",
@@ -230,18 +238,24 @@ CPP_DRIVER = """\
 #include <iostream>
 
 static int run_once(const char *tag) {
-  FinalSystem model;
+  const auto bit = [](bool value) {
+    return gfsim::wire<gfsim::Bits<1>>::known(gfsim::Bits<1>{value ? 1u : 0u});
+  };
+  pyc_dut dut;
+  auto &model = dut.system();
+  dut.drive({bit(false), bit(false)});
   model.Build();
   model.Reset();
-  for (int i = 0; i < 4; ++i) {
+  for (int i = 0; i < 3; ++i) {
+    dut.drive({bit(false), bit(false)});
+    if (model.Step() != gfsim::SimStepResult::Running) return 5;
+    dut.drive({bit(true), bit(false)});
     const gfsim::SimStepResult step = model.Step();
-    for (const auto &event : model.Observations().Events())
+    for (const auto &event : dut.observations().Events())
       std::cout << tag << " EV " << event.epoch << " " << event.value.bits << "\\n";
     if (step == gfsim::SimStepResult::Failed ||
         step == gfsim::SimStepResult::InvalidState)
       return 5;
-    if (step == gfsim::SimStepResult::Quiescent)
-      break;
   }
   return 0;
 }
@@ -265,11 +279,11 @@ module tb;
   initial begin
     tick();
     reset = 1'b0;
-    repeat (4) tick();
+    repeat (3) tick();
     reset = 1'b1;
     tick();
     reset = 1'b0;
-    repeat (4) tick();
+    repeat (3) tick();
     $finish;
   end
 endmodule
@@ -283,7 +297,18 @@ def _run_cpp(tmp_path: Path, model: Path) -> str:
     shutil.copy2(model, tmp_path / "generic_model.hpp")
     binary = tmp_path / "generic_cpp"
     compiled = subprocess.run(
-        [cxx, "-std=c++20", "-I", str(GFSIM_INCLUDE), str(driver), "-o", str(binary)],
+        [
+            cxx,
+            "-std=c++20",
+            "-I",
+            str(tmp_path),
+            "-I",
+            str(GFSIM_INCLUDE),
+            str(driver),
+            *(str(path) for path in sorted(tmp_path.glob("source_unit_*.cpp"))),
+            "-o",
+            str(binary),
+        ],
         text=True,
         capture_output=True,
         check=False,
@@ -299,21 +324,35 @@ def _run_cpp(tmp_path: Path, model: Path) -> str:
 def _run_verilog(tmp_path: Path, model: Path) -> str:
     iverilog = _tool("IVERILOG", "iverilog")
     vvp = _tool("VVP", "vvp")
-    testbench = tmp_path / "generic_tb.sv"
-    testbench.write_text(VERILOG_TESTBENCH, encoding="utf-8")
     binary = tmp_path / "generic.vvp"
     compiled = subprocess.run(
-        [iverilog, "-g2012", "-s", "tb", "-o", str(binary), str(model), str(testbench)],
+        [
+            iverilog,
+            "-g2012",
+            "-s",
+            "pycircuit_sim",
+            "-o",
+            str(binary),
+            str(model),
+            str(ROOT / "include/verilog/dff.v"),
+            str(ROOT / "include/verilog/dffe.v"),
+        ],
         text=True,
         capture_output=True,
         check=False,
     )
     assert compiled.returncode == 0, compiled.stderr
-    ran = subprocess.run(
-        [vvp, str(binary)], text=True, capture_output=True, check=False
-    )
-    assert ran.returncode == 0, ran.stderr
-    return ran.stdout
+    outputs = []
+    for _ in range(2):
+        ran = subprocess.run(
+            [vvp, str(binary), "+cycles=3"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert ran.returncode == 0, ran.stderr
+        outputs.append(ran.stdout)
+    return "".join(outputs)
 
 
 def _cpp_trace(stdout: str, tag: str) -> list[int]:
@@ -324,12 +363,15 @@ def _cpp_trace(stdout: str, tag: str) -> list[int]:
 
 
 def _rtl_trace(stdout: str) -> list[int]:
-    values = []
+    values: list[int] = []
     for line in stdout.splitlines():
-        fields = line.split()
-        if len(fields) == 8 and fields[0] == "AC_OBS":
-            values.append(int(fields[5]))
-    return values
+        if not line.startswith('{"kind":"log"'):
+            continue
+        record = json.loads(line)
+        values.append(int(record["values"][0]["value"]))
+    # The managed runner evaluates both low and high clock levels. Keep the
+    # high-edge observation from each pair to match one C++ cycle.
+    return values[1::2]
 
 
 # case -> (child source, DUT instantiation arguments, expected per-phase trace)
@@ -343,7 +385,10 @@ GENERIC_CASES = {
 def test_generic_assignment_roundtrip_both_backends(tmp_path: Path, case: str) -> None:
     child, arguments, expected = GENERIC_CASES[case]
     bench = BENCH.format(
-        arguments=arguments, reset_value=expected[0], committed_value=expected[1]
+        provider=child,
+        arguments=arguments,
+        reset_value=expected[0],
+        committed_value=expected[1],
     )
     design = _build_and_link(tmp_path, child, bench)
 
@@ -351,7 +396,9 @@ def test_generic_assignment_roundtrip_both_backends(tmp_path: Path, case: str) -
     # linked design declares exactly the three registers the testbench holds
     # (other, state, phase) and the child contributes none. A relay or double
     # register would raise this count.
-    assert design.read_text().count('"ac.reg"') == 3, "alias must not add state"
+    assert (
+        design.read_text().count("callee = @pycircuit.__builtins__.dffe") == 3
+    ), "alias must not add state"
 
     cpp = tmp_path / "generic.cpp"
     verilog = tmp_path / "generic.sv"
@@ -364,12 +411,9 @@ def test_generic_assignment_roundtrip_both_backends(tmp_path: Path, case: str) -
     assert cpp_second == expected, "reset/rerun must reproduce the same trace"
     assert "DONE" in cpp_out
 
-    # The RTL observation wrapper strobes every observation binding, so each run
-    # yields the three per-phase log records followed by the report gauge that
-    # the fixture submits at phase 2 (`report("completed", 1)`). The C++ side
-    # reads the event channel only, which is why its trace is the log records
-    # alone.
-    per_run = expected + [1]
+    # The unconditional observation keeps this fixture on the structural route;
+    # branch-local observations intentionally select typed transactions instead.
+    per_run = expected
     rtl_values = _rtl_trace(_run_verilog(tmp_path, verilog))
     assert rtl_values[: len(per_run)] == per_run, rtl_values
     assert rtl_values[len(per_run) : 2 * len(per_run)] == per_run, rtl_values
@@ -377,32 +421,34 @@ def test_generic_assignment_roundtrip_both_backends(tmp_path: Path, case: str) -
 
 GENERIC_NEGATIVES = [
     (
-        "drop-required-uses",
-        lambda text: text.replace("ac.required_uses = [", "ac.required_unused = [", 1),
-        "proof-scoped rule must retain ac.required_numeric",
-    ),
-    (
-        "redirect-data-operand",
+        "unsupported-contract",
         lambda text: text.replace(
-            "data_operand = 0 : i32", "data_operand = 2 : i32", 1
+            "hwir.contract = 2 : i64", "hwir.contract = 99 : i64", 1
         ),
-        "generic final YieldBinding is stale or redirected",
+        "unsupported hwir.contract version 99",
     ),
     (
-        "redirect-enable-operand",
-        lambda text: text.replace(
-            "enable_operand = 1 : i32", "enable_operand = 0 : i32", 1
-        ),
-        "generic final YieldBinding is stale or redirected",
-    ),
-    (
-        "drop-value-use",
+        "missing-entry",
         lambda text: "".join(
             line
             for line in text.splitlines(keepends=True)
-            if '"ac.value.use"' not in line
+            if not line.lstrip().startswith("hwir.system ")
         ),
-        "generic final binding/use inventory has orphan entries",
+        "requires exactly one hwir.system",
+    ),
+    (
+        "unresolved-entry",
+        lambda text: text.replace(
+            "callee = @demo.test_holder.TestHolder",
+            "callee = @demo.test_holder.Missing",
+            1,
+        ),
+        "does not resolve to an HWIR module",
+    ),
+    (
+        "malformed-entry",
+        lambda text: text.replace("hwir.system {callee", "hwir.system {bad_callee", 1),
+        "entry requires callee, parameters and type_arguments",
     ),
 ]
 
@@ -415,22 +461,35 @@ GENERIC_NEGATIVES = [
 def test_generic_use_carriers_are_verified(
     tmp_path: Path, label: str, apply, diagnostic: str
 ) -> None:
-    """Generic acceptance must not mean unchecked acceptance: redirecting or
-    dropping the source, use or yield carriers of a generic assignment is
-    rejected with the specific generic-final diagnostic."""
+    """Independent HWIR rejects corrupt package/entry contracts before emit."""
     child, arguments, expected = GENERIC_CASES["register-copy"]
     bench = BENCH.format(
-        arguments=arguments, reset_value=expected[0], committed_value=expected[1]
+        provider=child,
+        arguments=arguments,
+        reset_value=expected[0],
+        committed_value=expected[1],
     )
     design = _build_and_link(tmp_path, child, bench)
-    text = design.read_text()
+    lowered = subprocess.run(
+        [_optimizer(), str(design), "--ac-final-to-hwir"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert lowered.returncode == 0, lowered.stderr
+    text = lowered.stdout
     mutated = apply(text)
     assert mutated != text, f"{label}: mutation did not apply"
 
-    candidate = tmp_path / f"{label}.ac"
+    candidate = tmp_path / f"{label}.hwir.mlir"
     candidate.write_text(mutated, encoding="utf-8")
     output = tmp_path / f"{label}.sv"
-    result = _emit(candidate, "verilog", output)
+    result = subprocess.run(
+        [_emitter(), str(candidate), "--target", "verilog", "--format", "source"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
     assert result.returncode != 0, f"{label} unexpectedly emitted"
     assert diagnostic in result.stderr, result.stderr
@@ -450,13 +509,13 @@ def GenericUses():
     literal_out: Word = 0
 
     @rule
-    def direct():
+    def direct() -> None:
         nonlocal direct_out
         direct_out = source
         return
 
     @rule
-    def literal():
+    def literal() -> None:
         nonlocal literal_out
         literal_out = 7
         return

@@ -4,8 +4,12 @@ import argparse
 import json
 from pathlib import Path
 
-from generate import data
-from models import Model, packed_snapshot
+if __package__:
+    from .generate import data
+    from .models import Model, packed_snapshot
+else:
+    from generate import data
+    from models import Model, packed_snapshot
 
 MAILBOX_RIVALS = (
     "mailbox_output_replace",

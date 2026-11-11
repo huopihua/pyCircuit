@@ -1,15 +1,13 @@
 # ruff: noqa: N802,F841
-from pycircuit import module, report, rule
-
-from .types import Word
+from pycircuit import report, rule, system, u8 as Word
 
 
-@module
+@system
 def ReportProbeTop():
     value: Word = 7
 
     @rule
-    def observe_reports():
+    def observe_reports() -> None:
         report("first", value)
         report("second", value)
 

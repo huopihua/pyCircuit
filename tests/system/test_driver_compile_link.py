@@ -51,7 +51,7 @@ def Counter():
     total: Word = {initial}
 
     @rule
-    def tick():
+    def tick() -> None:
         nonlocal total
         total = (total + 1) & 255
 
@@ -65,7 +65,7 @@ from pycircuit import module, rule
 def Broken():
 
     @rule
-    def tick():
+    def tick() -> None:
         return 1
 
     tick()
@@ -97,6 +97,8 @@ def harnesses() -> dict[str, str]:
             "PYCIRCUIT_SOURCE_COMPILER", "pycircuit-source-unit"
         ),
         "PYCIRCUIT_LINKER": _tool("PYCIRCUIT_LINKER", "pycircuit-link"),
+        "PYCIRCUIT_OPT": _tool("PYCIRCUIT_OPT", "pycircuit-opt"),
+        "PYCIRCUIT_EMITTER": _tool("PYCIRCUIT_EMITTER", "pycircuit-emit"),
     }
 
 
@@ -291,6 +293,53 @@ def _direct_program(
     return program, json.loads(report.read_text(encoding="utf-8"))
 
 
+def _emit_from_final(
+    harnesses: dict[str, str], program: Path, target: str, scratch: Path
+) -> subprocess.CompletedProcess[str]:
+    """Exercise the public backend boundary: final ACIR -> HWIR -> source."""
+
+    scratch.mkdir(parents=True, exist_ok=True)
+    hwir = scratch / "design.hwir.mlir"
+    lowered = subprocess.run(
+        [
+            harnesses["PYCIRCUIT_OPT"],
+            str(program),
+            "--ac-final-to-hwir",
+            "-o",
+            str(hwir),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if lowered.returncode:
+        return lowered
+    return subprocess.run(
+        [
+            harnesses["PYCIRCUIT_EMITTER"],
+            str(hwir),
+            "--target",
+            target,
+            "--format",
+            "source",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _assert_total_initial(text: str, value: int) -> None:
+    """The source initializer must drive the total dffe init operand."""
+
+    assert 'instance_name = "total"' in text
+    initializer = re.compile(
+        rf'ac\.bits\.constant.*?column = 19 : i64, end_column = 20 : i64, '
+        rf'end_line = 6 : i64, line = 6 : i64.*?#ac\.math_int<{value}>',
+    )
+    assert initializer.search(text), f"missing total initializer {value}"
+
+
 # --------------------------------------------------------------------------
 # compile
 # --------------------------------------------------------------------------
@@ -455,7 +504,7 @@ def test_compile_rejects_an_invalid_source_with_a_single_line_diagnostic(
     diagnostic = _diagnostic(result, "compile")
     assert "rejected the source" in diagnostic
     # The rejection is the intended frontend rule, not an incidental failure.
-    assert "lexical rules cannot return data" in diagnostic
+    assert "void rule must return no value" in diagnostic
     _assert_nothing_published(workspace.units / "broken")
 
     absent = _compile(
@@ -531,8 +580,9 @@ def test_link_publishes_one_program_file_and_the_control_directory(
     )
     assert destination.read_bytes() == direct.read_bytes()
     text = destination.read_text(encoding="utf-8")
-    assert "ac.initial_value = 0 : i8" in text
-    assert 'ac.source_owner = {package = "demo", path = "counter.py"}' in text
+    _assert_total_initial(text, 0)
+    assert '{package = "demo", path = "counter.py"}' in text
+    assert 'ac.source_units = [' in text
     # Linking did not modify, add, or remove anything among its inputs.
     assert _tree(workspace.units) == units_before
 
@@ -541,6 +591,7 @@ def test_published_program_is_admitted_by_both_backends(
     workspace: _Workspace,
     cli_environment: dict[str, str],
     harnesses: dict[str, str],
+    tmp_path: Path,
 ) -> None:
     _two_units(cli_environment, workspace)
     destination = workspace.out / "program.ac"
@@ -553,43 +604,19 @@ def test_published_program_is_admitted_by_both_backends(
         )
     )
 
-    cpp = workspace.out / "design.cpp"
-    emitted = subprocess.run(
-        [
-            harnesses["PYCIRCUIT_LINKER"],
-            "--design",
-            str(destination),
-            "--target",
-            "cpp",
-            "--output",
-            str(cpp),
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
+    emitted = _emit_from_final(
+        harnesses, destination, "structural-cpp", tmp_path / "cpp"
     )
     assert emitted.returncode == 0, emitted.stderr
-    cpp_text = cpp.read_text(encoding="utf-8")
-    assert '#include "gfsim/SimSystem.h"' in cpp_text
-    assert '#include "gfsim/SimDFF.h"' in cpp_text
+    cpp_text = emitted.stdout
+    assert "#include <gfsim/SimModule.h>" in cpp_text
+    assert "gfsim::dffe<gfsim::Bits<8>> pyc_total" in cpp_text
 
-    verilog = workspace.out / "design.sv"
-    emitted = subprocess.run(
-        [
-            harnesses["PYCIRCUIT_LINKER"],
-            "--design",
-            str(destination),
-            "--target",
-            "verilog",
-            "--output",
-            str(verilog),
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
+    emitted = _emit_from_final(
+        harnesses, destination, "verilog", tmp_path / "verilog"
     )
     assert emitted.returncode == 0, emitted.stderr
-    verilog_text = verilog.read_text(encoding="utf-8")
+    verilog_text = emitted.stdout
     assert re.search(r"^module\s+\S+\s*\(", verilog_text, re.MULTILINE), verilog_text
     assert re.search(r"\balways\b", verilog_text), verilog_text
 
@@ -612,8 +639,12 @@ def test_link_top_must_name_the_linked_graph_root(
     )
 
     diagnostic = _diagnostic(result, "link")
-    assert "does not match the selected source graph root" in diagnostic
-    assert "'demo.counter.Counter'" in diagnostic
+    if top == "demo.types.Word":
+        assert "top is not a supplied module definition" in diagnostic
+        assert "@demo.types.Word" in diagnostic
+    else:
+        assert "top is not a supplied module definition" in diagnostic
+        assert f"@{top}" in diagnostic
     _assert_nothing_published(destination)
 
 
@@ -642,7 +673,7 @@ def test_link_replace_republishes_a_genuinely_different_program(
     destination = workspace.out / "program.ac"
     _ok(_link(cli_environment, (types, counter), "demo.counter.Counter", destination))
     before = destination.read_bytes()
-    assert "ac.initial_value = 0 : i8" in before.decode("utf-8")
+    _assert_total_initial(before.decode("utf-8"), 0)
 
     rejected = _link(
         cli_environment, (types, counter), "demo.counter.Counter", destination
@@ -672,8 +703,7 @@ def test_link_replace_republishes_a_genuinely_different_program(
     after = destination.read_bytes()
     assert after != before
     text = after.decode("utf-8")
-    assert "ac.initial_value = 9 : i8" in text
-    assert "ac.initial_value = 0 : i8" not in text
+    _assert_total_initial(text, 9)
     control = _control(destination)
     assert sorted(entry.name for entry in control.iterdir()) == ["lock", "owner.json"]
     assert json.loads((control / "owner.json").read_text(encoding="utf-8")) == {

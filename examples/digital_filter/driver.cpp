@@ -2,7 +2,7 @@
 // reused.
 #include "gfsim/SimExecutor.h"
 #include "gfsim/SystemRunner.h"
-#include "pycircuit_system.hpp"
+#include "design.hpp"
 
 #include <array>
 #include <cstdint>
@@ -130,7 +130,7 @@ pyc_dut::Inputs inputs(Row row) {
   in.x_valid = known<1>(row.valid);
   return in;
 }
-void drive(pyc_root &root, const pyc_dut::Inputs &in) {
+template <class Root> void drive(Root &root, const pyc_dut::Inputs &in) {
   root.pyc_7079635f636c6b = in.pyc_7079635f636c6b;
   root.pyc_7079635f727374 = in.pyc_7079635f727374;
   root.x_in = in.x_in;
@@ -171,8 +171,8 @@ struct RunnerContext {
 void directLifecycle(unsigned workers) {
   // Independently retry failed X/Z clock/reset controls at the same high level.
   for (unsigned failure = 0; failure != 5; ++failure) {
-    gfsim::WorkExecutor pool(workers);
-    pyc_root root("lifecycle_probe", &pool);
+    pyc_dut probe(workers);
+    auto &root = probe.root();
     Golden golden;
     drive(root, inputs({}));
     root.Reset();
@@ -298,8 +298,8 @@ void checkPlane(const gfsim::FourState<W> &actual, Masks expected) {
 void nativeFourState(unsigned workers) {
   for (bool z : {false, true})
     for (unsigned test = 0; test != 4; ++test) {
-      gfsim::WorkExecutor pool(workers);
-      pyc_root root("four_state_probe", &pool);
+      pyc_dut probe(workers);
+      auto &root = probe.root();
       auto in = inputs({});
       drive(root, in);
       root.Reset();

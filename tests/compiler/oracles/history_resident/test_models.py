@@ -5,9 +5,21 @@ import unittest
 from copy import deepcopy
 from pathlib import Path
 
-from check import compare
-from generate import data, isq_history, rob_history
-from models import ResidentModel, completion, entry, event, packed_snapshot, readiness
+if __package__:
+    from .check import compare
+    from .generate import data, isq_history, rob_history
+    from .models import (
+        ResidentModel,
+        completion,
+        entry,
+        event,
+        packed_snapshot,
+        readiness,
+    )
+else:
+    from check import compare
+    from generate import data, isq_history, rob_history
+    from models import ResidentModel, completion, entry, event, packed_snapshot, readiness
 
 
 def rob_residents():

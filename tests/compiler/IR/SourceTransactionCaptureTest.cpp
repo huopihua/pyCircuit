@@ -1216,11 +1216,12 @@ def Top(flag: ac.u1, value: ac.u8):
             CALL
     inspect()
 )py";
-  for (auto [declaration, call] :
-       {std::pair<StringRef, StringRef>(
-            "def report(arg: ac.u8) -> ac.u8:\n        return arg", "report(value)"),
-        {"def log(arg: ac.u8) -> ac.u8:\n        return arg", "log(value)"},
-        {"def sample(arg: ac.u8) -> ac.u8:\n        return arg", "sample(value)"}}) {
+  for (auto [declaration, call, shadowsImportedIntrinsic] :
+       {std::tuple<StringRef, StringRef, bool>(
+            "def report(arg: ac.u8) -> ac.u8:\n        return arg",
+            "report(value)", false),
+        {"def log(arg: ac.u8) -> ac.u8:\n        return arg", "log(value)", false},
+        {"def sample(arg: ac.u8) -> ac.u8:\n        return arg", "sample(value)", true}}) {
     auto text = replaceOnce(source, "IMPORT",
                             call.starts_with("sample")
                                 ? "from pycircuit import report as sample"
@@ -1230,14 +1231,19 @@ def Top(flag: ac.u1, value: ac.u8):
     auto captured = capture("nonintrinsic.py", text);
     ASSERT_TRUE(captured);
     diagnostics.clear();
-    EXPECT_TRUE(failed(lower(*captured, "nonintrinsic.py")));
-    EXPECT_FALSE(diagnostics.empty());
+    if (shadowsImportedIntrinsic) {
+      EXPECT_TRUE(failed(lower(*captured, "nonintrinsic.py")));
+      EXPECT_NE(diagnostics.find("source binding is shadowed"),
+                std::string::npos);
+    } else {
+      EXPECT_TRUE(succeeded(lower(*captured, "nonintrinsic.py")))
+          << diagnostics;
+      EXPECT_TRUE(diagnostics.empty());
+    }
     EXPECT_TRUE(operations<ac::SourceTransactionOp>(*captured).empty());
     EXPECT_TRUE(operations<ac::SourceObserveOp>(*captured).empty());
-    // A same-spelled helper is not an observation intrinsic. Shadowing may
-    // reject earlier, but observation metadata validation cannot accept it.
-    EXPECT_EQ(diagnostics.find("report requires"), std::string::npos);
-    EXPECT_EQ(diagnostics.find("log requires"), std::string::npos);
+    // A same-spelled ordinary helper remains an ordinary call. It may execute
+    // inside a rule, but it must not seed observation metadata.
   }
 }
 
@@ -2605,7 +2611,7 @@ def identity(value: ac.u8) -> ac.u8:
       auto input = block->addArgument(bit, helper.getLoc());
       OpBuilder operations(&context);
       operations.setInsertionPointToEnd(block);
-      operations.create<mlir::func::ReturnOp>(helper.getLoc(), input);
+      mlir::func::ReturnOp::create(operations, helper.getLoc(), input);
       ASSERT_TRUE(succeeded(mlir::verify(*header))) << diagnostics;
     }
     if (mutation == 2) helper->setAttr("ac.capture_types", b.getArrayAttr({TypeAttr::get(helper.getFunctionType().getInput(0))}));

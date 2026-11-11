@@ -153,9 +153,15 @@ def _assert_macos_native_dependencies_relocated(
         if "Mach-O" not in file_description:
             continue
         inspected += 1
-        dependencies = _checked(
+        dependency_lines = _checked(
             [otool, "-L", str(binary)], cwd=prefix, env=env, timeout=30
-        ).stdout
+        ).stdout.splitlines()
+        assert dependency_lines and dependency_lines[0].rstrip().endswith(":"), (
+            dependency_lines
+        )
+        # `otool -L` prints the inspected file itself as an absolute-path
+        # heading.  Only the indented rows that follow are load commands.
+        dependencies = "\n".join(dependency_lines[1:])
         assert str(old_prefix) not in dependencies, dependencies
         assert str(native_build) not in dependencies, dependencies
         assert str(ROOT) not in dependencies, dependencies
@@ -173,9 +179,11 @@ def _assert_macos_native_dependencies_relocated(
                 ("@rpath/", "@loader_path/", "@executable_path/")
             ), f"dylib has a non-relocatable install name: {binary}: {own_install_name}"
 
-        rpaths = _checked(
+        rpath_lines = _checked(
             [otool, "-l", str(binary)], cwd=prefix, env=env, timeout=30
-        ).stdout
+        ).stdout.splitlines()
+        assert rpath_lines and rpath_lines[0].rstrip().endswith(":"), rpath_lines
+        rpaths = "\n".join(rpath_lines[1:])
         assert str(old_prefix) not in rpaths, rpaths
         assert str(native_build) not in rpaths, rpaths
         assert str(ROOT) not in rpaths, rpaths
@@ -326,8 +334,14 @@ def test_compiler_sdk_compiles_links_emits_and_runs_after_prefix_move(
                 / str(framework)
             )
         else:
-            python_library = (
-                Path(str(sysconfig.get_config_var("LIBDIR"))) / library_name
+            library_dir = Path(str(sysconfig.get_config_var("LIBDIR")))
+            candidates = [
+                library_dir / library_name,
+                library_dir / f"libpython{sysconfig.get_config_var('VERSION')}.dylib",
+            ]
+            python_library = next(
+                (candidate for candidate in candidates if candidate.is_file()),
+                candidates[0],
             )
         assert python_library.is_file(), python_library
         venv_library = isolated_venv / "lib" / library_name
@@ -380,9 +394,9 @@ def test_compiler_sdk_compiles_links_emits_and_runs_after_prefix_move(
 
     shutil.rmtree(source)
     shutil.rmtree(work / "units")
-    cpp = tmp_path / "generated-cpp"
+    cpp = tmp_path / "generated-structural-cpp"
     verilog = tmp_path / "generated-verilog"
-    for target, output in (("cpp", cpp), ("verilog", verilog)):
+    for target, output in (("structural-cpp", cpp), ("verilog", verilog)):
         _checked(
             [str(driver), "emit", str(final), "--target", target, "-o", str(output)],
             cwd=tmp_path,
@@ -391,7 +405,7 @@ def test_compiler_sdk_compiles_links_emits_and_runs_after_prefix_move(
         assert (output / "CMakeLists.txt").is_file()
 
     runners: list[tuple[str, Path]] = []
-    for target, output in (("cpp", cpp), ("verilog", verilog)):
+    for target, output in (("structural-cpp", cpp), ("verilog", verilog)):
         build = tmp_path / f"runtime-only-{target}-build"
         _checked(
             [
@@ -430,7 +444,7 @@ def test_compiler_sdk_compiles_links_emits_and_runs_after_prefix_move(
         assert Path(package_dir).resolve().is_relative_to(moved_prefix.resolve())
         generated_graph = (build / "build.ninja").read_text(encoding="utf-8")
         assert str(moved_prefix) in generated_graph
-        if target == "cpp":
+        if target == "structural-cpp":
             assert "libpyc6_runtime" in generated_graph
         else:
             assert "include/verilog" in generated_graph
@@ -460,7 +474,11 @@ def test_compiler_sdk_compiles_links_emits_and_runs_after_prefix_move(
     shutil.copyfile(FIXTURE / "three-ticks.json", config)
     for index, (target, runner) in enumerate(runners):
         events = tmp_path / f"events-{index}.jsonl"
-        arguments = ["--cycles", "3"] if target == "cpp" else ["+cycles=3"]
+        arguments = (
+            ["--cycles", "3", "--events", "-"]
+            if target == "structural-cpp"
+            else ["+cycles=3"]
+        )
         run = _checked(
             [str(runner), *arguments],
             cwd=tmp_path,

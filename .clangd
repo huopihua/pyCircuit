@@ -1,0 +1,5 @@
+CompileFlags:
+  # The CMake preset "release" exports compile_commands.json here (see
+  # CMakePresets.json). Pointing clangd at it makes cross-file and third-party
+  # (LLVM/MLIR) "Go to Definition" work.
+  CompilationDatabase: .pycircuit_out/toolchain/build

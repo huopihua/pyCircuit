@@ -91,7 +91,7 @@ run(
     ],
     "link",
 )
-for target in ("cpp", "verilog"):
+for target in ("structural-cpp", "verilog"):
     run(
         [
             args.driver,
@@ -105,9 +105,9 @@ for target in ("cpp", "verilog"):
         ],
         "emit-" + target,
     )
-receipt = json.loads((build / "cpp/generated.json").read_text())
+receipt = json.loads((build / "structural-cpp/generated.json").read_text())
 cpp = [
-    build / "cpp" / row["path"]
+    build / "structural-cpp" / row["path"]
     for row in receipt["files"]
     if row["path"].endswith(".cpp")
 ]
@@ -119,7 +119,7 @@ run(
         "-std=c++20",
         "-pthread",
         "-I" + str(include),
-        "-I" + str(build / "cpp"),
+        "-I" + str(build / "structural-cpp"),
         source / "encoder_driver.cpp",
         *cpp,
         runtime,
@@ -195,7 +195,8 @@ proof.write_text(
             "runner_sha256": digest(runner),
             "runtime_sha256": digest(runtime),
             "generated": {
-                target: inventory(build / target) for target in ("cpp", "verilog")
+                target: inventory(build / target)
+                for target in ("structural-cpp", "verilog")
             },
             "execution_sha256": digest(build / "execution.json"),
             "patterns": 64,

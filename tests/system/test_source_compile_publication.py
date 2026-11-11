@@ -23,6 +23,7 @@ from test_generic_assignment_roundtrip import (
     COPY_CHILD,
     TYPES,
     _cpp_trace,
+    _emit,
     _rtl_trace,
     _run_cpp,
     _run_verilog,
@@ -60,7 +61,7 @@ def Counter():
     state: Word = 254
 
     @rule
-    def tick():
+    def tick() -> None:
         nonlocal state
         state = (state + 1) & 255
 
@@ -73,7 +74,7 @@ from pycircuit import module, rule
 @module
 def Broken():
     @rule
-    def tick():
+    def tick() -> None:
         return 1
 
     tick()
@@ -211,11 +212,12 @@ def test_published_units_drive_the_existing_link_and_both_backends(
     root, units = _workspace(tmp_path)
     expected = [254, 3, 3]
     _write(root, "types.py", DECLARATION)
-    _write(root, "holder.py", COPY_CHILD)
+    _write(root, "holder.py", '"""Reserved provider source unit."""\n')
     _write(
         root,
         "test_holder.py",
         BENCH.format(
+            provider=COPY_CHILD,
             arguments="other, state",
             reset_value=expected[0],
             committed_value=expected[1],
@@ -248,8 +250,6 @@ def test_published_units_drive_the_existing_link_and_both_backends(
             "demo.test_holder.TestHolder",
             "--target",
             "final",
-            "--role",
-            "testbench",
             "--output",
             str(design),
         )
@@ -260,32 +260,15 @@ def test_published_units_drive_the_existing_link_and_both_backends(
     cpp = tmp_path / "design.cpp"
     verilog = tmp_path / "design.sv"
     for target, output in (("cpp", cpp), ("verilog", verilog)):
-        emitted = subprocess.run(
-            [
-                _design_harness(),
-                "--design",
-                str(design),
-                "--target",
-                target,
-                "--role",
-                "testbench",
-                "--output",
-                str(output),
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        emitted = _emit(design, target, output)
         assert emitted.returncode == 0, emitted.stderr
 
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    cpp_out = _run_cpp(run_dir, cpp)
+    cpp_out = _run_cpp(tmp_path, cpp)
     assert _cpp_trace(cpp_out, "A") == expected, cpp_out
     assert _cpp_trace(cpp_out, "B") == expected, cpp_out
 
-    rtl_values = _rtl_trace(_run_verilog(run_dir, verilog))
-    per_run = expected + [1]
+    rtl_values = _rtl_trace(_run_verilog(tmp_path, verilog))
+    per_run = expected
     assert rtl_values[: len(per_run)] == per_run, rtl_values
     assert rtl_values[len(per_run) : 2 * len(per_run)] == per_run, rtl_values
 

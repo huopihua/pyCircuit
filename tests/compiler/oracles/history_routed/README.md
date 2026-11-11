@@ -162,7 +162,7 @@ history must never be reconstructed from expected results.
 python3 tests/compiler/oracles/history_routed/check.py \
   --case full_topology_backpressure --observed /tmp/observed.json
 python3 -m unittest discover \
-  -s tests/compiler/oracles/history_routed -p test_models.py -v
+  -s tests/compiler/oracles/history_routed -p test_history_routed_models.py -v
 ```
 
 ## Evidence scope

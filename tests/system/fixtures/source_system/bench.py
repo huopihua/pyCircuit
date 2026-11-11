@@ -3,7 +3,7 @@ from pycircuit import bits, log, report, rule, system
 
 
 @rule
-def advance(phase):
+def advance(phase) -> None:
     phase = phase + 1
 
 
@@ -14,7 +14,7 @@ def ExerciseAccumulator():
     right = Accumulator()
 
     @rule
-    def drive_left():
+    def drive_left() -> None:
         left(enable=(phase & 1) == 0)
         assert right.value < 4, "deliberate limit"
         log("info", "left", left.value)
@@ -22,7 +22,7 @@ def ExerciseAccumulator():
         report("progress", phase)
 
     @rule
-    def drive_right():
+    def drive_right() -> None:
         right(enable=1)
 
     advance(phase)

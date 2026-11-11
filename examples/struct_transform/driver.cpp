@@ -1,6 +1,6 @@
 // Independent baseline oracle: all actual values come from the generated DUT.
 #include "gfsim/SystemRunner.h"
-#include "pycircuit_system.hpp"
+#include "design.hpp"
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -138,8 +138,8 @@ struct RunnerContext {
   }
 };
 void directDiscard(unsigned workers) {
-  gfsim::WorkExecutor pool(workers);
-  pyc_root root("discard_probe", &pool);
+  pyc_dut probe(workers);
+  auto &root = probe.root();
   Golden golden;
   auto drive = [&](const pyc_dut::Inputs &in) {
     root.pyc_7079635f636c6b = in.pyc_7079635f636c6b;
@@ -184,8 +184,8 @@ void directDiscard(unsigned workers) {
   work({0, 0, retry});
 }
 void nativeFourState(unsigned workers, bool z) {
-  gfsim::WorkExecutor pool(workers);
-  pyc_root root("four_state_probe", &pool);
+  pyc_dut probe(workers);
+  auto &root = probe.root();
   auto in = inputs({0, 0, {1, 2, 3, 1}});
   auto drive = [&] {
     root.pyc_7079635f636c6b = in.pyc_7079635f636c6b;
@@ -227,8 +227,8 @@ void nativeFourState(unsigned workers, bool z) {
 }
 
 void nativeUnknownArithmetic(unsigned workers, bool z, bool unknownOp) {
-  gfsim::WorkExecutor pool(workers);
-  pyc_root root("arithmetic_probe", &pool);
+  pyc_dut probe(workers);
+  auto &root = probe.root();
   auto in = inputs({0, 0, {1, 2, 3, 1}});
   auto drive = [&] {
     root.pyc_7079635f636c6b = in.pyc_7079635f636c6b;

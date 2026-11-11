@@ -6,7 +6,10 @@ import json
 from copy import deepcopy
 from pathlib import Path
 
-from models import Model, entry, event, expected_controls, packed_snapshot, wakeup
+if __package__:
+    from .models import Model, entry, event, expected_controls, packed_snapshot, wakeup
+else:
+    from models import Model, entry, event, expected_controls, packed_snapshot, wakeup
 
 
 class Program:

@@ -1,5 +1,5 @@
 #include "gfsim/SystemRunner.h"
-#include "pycircuit_system.hpp"
+#include "design.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -203,8 +203,8 @@ void writeRows(const std::vector<Row>&rows) {
   for(auto&r:rows){auto e=o.output();file<<unsigned(r.clock)<<' '<<unsigned(r.reset)<<' '<<unsigned(r.valid)<<' '<<std::hex<<r.request.packed()<<std::dec<<' '<<unsigned(r.take)<<' '<<binary(e.packed(),53)<<' '<<binary(e.mask(),53)<<'\n';o.commit(r);}require(bool(file));
 }
 void nativeRollback(unsigned workers,const std::vector<Row>&rows) {
-  gfsim::WorkExecutor pool(workers);pyc_root root("banks-rollback",&pool);root.Build();
-  auto drive=[&](const pyc_dut::Inputs&p){root.pyc_7079635f636c6b=p.pyc_7079635f636c6b;root.pyc_7079635f727374=p.pyc_7079635f727374;root.valid=p.valid;root.request=p.request;root.take=p.take;};
+  pyc_dut rollback(workers);auto &root=rollback.root();root.Build();
+  auto drive=[&](const pyc_dut::Inputs&p){rollback.drive(p);};
   drive(inputs({}));root.Reset();root.Xfer();Oracle o;std::vector<unsigned> probeTags;
   for(unsigned i=0;i<rows.size();++i) {
     const auto&r=rows[i];auto e=o.output();unsigned writeTag=0;

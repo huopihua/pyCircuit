@@ -88,29 +88,27 @@ def _binding_table(array_text: str) -> list[tuple[str, str]]:
 
 PROVIDER = """\
 from typing import Annotated
+from pycircuit import struct, u1
 
 Word = Annotated[int, range(256)]
 LIMIT = 7
 ALSO_LIMIT = 7
 ENABLED = True
 
+@struct
 class Payload:
     value: Word
-    def __init__(self, value: Word = 7):
-        self.value = value
 
+@struct
 class Unused:
-    value: bool
-    def __init__(self, value: bool = False):
-        self.value = value
+    value: u1
 
+@struct
 class _Private:
-    value: bool
-    def __init__(self, value: bool = False):
-        self.value = value
+    value: u1
 
 def Make() -> Payload:
-    return Payload()
+    return Payload(value=7)
 """
 
 
@@ -152,8 +150,8 @@ def test_aliases_private_and_unused_imports_have_exact_namespace_mapping(
         "                       ENABLED as Switch, Make,\n"
         "                       Unused as NeverUsed, _Private as _Hidden)\n"
         "Local = Count\n\n"
-        "def Read() -> Count:\n"
-        "    return Make().value\n",
+        "def Read() -> Item:\n"
+        "    return Make()\n",
     )
     facade = _compile(
         facade_source,
@@ -226,8 +224,8 @@ def test_chained_facade_uses_only_headers_and_clones_transitive_make_value(
         "consumer.py",
         "from .facade import (Item, Count, Bound as Limit, Mirror as Same,\n"
         "                     ENABLED as Active, Make)\n\n"
-        "def Read() -> Count:\n"
-        "    return Make().value\n",
+        "def Read() -> Item:\n"
+        "    return Make()\n",
     )
 
     (root / "provider.py").unlink()
@@ -253,11 +251,10 @@ def test_chained_facade_uses_only_headers_and_clones_transitive_make_value(
     interface = first.interface.read_text(encoding="utf-8")
     assert "@demo.provider.Make" in interface
     assert "@demo.provider.Payload" in interface
-    assert "@demo.provider.Payload.__init__" in interface
     assert '"ac.constant"() <{sym_name = "demo.provider.LIMIT"' in interface
     assert '"ac.constant"() <{sym_name = "demo.provider.ALSO_LIMIT"' in interface
     assert '"ac.constant"() <{sym_name = "demo.provider.ENABLED"' in interface
-    assert "ac.struct.get" in interface
+    assert "ac.struct.create" in interface
     exports = _binding_table(
         _module_attribute(interface, "ac.exports", "ac.import_bindings")
     )
@@ -273,7 +270,7 @@ def test_chained_facade_uses_only_headers_and_clones_transitive_make_value(
     assert dict(exports)["Limit"] != dict(exports)["Same"]
 
 
-def test_multiple_aliases_and_later_local_shadow_preserve_import_uses(
+def test_multiple_aliases_and_later_local_shadow_is_rejected(
     tmp_path: Path,
 ) -> None:
     root, provider = _provider(tmp_path)
@@ -281,11 +278,11 @@ def test_multiple_aliases_and_later_local_shadow_preserve_import_uses(
         root,
         "aliases.py",
         "from .provider import Payload as A, Payload as B\n"
-        "from .provider import Word as Thing\n\n"
+        "from .provider import Word as Thing\n"
+        "from pycircuit import struct, u1\n\n"
+        "@struct\n"
         "class Thing:\n"
-        "    value: bool\n"
-        "    def __init__(self, value: bool = False):\n"
-        "        self.value = value\n",
+        "    value: u1\n",
     )
     unit = _compile(
         source,
@@ -293,24 +290,8 @@ def test_multiple_aliases_and_later_local_shadow_preserve_import_uses(
         output=tmp_path / "aliases-out",
         headers=(provider.interface,),
     )
-    assert unit.completed.returncode == 0, unit.completed.stderr
-    text = unit.interface.read_text(encoding="utf-8")
-    exports = _binding_table(
-        _module_attribute(text, "ac.exports", "ac.import_bindings")
-    )
-    imports = _binding_table(
-        _module_attribute(text, "ac.import_bindings", "ac.interfaces")
-    )
-    assert exports == [
-        ("A", "demo.provider.Payload"),
-        ("B", "demo.provider.Payload"),
-        ("Thing", "demo.aliases.Thing"),
-    ]
-    assert imports == [
-        ("Payload", "demo.provider.Payload"),
-        ("Payload", "demo.provider.Payload"),
-        ("Word", "demo.provider.Word"),
-    ]
+    assert unit.completed.returncode != 0
+    assert "nominal declaration shadows an existing binding 'Thing'" in unit.completed.stderr
 
 
 def test_later_shadow_does_not_rescue_an_invalid_import(tmp_path: Path) -> None:
@@ -318,11 +299,11 @@ def test_later_shadow_does_not_rescue_an_invalid_import(tmp_path: Path) -> None:
     source = _write(
         root,
         "invalid.py",
-        "from .provider import Missing\n\n"
+        "from .provider import Missing\n"
+        "from pycircuit import struct, u1\n\n"
+        "@struct\n"
         "class Missing:\n"
-        "    value: bool\n"
-        "    def __init__(self, value: bool = False):\n"
-        "        self.value = value\n",
+        "    value: u1\n",
     )
     unit = _compile(
         source,
@@ -331,7 +312,7 @@ def test_later_shadow_does_not_rescue_an_invalid_import(tmp_path: Path) -> None:
         headers=(provider.interface,),
     )
     assert unit.completed.returncode != 0
-    assert "does not export 'Missing'" in unit.completed.stderr
+    assert "imported declaration 'demo.provider.Missing' is absent" in unit.completed.stderr
 
 
 def test_rebinding_cannot_silently_retarget_definition_time_record_default(
@@ -342,14 +323,13 @@ def test_rebinding_cannot_silently_retarget_definition_time_record_default(
     provider_source = _write(
         root,
         "provider.py",
+        "from pycircuit import struct, u1\n\n"
+        "@struct\n"
         "class A:\n"
-        "    value: bool\n"
-        "    def __init__(self, value: bool = False):\n"
-        "        self.value = value\n\n"
+        "    value: u1\n\n"
+        "@struct\n"
         "class B:\n"
-        "    value: bool\n"
-        "    def __init__(self, value: bool = True):\n"
-        "        self.value = value\n",
+        "    value: u1\n",
     )
     provider = _compile(provider_source, root=root, output=tmp_path / "provider-out")
     assert provider.completed.returncode == 0, provider.completed.stderr
@@ -357,7 +337,7 @@ def test_rebinding_cannot_silently_retarget_definition_time_record_default(
         root,
         "defaults.py",
         "from .provider import A as T\n\n"
-        "def Choose(value: T = T()) -> T:\n"
+        "def Choose(value: T = T(value=False)) -> T:\n"
         "    return value\n\n"
         "from .provider import B as T\n",
     )
@@ -382,15 +362,17 @@ def test_module_facade_preserves_canonical_child_definition(tmp_path: Path) -> N
         root,
         "provider.py",
         "from typing import Annotated\n"
-        "from pycircuit import module, rule\n"
+        "from pycircuit import module, rule, struct\n"
         "Word = Annotated[int, range(256)]\n\n"
+        "@struct\n"
+        "class PassResult:\n"
+        "    value: Word\n\n"
         "@module\n"
-        "def Pass(source: Word, sink: Word):\n"
+        "def Pass(source: Word) -> PassResult:\n"
         "    @rule\n"
-        "    def forward():\n"
-        "        nonlocal sink\n"
-        "        sink = source\n\n"
-        "    forward()\n",
+        "    def forward() -> PassResult:\n"
+        "        return PassResult(value=source)\n\n"
+        "    return forward()\n",
     )
     provider = _compile(provider_source, root=root, output=tmp_path / "provider-out")
     assert provider.completed.returncode == 0, provider.completed.stderr
@@ -416,10 +398,8 @@ def test_module_facade_preserves_canonical_child_definition(tmp_path: Path) -> N
         "def Root():\n"
         "    a: Word = 1\n"
         "    b: Word = 2\n"
-        "    x: Word = 0\n"
-        "    y: Word = 0\n"
-        "    left = Channel(a, x)\n"
-        "    right = Channel(b, y)\n",
+        "    left = Channel(a)\n"
+        "    right = Channel(b)\n",
     )
     provider_source.unlink()
     facade_source.unlink()
@@ -447,11 +427,14 @@ def test_module_facade_preserves_canonical_child_definition(tmp_path: Path) -> N
     assert facade_exports["Channel"] == "demo.provider.Pass"
     assert consumer_imports["Channel"] == "demo.provider.Pass"
     body_text = consumer.body.read_text(encoding="utf-8")
-    instances = [line for line in body_text.splitlines() if '"ac.instance"' in line]
+    instances = [
+        line
+        for line in body_text.splitlines()
+        if '"ac.instance"' in line and "callee = @demo.provider.Pass" in line
+    ]
     assert len(instances) == 2
-    assert all("callee = @demo.provider.Pass" in line for line in instances)
-    assert 'name = "left"' in instances[0]
-    assert 'name = "right"' in instances[1]
+    assert 'instance_name = "__pyc_call_0"' in instances[0]
+    assert 'instance_name = "__pyc_call_1"' in instances[1]
     handles = [re.search(r'"ac.instance"\(([^)]*)\)', line) for line in instances]
     assert all(handle is not None for handle in handles)
     assert handles[0].group(1) != handles[1].group(1)

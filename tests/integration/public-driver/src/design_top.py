@@ -3,7 +3,7 @@ from source_public.counter import Counter
 
 
 @rule
-def transfer_outputs(left_output, right_output, left_count, right_count):
+def transfer_outputs(left_output, right_output, left_count, right_count) -> None:
     left_output = left_count  # noqa: F841
     right_output = right_count  # noqa: F841
 

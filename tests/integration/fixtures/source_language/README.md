@@ -15,7 +15,9 @@ output. The independent review confirmed both core and bank traces.
   the constant input (9 or 13). Different private array sizes and reset images
   cannot share instance state.
 - Integer vectors distinguish mathematical arithmetic, declared-range checks,
-  explicit low-bit masking, floor division and path-enabled errors.
+  explicit low-bit masking, floor division and path-enabled errors. A dynamic
+  boundary failure rejects the full-precision candidate at runtime precommit,
+  preserves committed state and cycle, and requires Reset before reuse.
 - Conflict and alias vectors enforce precommit failure and per-ordinal effects.
 
 Validation performed during preparation: `ast.parse` on all five sources and a

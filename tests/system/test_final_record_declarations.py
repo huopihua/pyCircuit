@@ -23,67 +23,46 @@ pytestmark = pytest.mark.system
 
 
 PROVIDER = """\
-from typing import Annotated
+from pycircuit import struct, u1, u8, u64
 
-Word = Annotated[int, range(256)]
-BitWord = Annotated[int, range(18446744073709551616)]
-
+@struct
 class Pair:
-    lo: Word
-    hi: bool
+    lo: u8
+    hi: u1
 
-    def __init__(self, hi: bool = False, lo: Word = 3):
-        self.lo = lo
-        self.hi = hi
-
+@struct
 class Wide:
-    low: BitWord
-    high: BitWord
+    low: u64
+    high: u64
 
-    def __init__(self, high: BitWord = 9, low: BitWord = 5):
-        self.low = low
-        self.high = high
-
+@struct
 class _Private:
-    first: bool
-    second: Word
-
-    def __init__(self, second: Word = 7, first: bool = True):
-        self.first = first
-        self.second = second
+    first: u1
+    second: u8
 """
 
 THREE_FIELDS = """\
-from typing import Annotated
-Word = Annotated[int, range(16)]
+from pycircuit import struct, u4
 
+@struct
 class TooWideForThisSlice:
-    first: Word
-    second: Word
-    third: Word
-
-    def __init__(self, first: Word = 1, second: Word = 2, third: Word = 3):
-        self.first = first
-        self.second = second
-        self.third = third
+    first: u4
+    second: u4
+    third: u4
 """
 
 ROOT_SOURCE = """\
-from pycircuit import module
+from pycircuit import module, struct, u1, u8
 from .facade import ExportedPair
-from .provider import Word
 
+@struct
 class LocalPair:
-    first: bool
-    second: Word
-
-    def __init__(self, second: Word = 4, first: bool = True):
-        self.first = first
-        self.second = second
+    first: u1
+    second: u8
 
 @module
 def Top():
-    value: Word = 11
+    value: u8 = 11
 """
 
 
@@ -104,7 +83,8 @@ def _build(
     }
     if ordinary_helper:
         source_texts["helper.py"] = (
-            "from .provider import Pair\ndef unused() -> Pair:\n    return Pair()\n"
+            "from .provider import Pair\ndef unused() -> Pair:\n"
+            "    return Pair(lo=3, hi=0)\n"
         )
     source_texts["root.py"] = root_source
     units = {}
@@ -141,7 +121,7 @@ def _build(
     (source_root / "provider.py").write_text(provider, encoding="utf-8")
     units["provider.py"].body.write_bytes(provider_body)
     final = directory / "root.final.ac"
-    linked = cpp._link(list(units.values()), final, top="demo.root.Top", role="design")
+    linked = cpp._link(list(units.values()), final, top="demo.root.Top")
     return source_root, units, final, linked
 
 
@@ -217,15 +197,14 @@ def _expect_invalid(final: Path, text: str, tmp_path: Path):
     for target in ("cpp", "verilog"):
         output = tmp_path / f"mutated.{target}"
         assert not output.exists()
+        native_target = "structural-cpp" if target == "cpp" else target
         emitted = subprocess.run(
             [
                 cpp._design_harness(),
                 "--design",
                 str(mutated),
                 "--target",
-                target,
-                "--role",
-                "design",
+                native_target,
                 "--output",
                 str(output),
             ],
@@ -251,22 +230,30 @@ def test_two_field_declarations_are_owned_ordered_and_final_only(tmp_path: Path)
         "demo.root.LocalPair": ("first", "second"),
     }
     assert set(records) == set(expected)
-    assert list(records) == sorted(records, key=lambda name: name.encode("utf-8"))
+    assert list(records) == [
+        "demo.provider._Private",
+        "demo.provider.Pair",
+        "demo.provider.Wide",
+        "demo.root.LocalPair",
+    ]
     for symbol, field_names in expected.items():
         line = records[symbol]
-        assert f"constructor @{symbol}.__init__" in line
         assert 'ac.declaration_role = "definition"' in line
         positions = [line.index(f'name = "{name}"') for name in field_names]
         assert positions == sorted(positions), (symbol, line)
         assert "func.func" not in line
 
     for symbol in expected:
-        final_fields = re.search(r" fields (.*?) constructor ", records[symbol])
+        final_fields = re.search(
+            r" fields (.*) \{ac\.declaration_role =", records[symbol]
+        )
         assert final_fields, records[symbol]
         owner_path = symbol.removeprefix("demo.").rsplit(".", 1)[0] + ".py"
         source_unit = units[owner_path]
         header_line = _record_lines(source_unit.header.read_text())[symbol]
-        header_fields = re.search(r" fields (.*?) constructor ", header_line)
+        header_fields = re.search(
+            r" fields (.*) \{ac\.declaration_role =", header_line
+        )
         assert header_fields, header_line
         assert final_fields.group(1) == header_fields.group(1), symbol
 
@@ -281,10 +268,10 @@ def test_two_field_declarations_are_owned_ordered_and_final_only(tmp_path: Path)
     assert ("demo", "empty.py") in value._units(text)
     assert "demo.root.Top" in text
 
-    # Constructor defaults and argument order are source-only provenance;
-    # the final package keeps the canonical symbol but no executable body.
-    assert text.count("constructor @demo.provider.Pair.__init__") == 1
-    assert text.count("constructor @demo.provider.Wide.__init__") == 1
+    # Nominal struct construction is carried by ac.struct itself; final ACIR
+    # retains one canonical declaration and no source helper body.
+    assert text.count('ac.struct "demo.provider.Pair"') == 1
+    assert text.count('ac.struct "demo.provider.Wide"') == 1
     assert "func.func @demo.provider.Pair.__init__" not in text
     assert "func.func @demo.provider.Wide.__init__" not in text
 
@@ -296,7 +283,7 @@ def test_two_field_declarations_are_owned_ordered_and_final_only(tmp_path: Path)
     assert checked.returncode == 0, checked.stderr
 
 
-def test_source_header_mismatch_and_out_of_slice_declarations_reject_at_link(
+def test_source_header_mismatch_rejects_but_three_field_structs_link(
     tmp_path: Path,
 ):
     source_root, units, _final, _linked = _build(tmp_path / "valid")
@@ -305,24 +292,19 @@ def test_source_header_mismatch_and_out_of_slice_declarations_reject_at_link(
     # boundary must detect that a consumer cannot redefine provider authority.
     header = units["provider.py"].header
     original = header.read_text(encoding="utf-8")
-    changed = re.sub(
-        r"constructor @demo\.provider\.Pair\.__init__",
-        "constructor @demo.provider.Wide.__init__",
-        original,
-        count=1,
-    )
+    pair = _record_lines(original)["demo.provider.Pair"]
+    changed = original.replace(pair, pair.replace('name = "lo"', 'name = "bad"', 1), 1)
     assert changed != original
     header.write_text(changed, encoding="utf-8")
     mismatch = cpp._link(
         list(units.values()),
         tmp_path / "mismatch.final.ac",
         top="demo.root.Top",
-        role="design",
     )
     assert mismatch.returncode == 1, mismatch.stderr
 
-    # Existing source/header capture can describe wider records, while this
-    # bounded final profile must capability-reject even an unused one.
+    # Independent HWIR supports nominal structs beyond the old two-field
+    # final-only slice, including unused declarations.
     source_root2 = tmp_path / "wide-source"
     source_root2.mkdir()
     wide_source = source_root2 / "provider.py"
@@ -343,16 +325,13 @@ def test_source_header_mismatch_and_out_of_slice_declarations_reject_at_link(
         output_dir=tmp_path / "wide-root",
         headers=(unit.header,),
     )
-    rejected = cpp._link(
+    linked = cpp._link(
         [unit, root_unit],
         tmp_path / "wide.final.ac",
         top="demo.root.Top",
-        role="design",
     )
-    assert rejected.returncode == 1, rejected.stderr
-    assert re.search(
-        r"record|struct|field|unsupported|capability", rejected.stderr, re.I
-    )
+    assert linked.returncode == 0, linked.stderr
+    value._accept_hwir_backends(tmp_path / "wide.final.ac", tmp_path / "wide-backends")
 
 
 def test_final_record_authority_and_shape_mutations_fail_closed(tmp_path: Path):
@@ -362,20 +341,6 @@ def test_final_record_authority_and_shape_mutations_fail_closed(tmp_path: Path):
     record = _record_lines(text)["demo.provider.Pair"]
 
     mutations = {
-        "constructor": text.replace(
-            record,
-            record.replace(
-                "@demo.provider.Pair.__init__", "@demo.provider.Wide.__init__"
-            ),
-            1,
-        ),
-        "unknown-property": text.replace(
-            record,
-            record.replace(
-                "ac.source_owner = {", "ac.unknown = 1, ac.source_owner = {", 1
-            ),
-            1,
-        ),
         "missing-field": text.replace(
             record,
             re.sub(r'name = "hi"', "", record, count=1),
@@ -383,25 +348,6 @@ def test_final_record_authority_and_shape_mutations_fail_closed(tmp_path: Path):
         ),
         "duplicate-field": text.replace(
             record, record.replace('name = "hi"', 'name = "lo"', 1), 1
-        ),
-        "field-origin": text.replace(
-            record,
-            record.replace(
-                "definition = @demo.provider.Pair",
-                "definition = @demo.provider.Wide",
-                1,
-            ),
-            1,
-        ),
-        "field-location-path": text.replace(
-            record,
-            record.replace('path = "provider.py"', 'path = "facade.py"', 1),
-            1,
-        ),
-        "owner": text.replace(
-            'ac.source_owner = {package = "demo", path = "provider.py"}',
-            'ac.source_owner = {package = "demo", path = "facade.py"}',
-            1,
         ),
     }
     for name, mutated in mutations.items():
@@ -417,6 +363,38 @@ def test_final_record_authority_and_shape_mutations_fail_closed(tmp_path: Path):
     )
 
 
+@pytest.mark.parametrize(
+    "case", ["unknown-property", "field-origin", "field-location-path", "owner"]
+)
+def test_unused_struct_provenance_does_not_constrain_hwir_projection(
+    tmp_path: Path, case: str
+):
+    _source_root, _units, final, linked = _build(tmp_path)
+    assert linked.returncode == 0, linked.stderr
+    text = final.read_text(encoding="utf-8")
+    record = _record_lines(text)["demo.provider.Pair"]
+    if case == "unknown-property":
+        changed = record.replace(
+            "ac.source_owner = {", "ac.unknown = 1, ac.source_owner = {", 1
+        )
+    elif case == "field-origin":
+        changed = record.replace(
+            "definition = @demo.provider.Pair", "definition = @demo.provider.Wide", 1
+        )
+    elif case == "field-location-path":
+        changed = record.replace('path = "provider.py"', 'path = "facade.py"', 1)
+    else:
+        changed = record.replace(
+            'ac.source_owner = {package = "demo", path = "provider.py"}',
+            'ac.source_owner = {package = "demo", path = "facade.py"}',
+            1,
+        )
+    assert changed != record
+    variant = tmp_path / f"{case}.ac"
+    variant.write_text(text.replace(record, changed, 1), encoding="utf-8")
+    value._accept_hwir_backends(variant, tmp_path / f"{case}-backends")
+
+
 def test_record_declaration_final_emit_is_explicitly_not_backend_acceptance(
     tmp_path: Path,
 ):
@@ -426,15 +404,14 @@ def test_record_declaration_final_emit_is_explicitly_not_backend_acceptance(
     # no final-only record artifact may accidentally claim executable support.
     for target in ("cpp", "verilog"):
         output = tmp_path / f"not-yet-supported.{target}"
+        native_target = "structural-cpp" if target == "cpp" else target
         emitted = subprocess.run(
             [
                 cpp._design_harness(),
                 "--design",
                 str(final),
                 "--target",
-                target,
-                "--role",
-                "design",
+                native_target,
                 "--output",
                 str(output),
             ],
@@ -446,93 +423,49 @@ def test_record_declaration_final_emit_is_explicitly_not_backend_acceptance(
         assert not output.exists()
 
 
-def test_unused_ordinary_helper_is_rejected_during_final_link(tmp_path: Path):
-    _source_root, units, _final, linked = _build(tmp_path, ordinary_helper=True)
+def test_unused_ordinary_helper_is_erased_before_hwir_projection(tmp_path: Path):
+    _source_root, units, final, linked = _build(tmp_path, ordinary_helper=True)
     assert units["helper.py"].body.is_file()
-    assert linked.returncode == 1, linked.stderr
-    assert re.search(r"helper|unsupported|capability", linked.stderr, re.I)
+    assert linked.returncode == 0, linked.stderr
+    assert "demo.helper.unused" not in final.read_text(encoding="utf-8")
+    value._accept_hwir_backends(final, tmp_path / "helper-backends")
 
 
-def test_nested_record_declaration_compiles_but_final_link_rejects(
+def test_nested_struct_declarations_link_and_reach_both_hwir_backends(
     tmp_path: Path,
 ):
     nested = (
         PROVIDER
         + """\
+@struct
 class Inner:
-    value: Word
-    def __init__(self, value: Word = 2):
-        self.value = value
+    value: u8
 
+@struct
 class Outer:
     inner: Inner
-    flag: bool
-    def __init__(self, inner: Inner, flag: bool = False):
-        self.inner = inner
-        self.flag = flag
+    flag: u1
 """
     )
-    _source_root, units, _final, linked = _build(tmp_path, provider=nested)
+    _source_root, units, final, linked = _build(tmp_path, provider=nested)
     assert units["provider.py"].header.is_file()
-    assert linked.returncode == 1, linked.stderr
-    assert re.search(
-        r"nested|record|struct|unsupported|capability", linked.stderr, re.I
-    )
+    assert linked.returncode == 0, linked.stderr
+    value._accept_hwir_backends(final, tmp_path / "nested-backends")
 
 
-@pytest.mark.parametrize(
-    ("case", "symbol", "before", "after", "diagnostic"),
-    [
-        (
-            "wrong-validity-path",
-            "demo.provider.Pair.__init__",
-            "return %0, %arg2",
-            "return %0, %arg0",
-            "record constructor return/create closure is invalid",
-        ),
-        (
-            "computed-field-value",
-            "demo.provider.Wide.__init__",
-            "    %0 = ac.struct.create(%arg1, %arg0) : (i64, i64)",
-            "    %computed = arith.addi %arg1, %arg1 : i64\n"
-            "    %0 = ac.struct.create(%computed, %arg0) : (i64, i64)",
-            "record constructor is not a direct two-operation body",
-        ),
-    ],
-)
-def test_unused_constructor_requires_direct_complete_projection(
+def test_imported_struct_persistent_initializer_is_rejected_by_frontend(
     tmp_path: Path,
-    case: str,
-    symbol: str,
-    before: str,
-    after: str,
-    diagnostic: str,
 ):
-    _source_root, _units, _final, linked = _build(
-        tmp_path, constructor_mutation=(symbol, before, after)
-    )
-    assert linked.returncode == 1, linked.stderr
-    assert diagnostic in linked.stderr
-    assert not _final.exists()
-
-
-def test_record_state_remains_rejected_in_s1(tmp_path: Path):
     stateful = """\
 from pycircuit import module
 from .provider import Pair
 
 @module
 def Top():
-    state: Pair = Pair()
+    state: Pair = Pair(lo=3, hi=0)
 """
-    _source_root, units, _final, linked = _build(tmp_path, root_source=stateful)
-    assert all(unit.body.is_file() and unit.header.is_file() for unit in units.values())
-    assert linked.returncode == 1, linked.stderr
-    assert re.search(
-        r"value integer state|record|struct|unsupported|capability",
-        linked.stderr,
-        re.I,
-    )
+    with pytest.raises(AssertionError, match="persistent initializer must be a static complete value"):
+        _build(tmp_path, root_source=stateful)
 
 
 def test_public_compile_link_publishes_final_declarations_and_emit_fails_closed(
@@ -618,7 +551,7 @@ def test_public_compile_link_publishes_final_declarations_and_emit_fails_closed(
     assert "demo.provider._Private" in final_text
     assert "demo.facade.ExportedPair" not in final_text
 
-    for target in ("cpp", "verilog"):
+    for target in ("structural-cpp", "verilog"):
         destination = workspace.out / f"sentinel.{target}"
         destination.write_bytes(b"preserve this existing output\n")
         emitted = driver._cli(

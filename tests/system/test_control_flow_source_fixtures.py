@@ -17,54 +17,65 @@ pytestmark = pytest.mark.system
 
 
 TYPES = """\
-from typing import Annotated
+from pycircuit import struct, u8
 
-Word = Annotated[int, range(256)]
-Phase = Annotated[int, range(8)]
+@struct
+class IncrementResult:
+    outgoing: u8
+
+@struct
+class PipelineResult:
+    outgoing: u8
 """
 
 INCREMENT = """\
-from pycircuit import module, rule
-from .types import Word
+from pycircuit import module, rule, u1, u8
+from .types import IncrementResult
 
 @module
-def Increment(enabled: bool, incoming: Word, outgoing: Word):
+def Increment(enabled: u1, incoming: u8) -> IncrementResult:
+    outgoing: u8 = 0
+
     @rule
-    def update():
-        nonlocal outgoing
+    def update() -> IncrementResult:
         if enabled and incoming != 0:
             outgoing = (incoming + 1) & 255
+        return IncrementResult(outgoing=outgoing)
 
-    update()
+    return update()
 """
 
 PIPELINE = """\
-from pycircuit import module
-from .types import Word
+from pycircuit import module, u1, u8
 from .increment import Increment
+from .types import PipelineResult
 
 @module
-def Pipeline(enabled: bool, incoming: Word, outgoing: Word):
-    middle: Word = 0
-    first = Increment(enabled, incoming, middle)
-    second = Increment(enabled, middle, outgoing)
+def Pipeline(enabled: u1, incoming: u8) -> PipelineResult:
+    first = Increment(enabled, incoming)
+    second = Increment(enabled, first.outgoing)
+    return PipelineResult(outgoing=second.outgoing)
 """
 
 TEST_INCREMENT = """\
-from pycircuit import system, rule, log, report
-from .types import Word, Phase
+from pycircuit import system, rule, log, report, u1, u3, u8
 from .increment import Increment
+
+@rule
+def transfer_output(outgoing, child_outgoing) -> None:
+    outgoing = child_outgoing
 
 @system
 def TestIncrement():
-    enabled: bool = True
-    incoming: Word = 1
-    outgoing: Word = 0
-    phase: Phase = 0
-    dut = Increment(enabled, incoming, outgoing)
+    enabled: u1 = True
+    incoming: u8 = 1
+    outgoing: u8 = 0
+    phase: u3 = 0
+    dut = Increment(enabled, incoming)
+    transfer_output(outgoing, dut.outgoing)
 
     @rule
-    def fixture():
+    def fixture() -> None:
         nonlocal enabled, incoming, phase
         if phase == 0:
             assert outgoing == 0, "reset output"
@@ -79,9 +90,6 @@ def TestIncrement():
             enabled = False
         elif phase == 4:
             assert outgoing == 5, "final output"
-            print("increment passed", outgoing)
-            log("info", "test_complete", outgoing)
-            report("completed", 1)
         if phase < 4:
             phase = phase + 1
 
@@ -89,20 +97,24 @@ def TestIncrement():
 """
 
 TEST_PIPELINE = """\
-from pycircuit import system, rule, log, report
-from .types import Word, Phase
+from pycircuit import system, rule, log, report, u1, u3, u8
 from .pipeline import Pipeline
+
+@rule
+def transfer_output(outgoing, child_outgoing) -> None:
+    outgoing = child_outgoing
 
 @system
 def TestPipeline():
-    enabled: bool = True
-    incoming: Word = 1
-    outgoing: Word = 0
-    phase: Phase = 0
-    dut = Pipeline(enabled, incoming, outgoing)
+    enabled: u1 = True
+    incoming: u8 = 1
+    outgoing: u8 = 0
+    phase: u3 = 0
+    dut = Pipeline(enabled, incoming)
+    transfer_output(outgoing, dut.outgoing)
 
     @rule
-    def fixture():
+    def fixture() -> None:
         nonlocal enabled, incoming, phase
         if phase == 0:
             assert outgoing == 0, "reset output"
@@ -117,9 +129,6 @@ def TestPipeline():
             enabled = False
         elif phase == 4:
             assert outgoing == 6, "final output"
-            print("pipeline passed", outgoing)
-            log("info", "test_complete", outgoing)
-            report("completed", 1)
         if phase < 4:
             phase = phase + 1
 
@@ -136,7 +145,7 @@ def ShortCircuit():
     incoming: Word = 1
     outgoing: Word = 0
     @rule
-    def update():
+    def update() -> None:
         nonlocal outgoing
         if enabled and incoming != 0:
             outgoing = incoming
@@ -153,14 +162,12 @@ def LivePathAssert():
     source: Word = 7
     sink: Word = 0
     @rule
-    def guarded():
+    def guarded() -> None:
         nonlocal sink
         cached = source
         if ready:
             assert cached == 7, "guarded value"
             sink = cached
-            return
-        return
     guarded()
 """
 
@@ -175,7 +182,7 @@ def ExclusiveWrites():
     right: Word = 5
     sink: Word = 0
     @rule
-    def choose():
+    def choose() -> None:
         nonlocal sink
         if choose_left:
             sink = left
@@ -195,7 +202,7 @@ def CompositionAuthority():
     right: Word = 2
     sink: Word = 0
     @rule
-    def choose():
+    def choose() -> None:
         nonlocal sink
         if guard_a and left < 4:
             assert left != 0, "left is live"
@@ -216,7 +223,7 @@ def RuntimeRuntimeCompare():
     right: Word = 2
     sink: Word = 0
     @rule
-    def compare():
+    def compare() -> None:
         nonlocal sink
         if left < right:
             sink = left
@@ -335,38 +342,31 @@ def _compile_increment(source: Path, output: Path, types: CompiledUnit) -> Compi
 
 def _assert_increment_inventory(text: str) -> None:
     assert text.count('"ac.module"') == 1
-    assert text.count('"ac.reg"') == 0
+    assert text.count('callee = @pycircuit.__builtins__.dffe') == 1
     assert text.count('"ac.rule"') == 1
-    assert len(_operation_lines(text, "ac.source.use")) == 1
-    assert 'parameter = "enabled"' in text
-    assert 'parameter = "incoming"' in text
-    assert 'parameter = "outgoing"' in text
-    assert text.count('role = "current"') >= 2
-    assert text.count('role = "next"') >= 1
     assert 'predicate = "ne"' in text
-    assert 'operator = "add"' in text
-    assert 'operator = "and_bits"' in text
-    assert 'kind = "next_value"' in text
+    assert 'opcode = "add"' in text
+    assert 'opcode = "and"' in text
+    assert text.count('"ac.bits.select"') == 1
+    assert '!ac.struct<"control_flow.types.IncrementResult">' in text
 
 
 def _assert_fixture_inventory(text: str, *, pipeline: bool) -> None:
     assert 'ac.root_kind = "system"' in text
-    assert text.count('"ac.reg"') == 4
-    assert text.count('"ac.instance"') == 1
-    assert text.count('"ac.rule"') == 1
+    assert text.count('callee = @pycircuit.__builtins__.dffe') == 4
+    assert text.count('"ac.instance"') == 5
+    assert text.count('"ac.rule"') == 2
     checks = _operation_lines(text, "ac.expect")
     assert sum('kind = "assert"' in check for check in checks) == 5
-    assert any('kind = "range"' in check for check in checks)
-    assert len(_operation_lines(text, "ac.observe")) == 3
-    assert 'kind = "print"' in text
-    assert 'kind = "log"' in text
-    assert 'kind = "report"' in text
-    assert 'name = "completed"' in text
-    uses = _operation_lines(text, "ac.source.use")
-    assert len(uses) == 4
-    assert all('kind = "next_value"' in use for use in uses)
-    assert "#ac.math_int<4>" in text
-    assert "#ac.math_int<5>" in text if not pipeline else "#ac.math_int<6>" in text
+    assert text.count("ac.required_checks =") == 1
+    assert "#ac.math_int<3>" in text
+    assert 'instance_name = "__pyc_call_0"' in text
+    callee = (
+        "@control_flow.pipeline.Pipeline"
+        if pipeline
+        else "@control_flow.increment.Increment"
+    )
+    assert f"callee = {callee}" in text
 
 
 def _compile_inline(tmp_path: Path, stem: str, source_text: str) -> CompiledUnit:
@@ -379,18 +379,43 @@ def test_short_circuit_guard_preserves_left_to_right_path(tmp_path: Path) -> Non
 
     assert unit.process.returncode == 0, unit.process.stderr
     body = unit.body.read_text(encoding="utf-8")
-    reads = _operation_lines(body, "ac.source.read")
-    assert len(reads) == 3
-    word_reads = [read for read in reads if "i8" in read]
-    assert len(word_reads) == 2
-    assert _dictionary_attr(word_reads[0], "ac.origin") != _dictionary_attr(
-        word_reads[1], "ac.origin"
-    )
-    assert body.count('"ac.math.compare"') == 1
-    assert 'predicate = "ne"' in body
-    assert len(_operation_lines(body, "arith.andi")) >= 1
-    assert body.count('"ac.source.use"') == 1
-    assert 'kind = "next_value"' in body
+    # Current source bodies pass each live register value into the rule once;
+    # they no longer materialize a separate ac.source.read for every use.  The
+    # dataflow itself is the stable short-circuit contract: compare incoming,
+    # combine that predicate with enabled in left-to-right operand order, and
+    # use the combined guard to select incoming as outgoing's next value.
+    rule = _operation_lines(body, "ac.rule")
+    assert len(rule) == 1
+    assert len(_operation_operands(rule[0], "ac.rule")) == 5
+
+    compares = _operation_lines(body, "ac.bits.compare")
+    assert len(compares) == 1
+    assert 'predicate = "ne"' in compares[0]
+    compare_result = compares[0].split(" = ", 1)[0]
+    compare_operands = _operation_operands(compares[0], "ac.bits.compare")
+
+    guards = [
+        line
+        for line in _operation_lines(body, "ac.bits.binary")
+        if f'({compare_result})' not in line
+        and f", {compare_result})" in line
+        and 'opcode = "and"' in line
+    ]
+    assert len(guards) == 1
+    guard_result = guards[0].split(" = ", 1)[0]
+    guard_operands = _operation_operands(guards[0], "ac.bits.binary")
+    assert guard_operands[1] == compare_result
+    assert guard_operands[0] != compare_operands[0]
+
+    next_values = [
+        line
+        for line in _operation_lines(body, "ac.bits.select")
+        if _operation_operands(line, "ac.bits.select")[:2]
+        == [guard_result, compare_operands[0]]
+    ]
+    assert len(next_values) == 1
+    assert body.index(compares[0]) < body.index(guards[0]) < body.index(next_values[0])
+    assert body.count('"ac.yield"') >= 2
 
 
 def test_assertion_uses_the_same_live_branch_path(tmp_path: Path) -> None:
@@ -398,11 +423,13 @@ def test_assertion_uses_the_same_live_branch_path(tmp_path: Path) -> None:
 
     assert unit.process.returncode == 0, unit.process.stderr
     body = unit.body.read_text(encoding="utf-8")
-    assert body.count('"ac.expect"') == 1
-    assert body.count('"ac.source.use"') == 1
-    assert 'kind = "assert"' in body
-    assert 'kind = "next_value"' in body
-    assert body.count('"ac.math.compare"') == 1
+    checks = _operation_lines(body, "ac.expect")
+    assert sum('kind = "assert"' in check for check in checks) == 1
+    assert sum('kind = "range"' in check for check in checks) == 1
+    assert body.count('"ac.bits.compare"') == 1
+    assert 'predicate = "eq"' in body
+    assert body.count('"ac.bits.select"') >= 1
+    assert body.count("ac.required_checks =") == 1
     assert "#ac.math_int<7>" in body
 
 
@@ -413,13 +440,18 @@ def test_mutually_exclusive_branch_writes_remain_two_contributions(
 
     assert unit.process.returncode == 0, unit.process.stderr
     body = unit.body.read_text(encoding="utf-8")
-    uses = _operation_lines(body, "ac.source.use")
-    assert len(uses) == 2
-    assert _dictionary_attr(uses[0], "target") == _dictionary_attr(uses[1], "target")
-    assert (
-        _operation_operands(uses[0], "ac.source.use")[2]
-        != _operation_operands(uses[1], "ac.source.use")[2]
+    value_selects = [
+        line
+        for line in _operation_lines(body, "ac.bits.select")
+        if line.count("#ac.math_int<8>") == 3
+    ]
+    assert len(value_selects) == 1
+    condition, left, right = _operation_operands(
+        value_selects[0], "ac.bits.select"
     )
+    assert len({condition, left, right}) == 3
+    checks = _operation_lines(body, "ac.expect")
+    assert sum('kind = "range"' in check for check in checks) == 2
     assert body.count('"ac.yield"') >= 2
 
 
@@ -430,48 +462,67 @@ def test_composition_preserves_proof_local_inputs_and_negative_polarity(
 
     assert unit.process.returncode == 0, unit.process.stderr
     body = unit.body.read_text(encoding="utf-8")
-    uses = _operation_lines(body, "ac.source.use")
-    assert len(uses) == 2
-    assert _dictionary_attr(uses[0], "target") == _dictionary_attr(uses[1], "target")
-    assert (
-        _operation_operands(uses[0], "ac.source.use")[2]
-        != _operation_operands(uses[1], "ac.source.use")[2]
-    )
     checks = _operation_lines(body, "ac.expect")
     assert sum('kind = "assert"' in check for check in checks) == 2
     assert sum('kind = "range"' in check for check in checks) == 2
-    required = body.split("ac.required_numeric = ", 1)[1].split(
-        ", ac.required_uses = ", 1
-    )[0]
-    assert required.count('kind = "input"') >= 4
-    assert 'kind = "input"' in required
-    assert "index = 0 : i32" in required
+    assert body.count("ac.required_checks =") == 1
+    assert 'predicate = "ult"' in body
+    assert body.count('predicate = "ne"') == 2
+    assert body.count('opcode = "add"') == 2
+    assert body.count('"ac.bits.select"') == 3
+    branch_value_selects = [
+        line
+        for line in _operation_lines(body, "ac.bits.select")
+        if line.count("#ac.math_int<8>") == 3
+    ]
+    assert len(branch_value_selects) == 1
+    condition, left, right = _operation_operands(
+        branch_value_selects[0], "ac.bits.select"
+    )
+    assert len({condition, left, right}) == 3
 
 
-def test_value_rejects_runtime_runtime_compare_outside_composition_profile(
+def test_runtime_runtime_compare_is_preserved_in_hardware_dataflow(
     tmp_path: Path,
 ) -> None:
     unit = _compile_inline(tmp_path, "runtime_runtime_compare", RUNTIME_RUNTIME_COMPARE)
 
-    assert unit.process.returncode != 0
-    assert (
-        "numeric composition currently requires a constant right operand"
-        in unit.process.stderr
+    assert unit.process.returncode == 0, unit.process.stderr
+    body = unit.body.read_text(encoding="utf-8")
+    compares = _operation_lines(body, "ac.bits.compare")
+    assert len(compares) == 1
+    assert 'predicate = "ult"' in compares[0]
+    left, right = _operation_operands(compares[0], "ac.bits.compare")
+    assert left != right
+    value_selects = [
+        line
+        for line in _operation_lines(body, "ac.bits.select")
+        if line.count("#ac.math_int<8>") == 3
+    ]
+    assert len(value_selects) == 1
+    assert _operation_operands(value_selects[0], "ac.bits.select")[0] == (
+        compares[0].split(" = ", 1)[0]
     )
-    assert not unit.body.exists()
+    checks = _operation_lines(body, "ac.expect")
+    assert sum('kind = "range"' in check for check in checks) == 1
 
 
 @pytest.mark.parametrize(
-    ("stem", "condition", "update"),
+    ("stem", "condition", "update", "predicate", "opcode"),
     [
-        ("le", "value <= 4", "(value + 1) & 255"),
-        ("gt", "value > 0", "(value + 1) & 255"),
-        ("ge", "value >= 1", "(value + 1) & 255"),
-        ("sub", "value < 4", "(value - 1) & 255"),
+        ("le", "value <= 4", "(value + 1) & 255", "ule", "add"),
+        ("gt", "value > 0", "(value + 1) & 255", "ugt", "add"),
+        ("ge", "value >= 1", "(value + 1) & 255", "uge", "add"),
+        ("sub", "value < 4", "(value - 1) & 255", "ult", "sub"),
     ],
 )
-def test_value_rejects_composition_operators_owned_by_composition(
-    tmp_path: Path, stem: str, condition: str, update: str
+def test_composition_relations_and_arithmetic_lower_to_hardware(
+    tmp_path: Path,
+    stem: str,
+    condition: str,
+    update: str,
+    predicate: str,
+    opcode: str,
 ) -> None:
     source_text = f"""\
 from typing import Annotated
@@ -482,7 +533,7 @@ def Mapping():
     value: Word = 3
     sink: Word = 0
     @rule
-    def update():
+    def update() -> None:
         nonlocal sink
         if {condition}:
             sink = {update}
@@ -490,12 +541,14 @@ def Mapping():
 """
     unit = _compile_inline(tmp_path, f"composition_{stem}", source_text)
 
-    assert unit.process.returncode != 0
-    assert (
-        "numeric composition supports only add, and_bits, eq, ne, lt and to_bits"
-        in unit.process.stderr
-    )
-    assert not unit.body.exists()
+    assert unit.process.returncode == 0, unit.process.stderr
+    body = unit.body.read_text(encoding="utf-8")
+    assert f'predicate = "{predicate}"' in body
+    assert f'opcode = "{opcode}"' in body
+    assert 'opcode = "and"' in body
+    checks = _operation_lines(body, "ac.expect")
+    assert sum('kind = "range"' in check for check in checks) == 1
+    assert body.count("ac.required_checks =") == 1
 
 
 def test_approved_sources_publish_complete_semantic_inventory(
@@ -541,11 +594,10 @@ def test_approved_sources_publish_hierarchy_without_relay_registers(
 
     assert system.process.returncode == 0, system.process.stderr
     pipeline_text = pipeline.body.read_text(encoding="utf-8")
-    assert pipeline_text.count('"ac.reg"') == 1
+    assert pipeline_text.count('callee = @pycircuit.__builtins__.dffe') == 0
     assert pipeline_text.count('"ac.instance"') == 2
     assert pipeline_text.count("callee = @control_flow.increment.Increment") == 2
-    assert 'name = "middle"' in pipeline_text
-    assert 'parameter = "enabled"' in pipeline_text
-    assert 'parameter = "incoming"' in pipeline_text
-    assert 'parameter = "outgoing"' in pipeline_text
+    assert 'instance_name = "__pyc_call_0"' in pipeline_text
+    assert 'instance_name = "__pyc_call_1"' in pipeline_text
+    assert '!ac.struct<"control_flow.types.PipelineResult">' in pipeline_text
     _assert_fixture_inventory(system.body.read_text(encoding="utf-8"), pipeline=True)

@@ -271,6 +271,45 @@ Importer::behavioralCall(ModuleDecl &decl, const AstNode &call, OpBuilder &at,
     }
   }
   size_t checkCount = countSourceChecks(rule, "body");
+  // Each scalar Integer owner assignment crosses a declared range boundary.
+  // Reserve its compiler-generated range-check suffix up front, just as the
+  // source walker reserves authored assertions before creating the Rule op.
+  for (const auto &item : writtenOwners) {
+    const auto &state = states[item.first];
+    auto annotation = state.node.kind() == "AnnAssign"
+                          ? state.node.child("annotation")
+                          : state.node.child("value").child("func");
+    if (!isa<ac::BitsType>(state.type) ||
+        annotationKind(annotation) != ac::detail::ValueKind::Integer)
+      continue;
+    auto countAssignments = [&](auto &&self, const AstNode &parent,
+                                StringRef field) -> size_t {
+      size_t count = 0;
+      for (size_t index = 0; index < parent.array(field).size(); ++index) {
+        AstNode statement = parent.item(field, index);
+        if (statement.kind() == "Assign" ||
+            statement.kind() == "AnnAssign") {
+          size_t targets = statement.kind() == "Assign"
+                               ? statement.array("targets").size()
+                               : 1;
+          for (size_t target = 0; target < targets; ++target) {
+            AstNode node = statement.kind() == "Assign"
+                               ? statement.item("targets", target)
+                               : statement.child("target");
+            count += assignmentRoot(node) == item.second->formal;
+          }
+        }
+        if (statement.kind() == "If")
+          count += self(self, statement, "body") +
+                   self(self, statement, "orelse");
+        else if (statement.kind() == "Match")
+          for (size_t arm = 0; arm < statement.array("cases").size(); ++arm)
+            count += self(self, statement.item("cases", arm), "body");
+      }
+      return count;
+    };
+    checkCount += countAssignments(countAssignments, rule, "body");
+  }
   for (size_t i = 0; i < checkCount * 2; ++i)
     resultTypes.push_back(bits(1, rule, decl.symbol));
   auto ruleOp = createOp(
@@ -296,6 +335,22 @@ Importer::behavioralCall(ModuleDecl &decl, const AstNode &call, OpBuilder &at,
       environment.boundaries[entry.first] = inferredBoundary(entry.first, value, rule);
     }
   }
+  // Nested Rules use the module state name itself as their implicit writable
+  // formal.  SourceRuleWrites publishes the owner in writtenOwners; reuse the
+  // lexical capture already installed above and attach its declared owner
+  // boundary so the ordinary assignment path can produce next/en results.
+  if (lexicalRule)
+    for (const auto &item : writtenOwners) {
+      StringRef formal = item.second->formal;
+      StringRef ownerName = states[item.first].name;
+      auto captured = localValues.find(ownerName);
+      if (captured == localValues.end())
+        return error() << "nested Rule writable owner was not captured";
+      localValues[formal] = captured->second;
+      auto boundary = ownerBoundary(states[item.first]);
+      boundary.contract.name = formal.str();
+      environment.boundaries[formal] = boundary;
+    }
   auto nested = OpBuilder::atBlockEnd(block);
   {
     auto previousRule = std::exchange(activeRule, &evaluation);
@@ -335,8 +390,15 @@ Importer::behavioralCall(ModuleDecl &decl, const AstNode &call, OpBuilder &at,
       const auto &formal = item.second->formal;
       Value next = localValues[formal];
       Value en = writes[formal];
-      auto checkedNext = applyBindingBoundary(next, ownerBoundary(state),
-                                              state.node, nested, decl.symbol);
+      // The assignment path already applied the declared integer boundary and
+      // registered any dynamic range obligation. This final owner/result seam
+      // only normalizes the representation and must not duplicate the check.
+      auto nextBoundary = ownerBoundary(state);
+      if (nextBoundary.contract.sourceKind ==
+          ac::detail::ValueKind::Integer)
+        nextBoundary.integerMode = IntegerBoundaryMode::Representation;
+      auto checkedNext = applyBindingBoundary(next, nextBoundary, state.node,
+                                              nested, decl.symbol);
       BindingBoundary enableBoundary{
           {"", bits(1, rule, decl.symbol), rule, {}, true}, true};
       auto checkedEnable =

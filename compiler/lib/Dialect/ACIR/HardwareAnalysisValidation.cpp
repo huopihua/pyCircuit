@@ -141,7 +141,8 @@ detail::verifyHardwarePackageEnvelope(const HardwareAnalysis &analysis) {
                                      [&] { return package.emitOpError(); })))
     return failure();
   for (Operation &op : package.getBody()->getOperations())
-    if (!isa<ModuleOp, ModuleImportOp, StructOp, EnumOp, SystemOp>(op))
+    if (!isa<TypeAliasOp, ConstantOp, ModuleOp, ModuleImportOp, StructOp,
+             EnumOp, SystemOp>(op))
       return op.emitOpError()
              << "operation outside closed executable hardware package";
   for (auto record : analysis.getStructs())

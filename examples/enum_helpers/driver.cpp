@@ -1,6 +1,6 @@
 #include "gfsim/SimExecutor.h"
 #include "gfsim/SystemRunner.h"
-#include "pycircuit_system.hpp"
+#include "design.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -375,7 +375,7 @@ void configure(gfsim::SimExecutor &exec) {
               reinterpret_cast<const std::uint8_t *>(probeConfig.data()),
               probeConfig.size()) == PYCIRCUIT_MODEL_STATUS_V1_OK);
 }
-void driveRoot(pyc_root &root, const Row &r) {
+template <class Root> void driveRoot(Root &root, const Row &r) {
   auto p = inputs(r);
   root.pyc_7079635f636c6b = p.pyc_7079635f636c6b;
   root.pyc_7079635f727374 = p.pyc_7079635f727374;
@@ -383,7 +383,7 @@ void driveRoot(pyc_root &root, const Row &r) {
   root.data = p.data;
   root.take = p.take;
 }
-void checkRoot(pyc_root &root, bool ready,
+template <class Root> void checkRoot(Root &root, bool ready,
                const std::optional<Planes> &payload) {
   const auto out = root.result.packed();
   require(out.knownMask().bit(21) && out.knownMask().bit(20));
@@ -397,8 +397,8 @@ void ownerProbes(unsigned workers) {
     // mode 0: discard a full replacement; mode 1: failed accept during
     // old-input move; mode 2: failed output pop while both owners contain
     // tokens.
-    gfsim::WorkExecutor pool(workers);
-    pyc_root root("owner", &pool);
+    pyc_dut probe(workers);
+    auto &root = probe.root();
     root.Build();
     const auto a = token(binary(0x0d3,InputWidth));
     const auto b = token(binary(0x269,InputWidth));

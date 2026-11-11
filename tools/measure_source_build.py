@@ -148,6 +148,8 @@ def _executed_commands(stdout: str) -> list[dict[str, Any]]:
                         if "--target" in arguments
                         else "unknown"
                     )
+                    if target == "structural-cpp":
+                        target = "cpp"
                     command_kind = f"pycircuit_emit_{target}"
                 if "-c" in arguments:
                     source = arguments[arguments.index("-c") + 1]

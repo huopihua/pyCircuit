@@ -271,18 +271,24 @@ def assert_runtime_result(
 
 
 def assert_design_top_run(payload: bytes) -> None:
-    """Verify two child instances, old-Q transfer, reports, and 3-step stop."""
+    """Verify two child instances, old-Q transfer, reports, and 3 cycles."""
 
     events, result = parse_jsonl(payload)
     logs = [event for event in events if event["kind"] == "log"]
     reports = [event for event in events if event["kind"] == "report"]
     expected_logs = [
-        ("left", 0, 1, 100),
-        ("right", 0, 1, 200),
-        ("left", 1, 2, 0),
-        ("right", 1, 2, 0),
-        ("left", 2, 3, 3),
-        ("right", 2, 3, 10),
+        ("__pyc_call_0", 0, 1, 100),
+        ("__pyc_call_1", 0, 1, 200),
+        ("__pyc_call_0", 1, 2, 100),
+        ("__pyc_call_1", 1, 2, 200),
+        ("__pyc_call_0", 2, 3, 0),
+        ("__pyc_call_1", 2, 3, 0),
+        ("__pyc_call_0", 3, 4, 0),
+        ("__pyc_call_1", 3, 4, 0),
+        ("__pyc_call_0", 4, 5, 3),
+        ("__pyc_call_1", 4, 5, 10),
+        ("__pyc_call_0", 5, 6, 3),
+        ("__pyc_call_1", 5, 6, 10),
     ]
     actual_logs = [
         (
@@ -296,12 +302,18 @@ def assert_design_top_run(payload: bytes) -> None:
     assert actual_logs == expected_logs
 
     expected_reports = [
-        ("left", 0, 1, 0),
-        ("right", 0, 1, 0),
-        ("left", 1, 2, 3),
-        ("right", 1, 2, 10),
-        ("left", 2, 3, 3),
-        ("right", 2, 3, 10),
+        ("__pyc_call_0", 0, 1, 0),
+        ("__pyc_call_1", 0, 1, 0),
+        ("__pyc_call_0", 1, 2, 0),
+        ("__pyc_call_1", 1, 2, 0),
+        ("__pyc_call_0", 2, 3, 3),
+        ("__pyc_call_1", 2, 3, 10),
+        ("__pyc_call_0", 3, 4, 3),
+        ("__pyc_call_1", 3, 4, 10),
+        ("__pyc_call_0", 4, 5, 3),
+        ("__pyc_call_1", 4, 5, 10),
+        ("__pyc_call_0", 5, 6, 3),
+        ("__pyc_call_1", 5, 6, 10),
     ]
     actual_reports = [
         (
@@ -313,7 +325,7 @@ def assert_design_top_run(payload: bytes) -> None:
         for event in reports
     ]
     assert actual_reports == expected_reports
-    assert_runtime_result(result, status="TERMINATED", epoch=3, cycles=3, stop_reason=1)
+    assert_runtime_result(result, status="TERMINATED", epoch=6, cycles=6, stop_reason=0)
 
     stats = result["statistics"]
     assert type(stats) is list
@@ -325,24 +337,30 @@ def assert_hold_run(payload: bytes, *, limit: int) -> None:
     events, result = parse_jsonl(payload)
     assert events == []
     assert_runtime_result(
-        result, status="TERMINATED", epoch=limit, cycles=limit, stop_reason=1
+        result,
+        status="TERMINATED",
+        epoch=limit * 2,
+        cycles=limit * 2,
+        stop_reason=0,
     )
 
 
 def assert_zero_rule_run(payload: bytes) -> None:
     events, result = parse_jsonl(payload)
     assert events == []
-    assert_runtime_result(result, status="QUIESCENT", epoch=0, cycles=0, stop_reason=0)
+    assert_runtime_result(result, status="TERMINATED", epoch=6, cycles=6, stop_reason=0)
 
 
 def assert_failure_run(payload: bytes) -> None:
     events, result = parse_jsonl(payload)
     logs = [event for event in events if event["kind"] == "log"]
     reports = [event for event in events if event["kind"] == "report"]
-    assert len(logs) == 1 and _integer_values(logs[0]) == (0,)
-    assert len(reports) == 1 and _integer_values(reports[0]) == (0,)
-    assert _u64_string(logs[0]["commit_epoch"]) == 1
-    assert_runtime_result(result, status="FAILED", epoch=1, cycles=1, stop_reason=0)
+    assert len(logs) == 2 and all(_integer_values(row) == (0,) for row in logs)
+    assert len(reports) == 2 and all(
+        _integer_values(row) == (0,) for row in reports
+    )
+    assert [_u64_string(row["commit_epoch"]) for row in logs] == [1, 2]
+    assert_runtime_result(result, status="FAILED", epoch=2, cycles=2, stop_reason=0)
     report_rows = [
         row
         for row in result["statistics"]  # type: ignore[union-attr]
@@ -351,43 +369,46 @@ def assert_failure_run(payload: bytes) -> None:
     assert len(report_rows) == 1 and report_rows[0]["value"] == 0
 
 
+def assert_failure_events_without_result(payload: bytes) -> None:
+    assert payload.endswith(b"\n")
+    rows = [json.loads(line, object_pairs_hook=_object_pairs) for line in payload.decode().splitlines()]
+    assert rows and all(row["kind"] in {"log", "report"} for row in rows)
+    logs = [row for row in rows if row["kind"] == "log"]
+    reports = [row for row in rows if row["kind"] == "report"]
+    assert len(logs) == 2 and all(_integer_values(row) == (0,) for row in logs)
+    assert len(reports) == 2 and all(
+        _integer_values(row) == (0,) for row in reports
+    )
+    assert [_u64_string(row["commit_epoch"]) for row in logs] == [1, 2]
+
+
 def assert_value_probe_run(payload: bytes, *, word: int) -> None:
     events, result = parse_jsonl(payload)
-    assert len(events) == 9
+    assert len(events) == 12
     expected = [
         ("log", "word", word),
         ("log", "flag", True),
-        ("print", "value probe", None),
-    ] * 3
+    ] * 6
     observed: list[tuple[str, str, object]] = []
     for index, event in enumerate(events):
-        cycle = index // 3
+        cycle = index // 2
         assert _u64_string(event["evaluation_epoch"]) == cycle
         assert _u64_string(event["commit_epoch"]) == cycle + 1
         spec = event["spec"]
         assert type(spec) is dict
-        if event["kind"] == "print":
-            assert spec == {
-                "items": [{"kind": "literal", "text": "value probe"}],
-                "sep": " ",
-                "end": "\n",
-            }
-            assert event["values"] == []
-            observed.append(("print", "value probe", None))
+        assert event["kind"] == "log"
+        name = spec["event"]
+        value = event["values"][0]
+        assert type(value) is dict
+        if name == "word":
+            assert value["kind"] == "integer"
+            actual: object = int(value["value"])
         else:
-            assert event["kind"] == "log"
-            name = spec["event"]
-            value = event["values"][0]
-            assert type(value) is dict
-            if name == "word":
-                assert value["kind"] == "integer"
-                actual: object = int(value["value"])
-            else:
-                assert name == "flag" and value["kind"] == "bool"
-                actual = value["value"]
-            observed.append(("log", name, actual))
+            assert name == "flag" and value["kind"] == "bool"
+            actual = value["value"]
+        observed.append(("log", name, actual))
     assert observed == expected
-    assert_runtime_result(result, status="TERMINATED", epoch=3, cycles=3, stop_reason=1)
+    assert_runtime_result(result, status="TERMINATED", epoch=6, cycles=6, stop_reason=0)
 
 
 def assert_repeated_run_identical(first: bytes, second: bytes) -> None:

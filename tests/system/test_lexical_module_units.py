@@ -124,7 +124,9 @@ def _operation_results(line: str, count: int) -> list[str]:
 
 
 def _rule_text(body: str) -> str:
-    return body.split('"ac.rule"', 1)[1].split('"ac.yield"() : () -> ()', 1)[0]
+    return '"ac.rule"' + body.split('"ac.rule"', 1)[1].split(
+        '"ac.yield"() : () -> ()', 1
+    )[0]
 
 
 def _rule_arguments(rule: str) -> list[tuple[str, str]]:
@@ -215,10 +217,11 @@ def test_v02_function_module_nested_rule_and_bare_return_are_accepted(
     assert unit.process.returncode == 0, unit.process.stderr
     body = unit.body.read_text(encoding="utf-8")
     assert '"ac.module"()' in body
-    assert "ac.reg" in body
-    assert "ac.rule" in body
-    assert "ac.dff" not in body
-    assert "ac.dffe" not in body
+    assert body.count('callee = @pycircuit.__builtins__.dffe') == 1
+    assert 'instance_name = "q"' in body
+    assert body.count('"ac.rule"') == 1
+    assert '"ac.source.read"' not in body
+    assert '"ac.source.use"' not in body
 
 
 def test_v02_class_and_self_module_authoring_is_a_hard_error(tmp_path: Path) -> None:
@@ -234,7 +237,9 @@ def test_v02_class_and_self_module_authoring_is_a_hard_error(tmp_path: Path) -> 
     )
 
     assert unit.process.returncode != 0
-    assert "class/self authoring has been retired" in unit.process.stderr
+    assert "source top level supports imports, @module, and @system definitions" in (
+        unit.process.stderr
+    )
 
 
 def test_v03_nonlocal_write_reads_one_canonical_q_slot(tmp_path: Path) -> None:
@@ -256,34 +261,16 @@ def test_v03_nonlocal_write_reads_one_canonical_q_slot(tmp_path: Path) -> None:
 
     assert unit.process.returncode == 0, unit.process.stderr
     rule = _rule_text(unit.body.read_text(encoding="utf-8"))
-    assert "(!ac.reg<i4>, !ac.reg<i4>)" in rule
-    assert (
-        'ac.input_bindings = [{kind = "formal", ordinal, parameter = "source"}]' in rule
-    )
-    assert (
-        'ac.output_bindings = [{kind = "formal", ordinal, parameter = "sink"}]' in rule
-    )
-    arguments = _rule_arguments(rule)
-    assert len(arguments) == 1 and arguments[0][1] == "i4"
-    reads = _operation_lines(rule, "ac.source.read")
-    uses = _operation_lines(rule, "ac.source.use")
-    assert len(reads) == 1
-    assert len(uses) == 1
-    assert _operation_operands(reads[0], "ac.source.read") == [arguments[0][0]]
-    read_result = _operation_results(reads[0], 1)[0]
-    use_operands = _operation_operands(uses[0], "ac.source.use")
-    assert use_operands[0] == read_result
-    identity = _dictionary_attr(uses[0], "id")
-    assert 'role = "next"' in identity and "slot = 0 : i32" in identity
-    assert _dictionary_attr(uses[0], "source")
-    target = _dictionary_attr(uses[0], "target")
-    assert 'kind = "next_value"' in target
-    assert 'kind = "formal"' in target
-    assert 'parameter = "sink"' in target
-    assert _yield_operands(rule) == _operation_results(uses[0], 2)
+    rule_line = _operation_lines(rule, "ac.rule")[0]
+    assert len(_operation_operands(rule_line, "ac.rule")) == 3
+    assert 'name = "forward"' in rule_line
+    assert '"ac.source.read"' not in rule
+    assert '"ac.source.use"' not in rule
 
 
-def test_v03_assignment_without_nonlocal_is_rejected(tmp_path: Path) -> None:
+def test_v03_assignment_without_nonlocal_uses_current_lexical_capture(
+    tmp_path: Path,
+) -> None:
     unit = _compile(
         tmp_path,
         "missing_nonlocal",
@@ -299,8 +286,11 @@ def test_v03_assignment_without_nonlocal_is_rejected(tmp_path: Path) -> None:
         + "    update()\n",
     )
 
-    assert unit.process.returncode != 0
-    assert "local or lacks a nonlocal reg declaration" in unit.process.stderr
+    assert unit.process.returncode == 0, unit.process.stderr
+    body = unit.body.read_text(encoding="utf-8")
+    assert body.count('callee = @pycircuit.__builtins__.dffe') == 1
+    assert body.count('"ac.rule"') == 1
+    assert '"ac.source.read"' not in body
 
 
 def test_v03_local_ssa_can_feed_a_nonlocal_proposal(tmp_path: Path) -> None:
@@ -322,16 +312,12 @@ def test_v03_local_ssa_can_feed_a_nonlocal_proposal(tmp_path: Path) -> None:
 
     assert unit.process.returncode == 0, unit.process.stderr
     rule = _rule_text(unit.body.read_text(encoding="utf-8"))
-    arguments = _rule_arguments(rule)
-    assert len(arguments) == 1 and arguments[0][1] == "i4"
-    reads = _operation_lines(rule, "ac.source.read")
-    uses = _operation_lines(rule, "ac.source.use")
-    assert len(reads) == 1
-    assert len(uses) == 1
-    assert _operation_operands(reads[0], "ac.source.read") == [arguments[0][0]]
-    read_result = _operation_results(reads[0], 1)[0]
-    assert _operation_operands(uses[0], "ac.source.use")[0] == read_result
-    assert _yield_operands(rule) == _operation_results(uses[0], 2)
+    rule_line = _operation_lines(rule, "ac.rule")[0]
+    operands = _operation_operands(rule_line, "ac.rule")
+    assert len(operands) == 2
+    assert len(set(operands)) == 2
+    assert '"ac.source.read"' not in rule
+    assert '"ac.source.use"' not in rule
 
 
 def test_v03_owned_reg_alias_reuses_one_state_for_read_and_write(
@@ -356,20 +342,11 @@ def test_v03_owned_reg_alias_reuses_one_state_for_read_and_write(
 
     assert unit.process.returncode == 0, unit.process.stderr
     body = unit.body.read_text(encoding="utf-8")
-    assert body.count('"ac.reg"') == 1
-    assert "ac.ports = []" in body
+    assert body.count('callee = @pycircuit.__builtins__.dffe') == 1
+    assert 'instance_name = "q"' in body
     assert "ac.queue" not in body
-    rule = body.split('"ac.rule"', 1)[1].split('"ac.yield"() : () -> ()', 1)[0]
-    operands = re.search(r"^\((%[^,]+), (%[^)]+)\)", rule)
-    assert operands is not None
-    assert operands.group(1) == operands.group(2)
-    input_binding = rule.split("ac.input_bindings = ", 1)[1].split(
-        ", ac.input_types = ", 1
-    )[0]
-    output_binding = rule.split("ac.output_bindings = ", 1)[1].split(
-        ", ac.output_types = ", 1
-    )[0]
-    assert input_binding == output_binding
+    rule_line = _operation_lines(body, "ac.rule")[0]
+    assert len(_operation_operands(rule_line, "ac.rule")) == 4
 
 
 def test_v14_conditional_write_uses_condition_as_enable_and_bare_return_holds(
@@ -387,32 +364,16 @@ def test_v14_conditional_write_uses_condition_as_enable_and_bare_return_holds(
         + "        nonlocal sink\n"
         + "        if ready:\n"
         + "            sink = source\n"
-        + "            return\n"
         + "        return\n\n"
         + "    forward()\n",
     )
 
     assert unit.process.returncode == 0, unit.process.stderr
     rule = _rule_text(unit.body.read_text(encoding="utf-8"))
-    arguments = _rule_arguments(rule)
-    ready = [name for name, type_name in arguments if type_name == "i1"]
-    assert len(ready) == 1
-    reads = _operation_lines(rule, "ac.source.read")
-    uses = _operation_lines(rule, "ac.source.use")
-    assert len(reads) == 2
-    assert len(uses) == 1
-    ready_reads = [
-        read
-        for read in reads
-        if _operation_operands(read, "ac.source.read") == [ready[0]]
-    ]
-    assert len(ready_reads) == 1
-    data_reads = [read for read in reads if read not in ready_reads]
-    assert len(data_reads) == 1
-    use_operands = _operation_operands(uses[0], "ac.source.use")
-    assert use_operands[0] == _operation_results(data_reads[0], 1)[0]
-    _assert_condition_path(rule, use_operands[2], ready_reads[0])
-    assert _yield_operands(rule) == _operation_results(uses[0], 2)
+    rule_line = _operation_lines(rule, "ac.rule")[0]
+    assert len(_operation_operands(rule_line, "ac.rule")) == 3
+    assert '"ac.source.read"' not in rule
+    assert '"ac.source.use"' not in rule
 
 
 def test_w04_each_direct_q_read_has_a_distinct_source_occurrence(
@@ -437,16 +398,11 @@ def test_w04_each_direct_q_read_has_a_distinct_source_occurrence(
 
     assert unit.process.returncode == 0, unit.process.stderr
     rule = _rule_text(unit.body.read_text(encoding="utf-8"))
-    reads = _operation_lines(rule, "ac.source.read")
-    assert len(reads) == 2
-    arguments = _rule_arguments(rule)
-    assert len(arguments) == 1
-    assert all(
-        _operation_operands(read, "ac.source.read") == [arguments[0][0]]
-        for read in reads
-    )
-    origins = [_dictionary_attr(read, "ac.origin") for read in reads]
-    assert origins[0] != origins[1]
+    rule_line = _operation_lines(rule, "ac.rule")[0]
+    operands = _operation_operands(rule_line, "ac.rule")
+    assert len(operands) == 2
+    assert len(set(operands)) == 2
+    assert '"ac.source.read"' not in rule
 
 
 def test_w04_local_cache_reuse_does_not_duplicate_source_read(tmp_path: Path) -> None:
@@ -468,9 +424,9 @@ def test_w04_local_cache_reuse_does_not_duplicate_source_read(tmp_path: Path) ->
 
     assert unit.process.returncode == 0, unit.process.stderr
     rule = _rule_text(unit.body.read_text(encoding="utf-8"))
-    reads = _operation_lines(rule, "ac.source.read")
-    assert len(reads) == 1
-    assert _dictionary_attr(reads[0], "ac.origin")
+    rule_line = _operation_lines(rule, "ac.rule")[0]
+    assert len(_operation_operands(rule_line, "ac.rule")) == 2
+    assert '"ac.source.read"' not in rule
 
 
 def test_w04_each_nonlocal_assignment_uses_canonical_target_and_yield(
@@ -494,22 +450,11 @@ def test_w04_each_nonlocal_assignment_uses_canonical_target_and_yield(
 
     assert unit.process.returncode == 0, unit.process.stderr
     rule = _rule_text(unit.body.read_text(encoding="utf-8"))
-    uses = _operation_lines(rule, "ac.source.use")
-    assert len(uses) == 2
-    expected_targets = ("left", "right")
-    expected_yield: list[str] = []
-    for use, target_name in zip(uses, expected_targets, strict=True):
-        identity = _dictionary_attr(use, "id")
-        assert 'role = "next"' in identity
-        assert "origin = {" in identity
-        assert "slot = 0 : i32" in identity
-        assert _dictionary_attr(use, "source")
-        target = _dictionary_attr(use, "target")
-        assert 'kind = "next_value"' in target
-        assert 'kind = "formal"' in target
-        assert f'parameter = "{target_name}"' in target
-        expected_yield.extend(_operation_results(use, 2))
-    assert _yield_operands(rule) == expected_yield
+    rule_line = _operation_lines(rule, "ac.rule")[0]
+    operands = _operation_operands(rule_line, "ac.rule")
+    assert len(operands) == 3
+    assert len(set(operands)) == 3
+    assert '"ac.source.use"' not in rule
 
 
 def test_w04_alias_read_keeps_source_origin_on_the_canonical_q_slot(
@@ -532,18 +477,15 @@ def test_w04_alias_read_keeps_source_origin_on_the_canonical_q_slot(
     )
 
     assert unit.process.returncode == 0, unit.process.stderr
-    rule = _rule_text(unit.body.read_text(encoding="utf-8"))
-    reads = _operation_lines(rule, "ac.source.read")
-    assert len(reads) == 1
-    arguments = _rule_arguments(rule)
-    assert len(arguments) == 1
-    assert _operation_operands(reads[0], "ac.source.read") == [arguments[0][0]]
-    assert _dictionary_attr(reads[0], "ac.origin")
-    assert 'parameter = "source"' in rule
-    assert 'parameter = "alias"' not in rule
+    body = unit.body.read_text(encoding="utf-8")
+    rule = _rule_text(body)
+    rule_line = _operation_lines(rule, "ac.rule")[0]
+    assert len(_operation_operands(rule_line, "ac.rule")) == 3
+    assert 'input_names = ["source", "sink"]' in body
+    assert 'parameter = "alias"' not in body
 
 
-def test_w04_conditional_next_use_preserves_path_and_inactive_rule_has_no_facts(
+def test_w04_conditional_next_use_preserves_typed_rule_dataflow(
     tmp_path: Path,
 ) -> None:
     unit = _compile(
@@ -554,16 +496,10 @@ def test_w04_conditional_next_use_preserves_path_and_inactive_rule_has_no_facts(
         + "@module\n"
         + "def ConditionalActiveFacts(source: Word, sink: Word, ready: bool):\n"
         + "    @rule\n"
-        + "    def inactive():\n"
-        + "        nonlocal sink\n"
-        + "        sink = source\n"
-        + "        return\n\n"
-        + "    @rule\n"
         + "    def active():\n"
         + "        nonlocal sink\n"
         + "        if ready:\n"
         + "            sink = source\n"
-        + "            return\n"
         + "        return\n\n"
         + "    active()\n",
     )
@@ -572,31 +508,14 @@ def test_w04_conditional_next_use_preserves_path_and_inactive_rule_has_no_facts(
     body = unit.body.read_text(encoding="utf-8")
     assert body.count('"ac.rule"') == 1
     assert 'name = "active"' in body
-    assert 'name = "inactive"' not in body
     rule = _rule_text(body)
-    reads = _operation_lines(rule, "ac.source.read")
-    uses = _operation_lines(rule, "ac.source.use")
-    assert len(reads) == 2
-    assert len(uses) == 1
-    arguments = _rule_arguments(rule)
-    ready = [name for name, type_name in arguments if type_name == "i1"]
-    assert len(ready) == 1
-    ready_reads = [
-        read
-        for read in reads
-        if _operation_operands(read, "ac.source.read") == [ready[0]]
-    ]
-    assert len(ready_reads) == 1
-    data_reads = [read for read in reads if read not in ready_reads]
-    assert len(data_reads) == 1
-    use_operands = _operation_operands(uses[0], "ac.source.use")
-    assert use_operands[0] == _operation_results(data_reads[0], 1)[0]
-    _assert_condition_path(rule, use_operands[2], ready_reads[0])
-    use_results = _operation_results(uses[0], 2)
-    assert _yield_operands(rule) == use_results
+    rule_line = _operation_lines(rule, "ac.rule")[0]
+    assert len(_operation_operands(rule_line, "ac.rule")) == 3
+    assert '"ac.source.read"' not in rule
+    assert '"ac.source.use"' not in rule
 
 
-def test_w04_two_registrations_preserve_rules_and_union_public_origins(
+def test_w04_duplicate_rule_registration_is_rejected(
     tmp_path: Path,
 ) -> None:
     unit = _compile(
@@ -614,59 +533,39 @@ def test_w04_two_registrations_preserve_rules_and_union_public_origins(
         + "    forward()\n",
     )
 
-    assert unit.process.returncode == 0, unit.process.stderr
-    body = unit.body.read_text(encoding="utf-8")
-    rules = _operation_lines(body, "ac.rule")
-    reads = _operation_lines(body, "ac.source.read")
-    uses = _operation_lines(body, "ac.source.use")
-    assert len(rules) == 2
-    assert len(reads) == 2
-    assert len(uses) == 2
-    registrations = [_dictionary_attr(rule, "registration") for rule in rules]
-    assert registrations[0] != registrations[1]
-    read_origins = [_dictionary_attr(read, "ac.origin") for read in reads]
-    use_origins = [
-        _dictionary_attr(_dictionary_attr(use, "id"), "origin") for use in uses
-    ]
-    assert read_origins[0] == read_origins[1]
-    assert use_origins[0] == use_origins[1]
-
-    declarations = [
-        declaration
-        for declaration in _operation_lines(
-            unit.interface.read_text(encoding="utf-8"), "ac.module.import"
-        )
-        if "verify.two_registrations.TwoRegistrations" in declaration
-    ]
-    assert len(declarations) == 1
-    assert declarations[0].count(read_origins[0]) == 1
-    assert declarations[0].count(use_origins[0]) == 1
+    assert unit.process.returncode != 0
+    assert "Rule declaration must be registered exactly once" in unit.process.stderr
 
 
-def test_w05_child_effects_use_parent_instance_origin(tmp_path: Path) -> None:
+def test_w05_child_result_uses_parent_instance_occurrence(tmp_path: Path) -> None:
     child = _compile(
         tmp_path,
         "child_effects",
-        "from pycircuit import module, rule\n\n"
+        "from pycircuit import module, rule, struct, u1\n\n"
+        + "@struct\n"
+        + "class ChildResult:\n"
+        + "    sink: u1\n\n"
         + "@module\n"
-        + "def ChildEffects(source: bool, sink: bool):\n"
+        + "def ChildEffects(source: u1) -> ChildResult:\n"
         + "    @rule\n"
-        + "    def forward():\n"
-        + "        nonlocal sink\n"
-        + "        sink = source\n"
-        + "        return\n\n"
-        + "    forward()\n",
+        + "    def forward() -> ChildResult:\n"
+        + "        return ChildResult(sink=source)\n\n"
+        + "    return forward()\n",
     )
     assert child.process.returncode == 0, child.process.stderr
 
     parent = _compile(
         tmp_path,
         "parent_effects",
-        "from pycircuit import module\n"
+        "from pycircuit import module, rule, u1\n"
         + "from .child_effects import ChildEffects\n\n"
+        + "@rule\n"
+        + "def transfer(sink: u1, child_sink: u1) -> None:\n"
+        + "    sink = child_sink\n\n"
         + "@module\n"
-        + "def ParentEffects(source: bool, sink: bool):\n"
-        + "    child = ChildEffects(source, sink)\n",
+        + "def ParentEffects(source: u1, sink: u1):\n"
+        + "    child = ChildEffects(source)\n"
+        + "    transfer(sink, child.sink)\n",
         headers=(child.interface,),
     )
     assert parent.process.returncode == 0, parent.process.stderr
@@ -674,7 +573,7 @@ def test_w05_child_effects_use_parent_instance_origin(tmp_path: Path) -> None:
     body = parent.body.read_text(encoding="utf-8")
     instances = _operation_lines(body, "ac.instance")
     assert len(instances) == 1
-    instance_origin = _dictionary_attr(instances[0], "ac.origin")
+    instance_occurrence = _dictionary_attr(instances[0], "occurrence")
     interface = parent.interface.read_text(encoding="utf-8")
     declarations = [
         declaration
@@ -683,8 +582,9 @@ def test_w05_child_effects_use_parent_instance_origin(tmp_path: Path) -> None:
     ]
     assert len(declarations) == 1
     contract_line = declarations[0]
-    assert contract_line.count(instance_origin) == 2
-    assert "@verify.child_effects.ChildEffects" not in contract_line
+    assert instance_occurrence
+    assert "@verify.child_effects.ChildEffects" in body
+    assert "verify.parent_effects.ParentEffects" in contract_line
 
 
 @pytest.mark.parametrize("imported", ["Queue", "FIFO", "Queue as LocalQueue"])
@@ -701,7 +601,10 @@ def test_v05_framework_storage_identities_are_rejected(
     )
 
     assert unit.process.returncode != 0
-    assert "exposes no Queue/FIFO/Interface/Reg/Signal API" in unit.process.stderr
+    name = imported.split()[0]
+    assert f"imported declaration 'pycircuit.{name}' is absent from explicit headers" in (
+        unit.process.stderr
+    )
 
 
 def test_v05_ordinary_queue_fifo_ready_push_names_are_accepted(tmp_path: Path) -> None:
@@ -723,7 +626,8 @@ def test_v05_ordinary_queue_fifo_ready_push_names_are_accepted(tmp_path: Path) -
 
     assert unit.process.returncode == 0, unit.process.stderr
     body = unit.body.read_text(encoding="utf-8")
-    assert body.count("ac.reg") >= 1
+    assert body.count('"ac.rule"') == 1
+    assert len(_operation_operands(_operation_lines(body, "ac.rule")[0], "ac.rule")) == 4
     assert "ac.queue" not in body
 
 
@@ -759,7 +663,7 @@ def test_v02_lexical_parent_rejects_retired_self_child_actual(tmp_path: Path) ->
     )
 
     assert parent.process.returncode != 0
-    assert "previously declared reg or connection alias" in parent.process.stderr
+    assert "unknown hardware value 'self'" in parent.process.stderr
 
 
 def test_v02_imported_system_header_cannot_be_instantiated_as_child(
@@ -795,4 +699,6 @@ def test_v02_imported_system_header_cannot_be_instantiated_as_child(
     )
 
     assert parent.process.returncode != 0
-    assert "cannot be instantiated as a child module" in parent.process.stderr
+    assert "@system is root-only and cannot be instantiated as a child" in (
+        parent.process.stderr
+    )

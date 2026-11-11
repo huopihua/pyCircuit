@@ -1,0 +1,1 @@
+"""Historical slot/issue oracle."""

@@ -257,7 +257,7 @@ def test_saved_final_groups_and_actual_origins_agree_across_targets(tmp_path):
     source, units, final = _prepare(tmp_path)
     shutil.rmtree(source)
     shutil.rmtree(units)
-    cpp, rtl = maps._collect(final, "cpp"), maps._collect(final, "verilog")
+    cpp, rtl = maps._collect(final, "structural-cpp"), maps._collect(final, "verilog")
     left, right = _map_rows(cpp), _map_rows(rtl)
     assert left.keys() == right.keys() == OWNERS
     for name in OWNERS:
@@ -267,14 +267,22 @@ def test_saved_final_groups_and_actual_origins_agree_across_targets(tmp_path):
     for filename in ("enums.py", "records.py"):
         assert left[filename]["origins"] == _expected_nominal_origins(filename)
     for name in ("enums.py", "records.py", "empty.py", "facade.py"):
-        group = next(g for g in cpp["source_groups"] if g["source"]["path"] == name)
-        assert group["source_path"] is None and group["implementation"] is None
-        assert group["header_path"] == f"sources/{PACKAGE}/{Path(name).stem}.hpp"
-        assert left[name]["generated_files"] == [group["header_path"]]
+        group = next(
+            g
+            for g in cpp["structural_cpp_groups"]
+            if g["source"]["path"] == name
+        )
+        assert group["path"].startswith("source_unit_")
+        assert group["path"].endswith(".cpp")
+        assert group["text"] == '#include "design.hpp"\n\n'
+        assert left[name]["generated_files"] == [group["path"]]
         assert right[name]["generated_files"] == []
     assert {g["source"]["path"] for g in rtl["rtl_source_groups"]} == {"main.py"}
-    assert all(g["path"] and g["path"].endswith(".v") for g in rtl["rtl_source_groups"])
-    for target in ("cpp", "verilog"):
+    assert all(
+        g["path"] and g["path"].endswith((".v", ".sv"))
+        for g in rtl["rtl_source_groups"]
+    )
+    for target in ("structural-cpp", "verilog"):
         output = tmp_path / target
         public._emit(final, target, output)
         receipt = public._receipt(output)
@@ -317,7 +325,7 @@ def test_raw_final_metadata_failure_preserves_public_outputs(tmp_path):
         ),
     }
     outputs = {}
-    for target in ("cpp", "verilog"):
+    for target in ("structural-cpp", "verilog"):
         output = tmp_path / (target + "-protected")
         public._emit(final, target, output)
         outputs[target] = (output, public._tree(output))
@@ -391,7 +399,7 @@ def test_real_provider_mutations_preserve_fresh_and_replacement_finals(tmp_path)
         headers["records"].write_text(_remove_spare_export(texts[headers["records"]]))
         run_bad(
             "missing-definition",
-            "owning header nominal declaration has no matching body definition",
+            "owning header declaration has no matching body definition",
         )
     finally:
         for path, text in texts.items():

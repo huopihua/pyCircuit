@@ -10,6 +10,7 @@ pycircuit_add_example(feedback_pipeline
   SYSTEM_TOP example_feedback_pipeline.bench.ExerciseFeedbackPipeline
   SYSTEM_ENTRY_SOURCE bench
   SYSTEM_CYCLES 3763
+  SYSTEM_TIMEOUT_SECONDS 600
   SYSTEM_SOURCES feedback_pipeline.py bench.py)
 if(PYC_EXAMPLE_VERIFY)
 

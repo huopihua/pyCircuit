@@ -66,6 +66,7 @@ def test_release_presets_configure_in_isolation_and_select_live_targets(
     assert release["cacheVariables"]["PYC_BUILD_RUNTIME_LIB"] == "ON"
     assert release["cacheVariables"]["PYC_BUILD_TESTING"] == "ON"
     assert release["cacheVariables"]["PYC_INSTALL_PYTHON"] == "ON"
+    assert release["cacheVariables"]["LLVM_EXTERNAL_LIT"] == "$env{LLVM_EXTERNAL_LIT}"
     assert "PYC_BUILD_MLIR_TOOLS" not in release["cacheVariables"]
     assert build["release-tools"]["configurePreset"] == "release"
     assert release_targets == EXPECTED_TARGETS
@@ -85,6 +86,7 @@ def test_release_presets_configure_in_isolation_and_select_live_targets(
     environment = os.environ.copy()
     environment["LLVM_DIR"] = _cache_value(cache, "LLVM_DIR")
     environment["MLIR_DIR"] = _cache_value(cache, "MLIR_DIR")
+    environment["LLVM_EXTERNAL_LIT"] = _cache_value(cache, "LLVM_EXTERNAL_LIT")
     isolated_build = tmp_path / "preset configure build"
     isolated_install = tmp_path / "preset configure install"
     configured = _checked(
@@ -105,6 +107,7 @@ def test_release_presets_configure_in_isolation_and_select_live_targets(
     assert "PYC_BUILD_RUNTIME_LIB:BOOL=ON" in configured_cache
     assert "PYC_BUILD_TESTING:BOOL=ON" in configured_cache
     assert "PYC_INSTALL_PYTHON:BOOL=ON" in configured_cache
+    assert f"LLVM_EXTERNAL_LIT:FILEPATH={environment['LLVM_EXTERNAL_LIT']}" in configured_cache
     assert f"CMAKE_INSTALL_PREFIX:PATH={isolated_install}" in configured_cache
 
     targets = _checked(

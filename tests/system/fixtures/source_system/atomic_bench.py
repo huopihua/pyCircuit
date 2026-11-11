@@ -8,13 +8,13 @@ def AtomicFailure():
     right = Accumulator()
 
     @rule
-    def drive_left():
+    def drive_left() -> None:
         left(enable=1)
         assert False, "atomic rejection"
         log("info", "failed observation", left.value)
 
     @rule
-    def drive_right():
+    def drive_right() -> None:
         right(enable=1)
 
     drive_left()

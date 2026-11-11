@@ -6,19 +6,34 @@ import json
 from copy import deepcopy
 from pathlib import Path
 
-from models import (
-    DONE,
-    MASK64,
-    WAITING,
-    Model,
-    empty_state,
-    flow_counters,
-    frame,
-    item,
-    packed_snapshot,
-    public_expected,
-    transformed,
-)
+if __package__:
+    from .models import (
+        DONE,
+        MASK64,
+        WAITING,
+        Model,
+        empty_state,
+        flow_counters,
+        frame,
+        item,
+        packed_snapshot,
+        public_expected,
+        transformed,
+    )
+else:
+    from models import (
+        DONE,
+        MASK64,
+        WAITING,
+        Model,
+        empty_state,
+        flow_counters,
+        frame,
+        item,
+        packed_snapshot,
+        public_expected,
+        transformed,
+    )
 
 
 class Program:

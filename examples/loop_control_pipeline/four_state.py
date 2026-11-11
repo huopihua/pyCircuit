@@ -139,9 +139,11 @@ rtl = [
 ]
 rtl.sort(key=lambda path: (path.name != "design_top.sv", str(path)))
 primitives = sorted((include / "verilog").glob("*.v"))
-cpp_receipt_path = main_build / "cpp/generated.json"
+cpp_receipt_path = main_build / "structural-cpp/generated.json"
 cpp_receipt = json.loads(cpp_receipt_path.read_text())
-cpp_files = [main_build / "cpp" / row["path"] for row in cpp_receipt["files"]]
+cpp_files = [
+    main_build / "structural-cpp" / row["path"] for row in cpp_receipt["files"]
+]
 inputs = {
     str(path): digest(path)
     for path in [

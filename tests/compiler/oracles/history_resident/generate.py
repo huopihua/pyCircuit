@@ -10,7 +10,10 @@ import json
 from copy import deepcopy
 from pathlib import Path
 
-from models import ResidentModel, completion, entry, event, packed_snapshot, readiness
+if __package__:
+    from .models import ResidentModel, completion, entry, event, packed_snapshot, readiness
+else:
+    from models import ResidentModel, completion, entry, event, packed_snapshot, readiness
 
 
 class Program:

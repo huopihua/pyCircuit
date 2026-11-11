@@ -1,7 +1,7 @@
 // Host calendar/edge oracle; every DUT epoch runs through the shared SystemRunner.
 #include "gfsim/SimExecutor.h"
 #include "gfsim/SystemRunner.h"
-#include "pycircuit_system.hpp"
+#include "design.hpp"
 #include <array>
 #include <cstdlib>
 #include <iostream>
@@ -110,7 +110,7 @@ pyc_dut::Inputs inputs(Row row) {
   in.btn_minus = known<1>(row.minus);
   return in;
 }
-void drive(pyc_root &root, const pyc_dut::Inputs &in) {
+template <class Root> void drive(Root &root, const pyc_dut::Inputs &in) {
   root.pyc_7079635f636c6b = in.pyc_7079635f636c6b;
   root.pyc_7079635f727374 = in.pyc_7079635f727374;
   root.btn_set = in.btn_set; root.btn_plus = in.btn_plus; root.btn_minus = in.btn_minus;
@@ -176,10 +176,10 @@ struct RunnerContext {
   }
 };
 struct Probe {
-  gfsim::WorkExecutor pool;
-  pyc_root root;
+  pyc_dut dut;
+  decltype(dut.root()) root;
   Golden golden;
-  explicit Probe(unsigned workers) : pool(workers), root("probe", &pool) {
+  explicit Probe(unsigned workers) : dut(workers), root(dut.root()) {
     drive(root, inputs({})); root.Reset(); root.Xfer();
   }
   void work(Row row) {

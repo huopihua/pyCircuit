@@ -1,15 +1,13 @@
 # ruff: noqa: N802,F841
-from pycircuit import module, report, rule
-
-from .types import Word
+from pycircuit import report, rule, system, u8 as Word
 
 
-@module
+@system
 def DuplicateReportTop():
     value: Word = 7
 
     @rule
-    def observe_duplicate_report():
+    def observe_duplicate_report() -> None:
         report("same", value)
         report("same", value)
 

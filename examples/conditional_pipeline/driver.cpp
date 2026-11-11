@@ -1,6 +1,6 @@
 #include "gfsim/SimExecutor.h"
 #include "gfsim/SystemRunner.h"
-#include "pycircuit_system.hpp"
+#include "design.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -401,7 +401,7 @@ void step(gfsim::SimExecutor &e) {
   PycircuitModelStepResultV1 r{sizeof(r)};
   require(e.Step(&r) == PYCIRCUIT_MODEL_STATUS_V1_OK);
 }
-void drive(pyc_root &r, const Row &x) {
+template <class Root> void drive(Root &r, const Row &x) {
   auto p = ports(x);
   r.pyc_7079635f636c6b = p.pyc_7079635f636c6b;
   r.pyc_7079635f727374 = p.pyc_7079635f727374;
@@ -410,8 +410,8 @@ void drive(pyc_root &r, const Row &x) {
   r.data = p.data;
 }
 void owner(unsigned workers) {
-  gfsim::WorkExecutor pool(workers);
-  pyc_root r("discard", &pool);
+  pyc_dut probe(workers);
+  auto &r = probe.root();
   r.Build();
   Row x{false, false, false, false, known(7, false)};
   drive(r, x);

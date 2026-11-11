@@ -15,6 +15,7 @@ sys.path[:0] = [
 ]
 
 from pycircuit._driver import _validate_published_program  # noqa: E402
+from pycircuit._emit import emit_command  # noqa: E402
 from pycircuit._generated_bundle import (  # noqa: E402
     _relative_file_path,
     _validate_generated_bundle,
@@ -186,51 +187,20 @@ def preview_files(payload: dict, *, rtl: bool):
 def materialize(final: Path, output: Path, helper: Path) -> None:
     snapshot = final_snapshot(final)
     with tempfile.TemporaryDirectory(prefix="pycircuit-preview-") as temporary:
-        saved = Path(temporary) / "design_top.ac"
+        saved = Path(temporary).resolve() / "design_top.ac"
         saved.write_bytes(snapshot)
-        emitted = subprocess.run(
-            [str(helper), str(saved), "--runner"],
-            capture_output=True,
-            text=True,
-            check=False,
+        # Reuse the production final-ACIR -> independent-HWIR -> bundle path.
+        # The stable snapshot above remains the sole input to both backends.
+        emit_command(
+            final=saved,
+            target="structural-cpp",
+            output=output / "cpp",
+            replace=True,
         )
-        if emitted.returncode:
-            raise ValueError(emitted.stderr.strip() or "native preview emission failed")
-        payload = json.loads(emitted.stdout)
-    # Complete all native generation/path admission before any publication.
-    artifacts = [preview_files(payload, rtl=rtl) for rtl in (False, True)]
-    filesystem = _PublicationFileSystem()
-    output = filesystem.absolute(output)
-    filesystem.assert_no_symlink_chain(output)
-    for target in ("cpp", "verilog"):
-        destination = output / target
-        if destination.exists() or destination.is_symlink():
-            _require_initialized_control(
-                _paths_for(destination, filesystem), filesystem
-            )
-    output.mkdir(parents=True, exist_ok=True)
-    for target, (files, receipt) in zip(("cpp", "verilog"), artifacts, strict=True):
-        owner = _publication_owner_generated(
-            **payload["entry_source"],
-            definition=payload["entry"]["definition"],
-            target=target,
-        )
-
-        def build(stage: Path, files=files, receipt=receipt) -> None:
-            for relative, (content, _role) in files.items():
-                path = stage / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(content, encoding="utf-8")
-            (stage / "generated.json").write_text(
-                json.dumps(receipt, ensure_ascii=False, separators=(",", ":")) + "\n",
-                encoding="utf-8",
-            )
-
-        _publish_directory(
-            output / target,
-            owner=owner,
-            build=build,
-            validate=_validate_generated_bundle,
+        emit_command(
+            final=saved,
+            target="verilog",
+            output=output / "verilog",
             replace=True,
         )
 

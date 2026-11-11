@@ -11,7 +11,7 @@ def Root():
     value: Word = 3
 
     @rule
-    def tick():
+    def tick() -> None:
         nonlocal value
         value = (value + 1) & 255
 

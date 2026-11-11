@@ -1,7 +1,7 @@
 // Independent eleven-tick table, not the DUT's ordered next-state expressions.
 #include "gfsim/SimExecutor.h"
 #include "gfsim/SystemRunner.h"
-#include "pycircuit_system.hpp"
+#include "design.hpp"
 #include <array>
 #include <cstdlib>
 #include <iostream>
@@ -130,7 +130,7 @@ pyc_dut::Inputs inputs(Row row) {
   in.emergency = known<1>(row.emergency);
   return in;
 }
-void drive(pyc_root &root, const pyc_dut::Inputs &in) {
+template <class Root> void drive(Root &root, const pyc_dut::Inputs &in) {
   root.pyc_7079635f636c6b = in.pyc_7079635f636c6b;
   root.pyc_7079635f727374 = in.pyc_7079635f727374;
   root.go = in.go;
@@ -179,10 +179,10 @@ struct RunnerContext {
   }
 };
 struct Probe {
-  gfsim::WorkExecutor pool;
-  pyc_root root;
+  pyc_dut dut;
+  decltype(dut.root()) root;
   Golden golden;
-  explicit Probe(unsigned workers) : pool(workers), root("probe", &pool) {
+  explicit Probe(unsigned workers) : dut(workers), root(dut.root()) {
     drive(root, inputs({}));
     root.Reset();
     root.Xfer();

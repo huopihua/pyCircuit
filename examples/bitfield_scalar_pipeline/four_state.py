@@ -96,7 +96,7 @@ inputs = {
         main_build / "parallel.stdout",
         receipt_path,
         final_path,
-        main_build / "cpp/generated.json",
+        main_build / "structural-cpp/generated.json",
         *primitives,
         *rtl,
     ]

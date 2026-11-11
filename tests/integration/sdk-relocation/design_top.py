@@ -3,7 +3,7 @@ from pycircuit import bits, rule, system
 
 
 @rule
-def transfer_output(outgoing, count):
+def transfer_output(outgoing, count) -> None:
     outgoing = count  # noqa: F841
 
 

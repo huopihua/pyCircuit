@@ -25,7 +25,11 @@ if(PYC_BUILD_RUNTIME_LIB)
   add_subdirectory(runtime)
 endif()
 if(PYC_BUILD_COMPILER_DEV)
-  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  # CompilerDev and its source-identifier oracle share one reproducible
+  # CPython/UCD contract. Reject a different patch release during configure
+  # instead of discovering the mismatch in the test suite.
+  set(Python3_FIND_IMPLEMENTATIONS CPython)
+  find_package(Python3 3.14.6 EXACT REQUIRED COMPONENTS Interpreter)
   find_package(LLVM 22.1.8 EXACT CONFIG REQUIRED)
   find_package(MLIR 22.1.8 EXACT CONFIG REQUIRED)
   set(PYCIRCUIT_BUILD_TESTING "${PYC_BUILD_TESTING}" CACHE BOOL "Build native tests" FORCE)

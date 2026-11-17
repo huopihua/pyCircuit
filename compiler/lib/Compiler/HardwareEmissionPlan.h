@@ -257,6 +257,8 @@ struct HardwareEmissionPlan {
   std::optional<HardwareEmissionExecutionPlan> execution;
   llvm::SmallVector<std::string, 0> systemSamples;
   bool needsFourState = false;
+  /// Frozen package-scope nominal and static type queries.
+  llvm::SmallVector<HardwareEmissionTypeQueryPlan, 0> packageTypes;
   llvm::SmallVector<HardwareEmissionDefinitionPlan, 0> definitions;
   llvm::SmallVector<mlir::Operation *, 0> nominalDeclarations;
   llvm::SmallVector<HardwareEmissionPrimitivePlan, 0> primitives;

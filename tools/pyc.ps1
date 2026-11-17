@@ -19,7 +19,7 @@ Environment parity with the bash wrapper:
   PYC_BUILD_DIR              Optional build directory override.
   PYC_INSTALL_PREFIX         Optional install prefix override.
   PYC_BUILD_TESTING         Build native compiler tests (ON by default).
-  PYC_PYTHON_EXECUTABLE      Optional exact Python interpreter for the SDK.
+  PYC_PYTHON_EXECUTABLE      CPython 3.14.6 interpreter for the SDK.
 
 The bash wrapper supports `build` and `smoke`. Only `build` has a supported
 Windows implementation here; every other subcommand fails explicitly instead
@@ -73,7 +73,7 @@ Env:
   PYC_BUILD_DIR             Optional build directory override.
   PYC_INSTALL_PREFIX        Optional install prefix override.
   PYC_BUILD_TESTING         Build native compiler tests (ON by default).
-  PYC_PYTHON_EXECUTABLE     Optional exact Python interpreter for the SDK.
+  PYC_PYTHON_EXECUTABLE     CPython 3.14.6 interpreter for the SDK.
 
 Unsupported on Windows:
   smoke                     The bash-only simulation and example flows are not

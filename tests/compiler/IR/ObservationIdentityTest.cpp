@@ -1,6 +1,7 @@
 #include "Compiler/HardwareEmitCommon.h"
 #include "Dialect/ACIR/ACIRSourceContracts.h"
 #include "Dialect/ACIR/HardwareSourceChecks.h"
+#include "HardwareEmitTestContext.h"
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Diagnostics.h"
@@ -368,8 +369,10 @@ TEST_F(ObservationIdentityTest,
   finish(root);
   system(root);
 
-  ac::HardwareAnalysis analysis(*package);
-  acir::compiler::HardwareEmitContext emitter(*package, analysis);
+  auto prepared =
+      acir::compiler::test::HardwareEmitTestContext::prepare(*package);
+  ASSERT_TRUE(succeeded(prepared)) << diagnostics;
+  auto &emitter = (*prepared)->emitter();
   ASSERT_TRUE(succeeded(emitter.prepareNativeChecks())) << diagnostics;
   auto emission = acir::compiler::observationEmissionPlan(emitter);
   ASSERT_TRUE(succeeded(emission)) << diagnostics;
@@ -402,8 +405,10 @@ TEST_F(ObservationIdentityTest,
   finish(root);
   system(root);
 
-  ac::HardwareAnalysis analysis(*package);
-  acir::compiler::HardwareEmitContext emitter(*package, analysis);
+  auto prepared =
+      acir::compiler::test::HardwareEmitTestContext::prepare(*package);
+  ASSERT_TRUE(succeeded(prepared)) << diagnostics;
+  auto &emitter = (*prepared)->emitter();
   ASSERT_TRUE(succeeded(emitter.prepareNativeChecks())) << diagnostics;
   auto emission = acir::compiler::observationEmissionPlan(emitter);
   ASSERT_TRUE(succeeded(emission)) << diagnostics;
@@ -596,8 +601,10 @@ TEST_F(ObservationIdentityTest,
 
   ASSERT_EQ(relocated.getPath().getDefiningOp()->getParentOp(),
             root.getOperation());
-  ac::HardwareAnalysis analysis(*package);
-  acir::compiler::HardwareEmitContext emitter(*package, analysis);
+  auto prepared =
+      acir::compiler::test::HardwareEmitTestContext::prepare(*package);
+  ASSERT_TRUE(succeeded(prepared)) << diagnostics;
+  auto &emitter = (*prepared)->emitter();
   ASSERT_TRUE(succeeded(emitter.prepareNativeChecks())) << diagnostics;
   auto emission = acir::compiler::observationEmissionPlan(emitter);
   ASSERT_TRUE(succeeded(emission)) << diagnostics;
@@ -687,10 +694,9 @@ TEST_F(ObservationIdentityTest,
   system(root);
 
   ASSERT_TRUE(succeeded(plan())) << diagnostics;
-  ac::HardwareAnalysis analysis(*package);
-  acir::compiler::HardwareEmitContext emitter(*package, analysis);
-  ASSERT_TRUE(succeeded(emitter.prepareNativeChecks())) << diagnostics;
-  EXPECT_TRUE(failed(acir::compiler::observationEmissionPlan(emitter)));
+  auto prepared =
+      acir::compiler::test::HardwareEmitTestContext::prepare(*package);
+  EXPECT_TRUE(failed(prepared));
 }
 
 TEST_F(ObservationIdentityTest, OwnerPathCannotCrossCollection) {

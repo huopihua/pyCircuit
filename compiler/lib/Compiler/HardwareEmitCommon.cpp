@@ -1210,6 +1210,9 @@ template <class Callback>
 bool withEmissionQueries(const HardwareEmissionPlan &plan,
                          const ac::HardwareBindings &bindings,
                          Callback callback) {
+  if (!bindings.owner && bindings.integers.empty() && bindings.types.empty() &&
+      callback({}, plan.packageTypes))
+    return true;
   for (const HardwareEmissionModulePlan &module : plan.modules) {
     if (module.diagnosticAnchor == bindings.owner &&
         module.concreteBindings.integers.size() == bindings.integers.size() &&

@@ -1,6 +1,7 @@
 #include "Compiler/HardwareEmitCommon.h"
 #include "Dialect/ACIR/HardwareSampledAdmission.h"
 #include "Dialect/ACIR/HardwareSourceCheckPreflight.h"
+#include "HardwareEmitTestContext.h"
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Diagnostics.h"
@@ -1840,9 +1841,12 @@ TEST_F(HardwareSampledAdmissionWiringTest,
        NativeEmitterPreparationAdmitsSampledLifecycleOnlyThroughItsOwnedGate) {
   build(false);
   auto prepare = [&](bool native) {
-    ac::HardwareAnalysis analysis(*package);
-    acir::compiler::HardwareEmitContext emitter(*package, analysis);
-    return native ? emitter.prepareNativeChecks() : emitter.prepare();
+    auto prepared =
+        acir::compiler::test::HardwareEmitTestContext::prepare(*package);
+    if (failed(prepared))
+      return failure();
+    return native ? (*prepared)->emitter().prepareNativeChecks()
+                  : (*prepared)->emitter().prepare();
   };
   EXPECT_TRUE(failed(capture([&] { return prepare(false); })));
   EXPECT_NE(diagnostics.find("hardware instrumentation emission is not "

@@ -10,7 +10,7 @@ C++ models.
 | --- | --- |
 | Author and compile Python sources | Python 3.11+, pyCircuit Python package, native compiler installed from a CompilerDev build |
 | Build and run generated C++ | CMake 3.25+, Ninja, C++20 compiler, installed Runtime |
-| Develop the compiler | Above, plus LLVM and MLIR exactly 22.1.8 |
+| Develop the compiler | Above, plus CPython exactly 3.14.6 and LLVM/MLIR exactly 22.1.8 |
 | Emit Verilog | CompilerDev build; downstream Verilog simulation tools are separate |
 
 Typed modules, state variables and rules use one Python frontend. Generated
@@ -37,7 +37,9 @@ pycircuit --help
 ```
 
 `PYC_BUILD_COMPILER_DEV` enables the native source compiler and requires exact
-LLVM/MLIR 22.1.8. `PYC_BUILD_TESTING` controls native compiler test targets.
+CPython 3.14.6 and LLVM/MLIR 22.1.8. Set `Python3_EXECUTABLE` (or
+`PYC_PYTHON_EXECUTABLE` when using `tools/pyc`) to the CPython 3.14.6
+interpreter. `PYC_BUILD_TESTING` controls native compiler test targets.
 `PYC_BUILD_RUNTIME_LIB` controls the generated-model runtime. The install prefix
 contains the `pycircuit` driver, Python capture package, CMake package metadata,
 and enabled native libraries.

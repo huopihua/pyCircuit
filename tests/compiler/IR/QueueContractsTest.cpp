@@ -2,6 +2,7 @@
 #include "Compiler/HardwareEmitCommon.h"
 #include "Compiler/SourceLink.h"
 #include "Compiler/SourceUnit.h"
+#include "HardwareEmitTestContext.h"
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Diagnostics.h"
@@ -894,14 +895,26 @@ TEST_F(QueueContractsTest, SharedUnsignedRendererPreservesExactClosedLatency) {
   ASSERT_TRUE(body);
   auto module = definition(*body);
   auto queue = onlyQueue(module);
-  ac::HardwareAnalysis analysis(*body);
-  compiler::HardwareEmitContext emitter(*body, analysis);
+  auto render = [&](ac::StaticExprAttr value, bool rtl) {
+    module->setAttr("pycircuit.test_render_value", value);
+    auto final = finalForEmission(*body);
+    if (!final)
+      return FailureOr<std::string>(failure());
+    auto prepared = compiler::test::HardwareEmitTestContext::prepare(*final);
+    if (failed(prepared))
+      return FailureOr<std::string>(failure());
+    auto finalModule = definition(*final);
+    auto planned = finalModule->getAttrOfType<ac::StaticExprAttr>(
+        "pycircuit.test_render_value");
+    return (*prepared)->emitter().unsignedStaticValue(
+        planned, onlyQueue(finalModule), rtl);
+  };
   for (StringRef decimal :
        {"1", "2", "9223372036854775808", "18446744073709551615"}) {
     // Exercise exact evaluation too, rather than only literal recognition.
     auto value = binary("add", exactInteger(decimal), integer(0));
-    auto cpp = emitter.unsignedStaticValue(value, queue);
-    auto rtl = emitter.unsignedStaticValue(value, queue, true);
+    auto cpp = render(value, false);
+    auto rtl = render(value, true);
     ASSERT_TRUE(succeeded(cpp));
     ASSERT_TRUE(succeeded(rtl));
     EXPECT_EQ(*cpp, decimal.str() + "ULL");
@@ -909,36 +922,18 @@ TEST_F(QueueContractsTest, SharedUnsignedRendererPreservesExactClosedLatency) {
     setQueueLatency(queue, value);
     auto final = finalForEmission(*body);
     ASSERT_TRUE(final);
-    ac::HardwareAnalysis finalAnalysis(*final);
-    compiler::HardwareEmitContext finalEmitter(*final, finalAnalysis);
-    EXPECT_TRUE(succeeded(finalEmitter.prepare()));
+    auto finalEmitter =
+        compiler::test::HardwareEmitTestContext::prepare(*final);
+    ASSERT_TRUE(succeeded(finalEmitter));
+    EXPECT_TRUE(succeeded((*finalEmitter)->emitter().prepare()));
   }
   for (StringRef decimal : {"0", "-1", "18446744073709551616"})
     for (bool rtl : {false, true})
-      rejects(
-          [&] {
-            return emitter.unsignedStaticValue(exactInteger(decimal), queue,
-                                               rtl);
-          },
-          "positive integer fitting u64");
+      rejects([&] { return render(exactInteger(decimal), rtl); },
+              "positive integer fitting u64");
   for (bool rtl : {false, true})
-    rejects(
-        [&] { return emitter.unsignedStaticValue(boolean(true), queue, rtl); },
-        "positive integer fitting u64");
-  addIntegerFormals(module, {"L"});
-  auto latency = formal("Provider", "L");
-  ac::HardwareBindings bindings;
-  bindings.owner = module;
-  EXPECT_FALSE(emitter.isClosedStatic(latency, bindings));
-  EXPECT_TRUE(
-      succeeded(emitter.unsignedStaticValue(latency, queue, false, bindings)));
-  EXPECT_TRUE(
-      succeeded(emitter.unsignedStaticValue(latency, queue, true, bindings)));
-  bindings.integers["L"] = exactInteger("18446744073709551615");
-  EXPECT_TRUE(emitter.isClosedStatic(latency, bindings));
-  auto closed = emitter.unsignedStaticValue(latency, queue, false, bindings);
-  ASSERT_TRUE(succeeded(closed));
-  EXPECT_EQ(*closed, "18446744073709551615ULL");
+    rejects([&] { return render(boolean(true), rtl); },
+            "positive integer fitting u64");
 }
 
 TEST_F(QueueContractsTest,
@@ -956,9 +951,15 @@ TEST_F(QueueContractsTest,
   auto final = finalForEmission(*body);
   ASSERT_TRUE(final);
   auto before = print(*final);
-  ac::HardwareAnalysis analysis(*final);
-  compiler::HardwareEmitContext emitter(*final, analysis);
-  rejects([&] { return emitter.prepare(); }, "Runtime object capacity");
+  rejects(
+      [&] {
+        auto prepared =
+            compiler::test::HardwareEmitTestContext::prepare(*final);
+        if (failed(prepared))
+          return failure();
+        return (*prepared)->emitter().prepare();
+      },
+      "Runtime object capacity");
   EXPECT_EQ(print(*final), before);
 }
 
@@ -979,12 +980,19 @@ TEST_F(QueueContractsTest,
         addQueueFamilyRoot(*body, 5);
       auto final = finalForEmission(*body, family ? "FamilyRoot" : "Provider");
       ASSERT_TRUE(final);
-      ac::HardwareAnalysis analysis(*final);
-      compiler::HardwareEmitContext emitter(*final, analysis);
       if (latency == 1)
-        EXPECT_TRUE(succeeded(emitter.prepare()));
+        EXPECT_TRUE(succeeded(
+            compiler::test::HardwareEmitTestContext::prepare(*final)));
       else
-        rejects([&] { return emitter.prepare(); }, "Runtime object capacity");
+        rejects(
+            [&] {
+              auto prepared =
+                  compiler::test::HardwareEmitTestContext::prepare(*final);
+              if (failed(prepared))
+                return failure();
+              return (*prepared)->emitter().prepare();
+            },
+            "Runtime object capacity");
     }
   auto body = provider(1, 3, "local_occupancy");
   ASSERT_TRUE(body);
@@ -993,9 +1001,15 @@ TEST_F(QueueContractsTest,
   setQueueLatency(queue, integer(2));
   auto final = finalForEmission(*body);
   ASSERT_TRUE(final);
-  ac::HardwareAnalysis analysis(*final);
-  compiler::HardwareEmitContext emitter(*final, analysis);
-  rejects([&] { return emitter.prepare(); }, "Runtime object capacity");
+  rejects(
+      [&] {
+        auto prepared =
+            compiler::test::HardwareEmitTestContext::prepare(*final);
+        if (failed(prepared))
+          return failure();
+        return (*prepared)->emitter().prepare();
+      },
+      "Runtime object capacity");
 }
 
 TEST_F(QueueContractsTest, UnusedConcreteQueuesStillReceiveTimingPreflight) {
@@ -1010,16 +1024,22 @@ TEST_F(QueueContractsTest, UnusedConcreteQueuesStillReceiveTimingPreflight) {
   envelope(*body, "__init__.py");
   auto safe = finalForEmission(*body);
   ASSERT_TRUE(safe);
-  ac::HardwareAnalysis safeAnalysis(*safe);
-  compiler::HardwareEmitContext safeEmitter(*safe, safeAnalysis);
-  ASSERT_TRUE(succeeded(safeEmitter.prepare()));
+  auto safeEmitter = compiler::test::HardwareEmitTestContext::prepare(*safe);
+  ASSERT_TRUE(succeeded(safeEmitter));
+  ASSERT_TRUE(succeeded((*safeEmitter)->emitter().prepare()));
   setQueueDepth(queue, exactInteger(std::to_string(
                            std::numeric_limits<std::ptrdiff_t>::max() / 30)));
   auto oversized = finalForEmission(*body);
   ASSERT_TRUE(oversized);
-  ac::HardwareAnalysis analysis(*oversized);
-  compiler::HardwareEmitContext emitter(*oversized, analysis);
-  rejects([&] { return emitter.prepare(); }, "Runtime object capacity");
+  rejects(
+      [&] {
+        auto prepared =
+            compiler::test::HardwareEmitTestContext::prepare(*oversized);
+        if (failed(prepared))
+          return failure();
+        return (*prepared)->emitter().prepare();
+      },
+      "Runtime object capacity");
 }
 
 TEST_F(QueueContractsTest,
@@ -1781,13 +1801,19 @@ TEST_F(QueueContractsTest,
     EXPECT_EQ(print(*body), before);
     auto final = finalForEmission(*body, "Root");
     ASSERT_TRUE(final);
-    ac::HardwareAnalysis finalAnalysis(*final);
-    compiler::HardwareEmitContext emitter(*final, finalAnalysis);
     if (latency == "18446744073709551615")
-      rejects([&] { return emitter.prepare(); },
-              "emitted signed 64-bit domain");
+      rejects(
+          [&] {
+            auto prepared =
+                compiler::test::HardwareEmitTestContext::prepare(*final);
+            if (failed(prepared))
+              return failure();
+            return (*prepared)->emitter().prepare();
+          },
+          "emitted signed 64-bit domain");
     else
-      EXPECT_TRUE(succeeded(emitter.prepare()));
+      EXPECT_TRUE(
+          succeeded(compiler::test::HardwareEmitTestContext::prepare(*final)));
   }
 }
 

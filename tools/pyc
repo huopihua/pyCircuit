@@ -11,14 +11,15 @@ usage() {
 Usage: tools/pyc <build|smoke>
 
 build configures and installs the pyCircuit source compiler and pyc6 runtime.
-The compiler requires LLVM/MLIR 22.1.8 exactly. Set LLVM_DIR and MLIR_DIR, or
-provide llvm-config-22 (or LLVM_CONFIG) from that installation.
+The compiler requires CPython 3.14.6 and LLVM/MLIR 22.1.8 exactly. Set
+PYC_PYTHON_EXECUTABLE to that CPython interpreter. Set LLVM_DIR and MLIR_DIR,
+or provide llvm-config-22 (or LLVM_CONFIG) from that installation.
 
 Environment:
   PYC_BUILD_DIR             Build directory (default: .pycircuit_out/toolchain/build)
   PYC_INSTALL_PREFIX        Install prefix (default: .pycircuit_out/toolchain/install)
   PYC_BUILD_TESTING         Native compiler tests, ON by default for this gate
-  PYC_PYTHON_EXECUTABLE     Python interpreter used by CMake
+  PYC_PYTHON_EXECUTABLE     CPython 3.14.6 interpreter used by CMake
 EOF
 }
 

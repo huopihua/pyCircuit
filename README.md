@@ -117,7 +117,7 @@ Traceability, behavioral validation and specification approval remain distinct.
 
 | Task | Requirements |
 | --- | --- |
-| Build the compiler | Python 3.11+, CMake 3.25+, Ninja, a C++20 compiler, LLVM and MLIR **22.1.8** |
+| Build the compiler | CPython **3.14.6**, CMake 3.25+, Ninja, a C++20 compiler, LLVM and MLIR **22.1.8** |
 | Run generated C++ | C++20 toolchain, CMake/Ninja and pyCircuit Runtime |
 | Run generated Verilog systems | Installed pyCircuit compiler, Verilator, CMake/Ninja and a C++20 toolchain |
 

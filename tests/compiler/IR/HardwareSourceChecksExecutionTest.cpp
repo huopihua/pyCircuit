@@ -4,6 +4,7 @@
 // the local observation case verifies common native IR semantics directly.
 #include "Compiler/HardwareEmitCommon.h"
 #include "Compiler/HardwareEmitCppChecks.h"
+#include "HardwareEmitTestContext.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "pycircuit/Dialect/ACIR/ACIRDialect.h"
@@ -82,8 +83,11 @@ bool emitNative(const std::string &caseName, const std::string &final,
         final, ParserConfig(&context, /*verifyAfterParse=*/false));
     if (!package)
       return false;
-    ac::HardwareAnalysis analysis(*package);
-    acir::compiler::HardwareEmitContext emitter(*package, analysis);
+    auto prepared =
+        acir::compiler::test::HardwareEmitTestContext::prepare(*package);
+    if (failed(prepared))
+      return false;
+    auto &emitter = (*prepared)->emitter();
     if (failed(emitter.prepareNativeChecks()))
       return false;
     const auto &plan = emitter.sourceChecks();

@@ -154,10 +154,56 @@ public:
       return failure();
     plan.rootModule = *rootIndex;
 
+    // Every non-generic definition emits a concrete scalar wrapper even when
+    // it is not reachable from the selected root. Materialize the same closure
+    // that HardwareEmitContext::prepare() validates so all backend queries are
+    // served by the frozen plan.
+    for (ac::ModuleOp definition : analysis.getDefinitions()) {
+      if (!definition.getParameters().empty() ||
+          !definition.getTypeParameters().empty())
+        continue;
+      ac::HardwareBindings bindings;
+      bindings.owner = definition;
+      if (failed(visit(definition, bindings)))
+        return failure();
+    }
+
     if (failed(buildEntry(root, logicalRoot)) || failed(buildChecks()) ||
         failed(buildDefinitions()) || failed(buildPrimitives()) ||
         failed(buildSourceUnits()))
       return failure();
+    ac::HardwareBindings packageBindings;
+    if (failed(buildQueries(package, packageBindings, packageStaticValues,
+                            plan.packageTypes)))
+      return failure();
+    for (Operation *declaration : plan.nominalDeclarations) {
+      Type nominal;
+      if (auto structure = dyn_cast<ac::StructOp>(declaration))
+        nominal = ac::StructType::get(package.getContext(),
+                                      structure.getSymNameAttr());
+      else if (auto enumeration = dyn_cast<ac::EnumOp>(declaration))
+        nominal = ac::EnumType::get(package.getContext(),
+                                    enumeration.getSymNameAttr());
+      if (!nominal)
+        continue;
+      auto width =
+          analysis.getPackedWidth(nominal, packageBindings, declaration);
+      auto paths =
+          analysis.getFieldPaths(nominal, packageBindings, declaration);
+      if (failed(width) || failed(paths))
+        return failure();
+      HardwareEmissionTypeQueryPlan query;
+      query.source = nominal;
+      query.resolved = nominal;
+      query.packedWidth = *width;
+      for (const ac::FieldPath &path : *paths) {
+        llvm::SmallVector<std::string, 2> stored;
+        for (StringAttr component : path)
+          stored.push_back(component.getValue().str());
+        query.fieldPaths.push_back(std::move(stored));
+      }
+      plan.packageTypes.push_back(std::move(query));
+    }
     buildExecutionMetadata();
     if (failed(buildSystemMetadata(root)))
       return failure();
@@ -166,6 +212,9 @@ public:
   }
 
 private:
+  // Package-scope queries have no occurrence bindings but still must be frozen
+  // for nominal type widths used by target capability checks.
+  llvm::SmallVector<HardwareEmissionStaticPlan, 0> packageStaticValues;
   LogicalResult buildQueries(
       Operation *root, const ac::HardwareBindings &bindings,
       llvm::SmallVectorImpl<HardwareEmissionStaticPlan> &staticValues,
@@ -205,7 +254,13 @@ private:
         HardwareEmissionTypeQueryPlan query;
         query.source = type;
         auto formal = dyn_cast<ac::TypeParamType>(type);
-        if (formal && !bindings.types.contains(formal.getName().getValue())) {
+        bool hasUnboundFormal = false;
+        type.walk([&](Type nested) {
+          if (auto parameter = dyn_cast<ac::TypeParamType>(nested))
+            hasUnboundFormal |=
+                !bindings.types.contains(parameter.getName().getValue());
+        });
+        if (hasUnboundFormal) {
           query.resolved = type;
           types.push_back(std::move(query));
           return success();
@@ -221,21 +276,23 @@ private:
         if (auto table = dyn_cast<ac::TableType>(type))
           for (Attribute extent : table.getShape())
             concreteWidth &= analysis.isStaticEvaluable(extent, bindings);
-        if (concreteWidth &&
-            analysis.isStaticEvaluable(TypeAttr::get(type), bindings)) {
+        concreteWidth &=
+            isa<ac::StructType, ac::EnumType>(type) ||
+            analysis.isStaticEvaluable(TypeAttr::get(type), bindings);
+        if (concreteWidth) {
           auto width = analysis.getPackedWidth(type, bindings, site);
           if (failed(width))
             return failure();
           query.packedWidth = *width;
-        }
-        auto paths = analysis.getFieldPaths(type, bindings, site);
-        if (failed(paths))
-          return failure();
-        for (const ac::FieldPath &path : *paths) {
-          llvm::SmallVector<std::string, 2> stored;
-          for (StringAttr component : path)
-            stored.push_back(component.getValue().str());
-          query.fieldPaths.push_back(std::move(stored));
+          auto paths = analysis.getFieldPaths(type, bindings, site);
+          if (failed(paths))
+            return failure();
+          for (const ac::FieldPath &path : *paths) {
+            llvm::SmallVector<std::string, 2> stored;
+            for (StringAttr component : path)
+              stored.push_back(component.getValue().str());
+            query.fieldPaths.push_back(std::move(stored));
+          }
         }
         types.push_back(std::move(query));
       }
@@ -599,15 +656,16 @@ private:
       child.concreteBindings = *childBindings;
       if (auto queue = dyn_cast<ac::InstanceOp>(operation);
           queue && ac::isQueueInstance(queue)) {
-        auto config = analysis.resolveQueue(queue, *childBindings);
+        auto config = analysis.resolveQueue(queue, bindings);
         if (failed(config))
           return failure();
-        auto elementWidth = analysis.getPackedWidth(
-            config->tokenElementType, *childBindings, &operation);
-        if (failed(elementWidth))
-          return failure();
+        if (!config->tokenCardinality ||
+            config->packedWidth % config->tokenCardinality)
+          return operation.emitOpError()
+                 << "queue token geometry is not evenly packed";
         child.queue = HardwareEmissionQueuePlan{
-            config->depth, config->tokenCardinality, *elementWidth,
+            config->depth, config->tokenCardinality,
+            config->packedWidth / config->tokenCardinality,
             config->availabilityLatency};
       }
       child.primitiveKind = analysis.getPrimitiveKind(callee).str();
@@ -866,7 +924,8 @@ private:
       if (failed(independent))
         return failure();
       item.independentWorkChildren = std::move(*independent);
-      if (failed(buildDependencies(definition, templateBindings,
+      if (definition.getTypeParameters().empty() &&
+          failed(buildDependencies(definition, templateBindings,
                                    item.dependencies)))
         return failure();
       if (failed(buildQueries(definition, templateBindings, item.staticValues,
@@ -1055,7 +1114,6 @@ LogicalResult verifyHardwareEmissionPlan(const HardwareEmissionPlan &plan) {
           plan.modules[plan.rootModule].key.definition ||
       plan.entry.logicalDefinition.empty() || !plan.entry.sourceOwner)
     return error() << "hardware emission plan has an invalid entry";
-
   llvm::DenseSet<Operation *> definitions;
   for (const HardwareEmissionDefinitionPlan &definition : plan.definitions) {
     const HardwareEmissionDefinitionNames &names = definition.names;

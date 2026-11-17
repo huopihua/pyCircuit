@@ -1,6 +1,6 @@
 #ifndef PYCIRCUIT_FINAL_CPP_SOURCE_PARTS_H
 #define PYCIRCUIT_FINAL_CPP_SOURCE_PARTS_H
-#include "pycircuit/Dialect/ACIR/HardwareAnalysis.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -15,9 +15,5 @@ struct FinalCppSourceParts {
   std::string simulationMain, simulationConfig, portMap;
   uint64_t sourceCheckCount = 0;
 };
-mlir::FailureOr<FinalCppSourceParts> emitCppSourceParts(
-    mlir::ModuleOp package, ac::HardwareAnalysis &analysis);
-mlir::LogicalResult emitCpp(mlir::ModuleOp package,
-    ac::HardwareAnalysis &analysis, llvm::raw_ostream &out);
 } // namespace acir::compiler
 #endif

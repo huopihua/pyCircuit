@@ -164,6 +164,10 @@ set_tests_properties(ACIRHardwareSourceChecksExecution PROPERTIES
 
 add_acir_api_test(ACIREnumHardwareAnalysisTests EnumHardwareAnalysisTest.cpp)
 target_link_libraries(ACIREnumHardwareAnalysisTests PRIVATE ACIRAnalysis)
+add_acir_api_test(ACIRHardwareEmissionPlanTests HardwareEmissionPlanTest.cpp)
+target_link_libraries(ACIRHardwareEmissionPlanTests PRIVATE ACIRCodegen)
+target_compile_definitions(ACIRHardwareEmissionPlanTests PRIVATE
+  PYCIRCUIT_TEST_REPO_ROOT="${PYCIRCUIT_REPO_ROOT}")
 add_acir_api_test(ACIRFinalSourceUnitsTests FinalSourceUnitsTest.cpp)
 target_link_libraries(ACIRFinalSourceUnitsTests PRIVATE ACIRAnalysis)
 add_acir_api_test(ACIREnumSourceUnitAuthorityTests EnumSourceUnitAuthorityTest.cpp)
@@ -263,7 +267,7 @@ add_custom_target(check-pycircuit
   ACIRTransactionSurfaceTiersTests
     ACIRTableDependencySummaryTests
     ACIRHardwareSourceChecksTests
-    ACIREnumHardwareAnalysisTests
+    ACIREnumHardwareAnalysisTests ACIRHardwareEmissionPlanTests
     ACIRFinalSourceUnitsTests ACIREnumSourceUnitAuthorityTests
     ACIRRegRuntimeTests ACIRCollectionRuntimeTests ACIRFifoRuntimeTests ACIRSystemLifecycleTests ACIRObservationTests ACIRSimExecutorTests
     ACIRWorkExecutorTests

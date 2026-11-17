@@ -45,8 +45,7 @@ public:
       }
       expression = "(" + *width + ")'(" + *literal + ")";
     } else if (auto create = dyn_cast<ac::EnumCreateOp>(op)) {
-      auto enumeration =
-          context.analysis.resolveEnum(create.getResult().getType(), op);
+      auto enumeration = context.resolveEnum(create.getResult().getType(), op);
       if (failed(enumeration))
         return failure();
       for (const auto &member : enumeration->members)
@@ -421,8 +420,7 @@ public:
     if (isa<ac::ValueRequireOp>(op))
       expression = "(" + operands[1] + " ? " + operands[0] + " : 1'b1)";
     else if (auto create = dyn_cast<ac::EnumCreateOp>(op)) {
-      auto definition =
-          context.analysis.resolveEnum(create.getResult().getType(), op);
+      auto definition = context.resolveEnum(create.getResult().getType(), op);
       if (failed(definition))
         return failure();
       for (const auto &member : definition->members)
@@ -439,7 +437,7 @@ public:
         expression = operands[0];
       else {
         auto definition =
-            context.analysis.resolveEnum(fromBits.getValue().getType(), op);
+            context.resolveEnum(fromBits.getValue().getType(), op);
         if (failed(definition))
           return failure();
         for (const auto &member : definition->members) {
@@ -850,8 +848,7 @@ public:
       };
       ac::HardwareBindings bindings;
       bindings.owner = definition;
-      auto leaves = context.analysis.getFieldPaths(merge.getBase().getType(),
-                                                   bindings, op);
+      auto leaves = context.fieldPaths(merge.getBase().getType(), bindings);
       if (failed(leaves))
         return failure();
       // Empty-path whole-Table merge selects the complete packed value.
@@ -861,7 +858,7 @@ public:
       for (auto path : *leaves) {
         Type type = merge.getBase().getType();
         for (size_t i = 0; i < path.size(); ++i) {
-          auto resolved = context.analysis.resolveType(type, bindings, op);
+          auto resolved = context.resolvedType(type, bindings);
           if (failed(resolved))
             return failure();
           if (isa<ac::TableType>(*resolved)) {
@@ -870,7 +867,7 @@ public:
           }
           auto record = dyn_cast<ac::StructType>(*resolved);
           auto declaration =
-              record ? context.analysis.lookupStruct(record) : ac::StructOp();
+              record ? context.lookupStruct(record) : ac::StructOp();
           if (!declaration)
             return op->emitOpError() << "RTL merge has unresolved field path";
           auto fields = declaration.getFields();
@@ -990,17 +987,14 @@ public:
       Operation *occurrence = &operation;
       bool collection = isa<ac::CollectionOp>(operation);
       auto *callee =
-          collection
-              ? context.analysis.resolveCallee(
-                    cast<ac::CollectionOp>(operation))
-              : context.analysis.resolveCallee(cast<ac::InstanceOp>(operation));
-      auto bindings =
-          collection
-              ? context.analysis.bindInstance(cast<ac::CollectionOp>(operation))
-              : context.analysis.bindInstance(cast<ac::InstanceOp>(operation));
+          collection ? context.resolveCallee(cast<ac::CollectionOp>(operation))
+                     : context.resolveCallee(cast<ac::InstanceOp>(operation));
+      ac::HardwareBindings parent;
+      parent.owner = operation.getParentOp();
+      auto bindings = context.bindOccurrence(&operation, parent);
       if (failed(bindings))
         return failure();
-      auto kind = context.analysis.getPrimitiveKind(callee);
+      auto kind = context.primitiveKind(callee);
       bool managedPrimitive = false;
       if ((context.managesChecks() || context.isPhysical()) && !kind.empty())
         managedPrimitive =

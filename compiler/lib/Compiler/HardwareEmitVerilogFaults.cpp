@@ -125,8 +125,7 @@ LogicalResult descend(HardwareEmitContext &context, Address &address,
     return failure();
   address.logical += "/" + raw.getValue().str();
   if (auto collection = dyn_cast<ac::CollectionOp>(allocation)) {
-    auto shape = context.analysis.resolveShape(collection.getShape(),
-                                               address.bindings, collection);
+    auto shape = context.occurrenceShape(collection, address.bindings);
     if (failed(shape))
       return failure();
     uint64_t lane = 0;
@@ -136,11 +135,7 @@ LogicalResult descend(HardwareEmitContext &context, Address &address,
     }
     address.rtl += ".pyc_instances_" + *name + "[" + std::to_string(lane) + "]";
   }
-  auto child = isa<ac::InstanceOp>(allocation)
-                   ? context.analysis.bindInstance(
-                         cast<ac::InstanceOp>(allocation), address.bindings)
-                   : context.analysis.bindInstance(
-                         cast<ac::CollectionOp>(allocation), address.bindings);
+  auto child = context.bindOccurrence(allocation, address.bindings);
   if (failed(child))
     return failure();
   address.bindings = std::move(*child);
@@ -254,11 +249,12 @@ LogicalResult relatedControls(HardwareEmitContext &context,
       if (!op || isa<ac::InstanceOp, ac::CollectionOp>(op) ||
           !isa<ac::BitsType>(value.getType()))
         continue;
-      auto width =
-          context.analysis.getPackedWidth(value.getType(), owner.bindings, op);
-      if (failed(width))
-        return failure();
-      if (*width != 1 || reference(context, owner.rtl, value).empty())
+      const auto *type = context.concreteValueType(value, owner.bindings);
+      if (!type)
+        return op->emitOpError()
+               << "physical fault value is absent from the frozen type plan";
+      if (type->packedWidth != 1 ||
+          reference(context, owner.rtl, value).empty())
         continue;
       if (isa<ac::BitsSelectOp, ac::BitsCompareOp, ac::BitsUnaryOp,
               ac::BitsBinaryOp>(op))

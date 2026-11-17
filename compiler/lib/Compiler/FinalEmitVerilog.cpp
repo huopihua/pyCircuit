@@ -1,4 +1,5 @@
 #include "FinalEmitVerilog.h"
+#include "BackendPlanning.h"
 #include "FinalCppNames.h"
 #include "HardwareEmitCommon.h"
 #include "pycircuit/Dialect/ACIR/SourceUnitValidation.h"
@@ -14,7 +15,7 @@ LogicalResult emitEnum(HardwareEmitContext &context, ac::EnumOp declaration,
                        raw_ostream &out) {
   auto type =
       ac::EnumType::get(declaration.getContext(), declaration.getSymNameAttr());
-  auto definition = context.analysis.resolveEnum(type, declaration);
+  auto definition = context.resolveEnum(type, declaration);
   auto name = context.rtlType(type, declaration);
   if (failed(definition) || failed(name))
     return failure();
@@ -108,7 +109,7 @@ FailureOr<ac::ModuleOp> rootModule(HardwareEmitContext &context) {
   auto system = *systems.begin();
   auto symbol = system.getEntry().getAs<FlatSymbolRefAttr>("callee");
   auto root = symbol ? dyn_cast_or_null<ac::ModuleOp>(
-                           context.analysis.lookupDefinition(symbol.getValue()))
+                           context.lookupDefinition(symbol.getValue()))
                      : ac::ModuleOp();
   if (!root)
     return system.emitOpError() << "root module is unresolved";
@@ -601,7 +602,7 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
   bool first = true;
   auto port = [&](StringRef direction, Type type,
                   StringRef name) -> LogicalResult {
-    auto resolved = context.analysis.resolveType(type, *bindings, root);
+    auto resolved = context.resolvedType(type, *bindings);
     if (failed(resolved))
       return failure();
     auto rendered = context.rtlType(*resolved, root);
@@ -705,14 +706,12 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
         return failure();
       expression = std::move(*id);
     } else {
-      auto width = context.analysis.getPackedWidth(signature.getInput(index),
-                                                   *bindings, root);
-      if (failed(width))
-        return failure();
+      const auto &rootPlan = context.plan.modules[context.plan.rootModule];
+      uint64_t width = rootPlan.inputs[index].type.packedWidth;
       auto initial = cast<IntegerAttr>(
           layout->rootInputDefaults[index - layout->sourceInputCount]);
       expression =
-          std::to_string(*width) + "'d" + std::to_string(initial.getInt());
+          std::to_string(width) + "'d" + std::to_string(initial.getInt());
     }
     if (failed(connection(name, expression)))
       return failure();
@@ -762,13 +761,21 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
 }
 } // namespace
 FailureOr<FinalVerilogSourceParts>
-emitVerilogSourceParts(ModuleOp package, ac::HardwareAnalysis &analysis,
-                       bool physical) {
-  HardwareEmitContext context(package, analysis, physical);
+prepareVerilogSourceParts(const VerifiedHardwareEmissionPlan &hardware,
+                          bool physical) {
+  ModuleOp package = hardware->package;
+  const ac::HardwarePhysicalProjection *projection = nullptr;
+  if (physical) {
+    auto planned = BackendPlanningAccess::physicalProjection(hardware);
+    if (failed(planned))
+      return failure();
+    projection = *planned;
+  }
+  HardwareEmitContext context(
+      hardware.get(), BackendPlanningAccess::sourceChecks(hardware),
+      BackendPlanningAccess::observationPlan(hardware), projection, physical);
   const bool system = context.isSystem();
   if (failed(context.prepareNativeChecks()))
-    return failure();
-  if (failed(analysis.verifySourceCheckPlan(context.sourceChecks())))
     return failure();
   auto root = rootModule(context);
   if (failed(root))
@@ -782,9 +789,9 @@ emitVerilogSourceParts(ModuleOp package, ac::HardwareAnalysis &analysis,
     for (Operation &operation : definition.getBody().front()) {
       Operation *callee = nullptr;
       if (auto instance = dyn_cast<ac::InstanceOp>(operation))
-        callee = analysis.resolveCallee(instance);
+        callee = context.resolveCallee(instance);
       else if (auto collection = dyn_cast<ac::CollectionOp>(operation))
-        callee = analysis.resolveCallee(collection);
+        callee = context.resolveCallee(collection);
       if (auto child = dyn_cast_or_null<ac::ModuleOp>(callee))
         pending.push_back(child);
     }
@@ -801,57 +808,29 @@ emitVerilogSourceParts(ModuleOp package, ac::HardwareAnalysis &analysis,
   if (unsupported.wasInterrupted())
     return failure();
   FinalVerilogSourceParts parts;
-  auto portMap = context.rootPortMap();
-  if (failed(portMap))
-    return failure();
-  parts.portMap = std::move(*portMap);
-  parts.sourceCheckCount = context.sourceChecks().checks.size();
   parts.rootRtlName = "pyc_root";
-  llvm::StringSet<> standard;
-  package.walk([&](ac::InstanceOp instance) {
-    if (!ac::isQueueInstance(instance))
-      return;
-    const std::string path = "include/verilog/fifo.v";
-    if (standard.insert(path).second)
-      parts.standardSources.push_back(path);
-  });
-  for (auto imported : package.getOps<ac::ModuleImportOp>()) {
-    auto kind = analysis.getPrimitiveKind(imported);
-    if (kind.empty())
-      return imported.emitOpError()
-             << "unresolved module import in RTL emitter";
-    if (kind == "fifo_local" || kind == "fifo_downstream_pop")
-      continue;
-    std::string path = "include/verilog/" + kind.str() + ".v";
-    if (standard.insert(path).second)
-      parts.standardSources.push_back(path);
-  }
+  parts.standardSources.append(context.plan.standardVerilogSources.begin(),
+                               context.plan.standardVerilogSources.end());
   RtlPackageDependencies dependencies;
   context.rtlPackage = &dependencies;
-  auto emitError = [&] { return package.emitOpError(); };
-  auto units = ac::collectFinalSourceUnits(package, emitError);
-  if (failed(units))
-    return failure();
-  llvm::StringMap<DictionaryAttr> paths;
-  for (const ac::FinalSourceUnitView &unit : *units) {
+  for (const HardwareEmissionSourceUnitPlan &unit : context.plan.sourceUnits) {
     FinalVerilogSourceGroup group;
-    group.sourceOwner = unit.owner;
+    group.sourceOwner = unit.sourceOwner;
+    group.path = unit.verilogPath;
     llvm::raw_string_ostream out(group.text);
-    for (Operation *declaration : unit.declarations)
-      if (auto module = dyn_cast<ac::ModuleOp>(declaration)) {
-        group.path = context.names(module).verilog;
-        group.definitions.push_back(
-            FlatSymbolRefAttr::get(module.getContext(), module.getSymName()));
-        if (failed(emitHardwareVerilogDefinition(context, module, out)))
-          return failure();
-      }
+    for (unsigned definitionIndex : unit.definitionIndices) {
+      auto module = cast<ac::ModuleOp>(
+          context.plan.definitions[definitionIndex].diagnosticAnchor);
+      group.definitions.push_back(
+          FlatSymbolRefAttr::get(module.getContext(), module.getSymName()));
+      if (failed(emitHardwareVerilogDefinition(context, module, out)))
+        return failure();
+    }
     out.flush();
     // Shared nominal typedefs remain in the core. An owner without a module
     // has provenance membership but no source file or placeholder RTL group.
     if (group.definitions.empty())
       continue;
-    if (!paths.try_emplace(group.path, unit.owner).second)
-      return emitError() << "source owner Verilog path collision";
     parts.sourceGroups.push_back(std::move(group));
   }
   {
@@ -873,17 +852,5 @@ emitVerilogSourceParts(ModuleOp package, ac::HardwareAnalysis &analysis,
     return failure();
   parts.core.insert(0, typePackage);
   return parts;
-}
-LogicalResult emitVerilog(ModuleOp package, ac::HardwareAnalysis &analysis,
-                          raw_ostream &out, bool physical) {
-  auto parts = emitVerilogSourceParts(package, analysis, physical);
-  if (failed(parts))
-    return failure();
-  out << parts->core;
-  for (auto &group : parts->sourceGroups)
-    out << group.text;
-  out << parts->runtimeGlue;
-  out << parts->simulationTop;
-  return success();
 }
 } // namespace acir::compiler

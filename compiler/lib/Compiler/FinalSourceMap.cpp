@@ -16,8 +16,8 @@
 
 #include <algorithm>
 #include <array>
-#include <optional>
 #include <functional>
+#include <optional>
 #include <set>
 #include <tuple>
 
@@ -26,12 +26,6 @@ using namespace mlir;
 namespace acir::compiler {
 namespace {
 
-struct OriginRow {
-  std::string operation;
-  std::string origin;
-  std::string location;
-};
-
 bool byteLess(StringRef left, StringRef right) {
   return std::lexicographical_compare(
       left.begin(), left.end(), right.begin(), right.end(), [](char a, char b) {
@@ -39,7 +33,7 @@ bool byteLess(StringRef left, StringRef right) {
       });
 }
 
-bool rowLess(const OriginRow &left, const OriginRow &right) {
+bool rowLess(const FinalSourceOrigin &left, const FinalSourceOrigin &right) {
   if (left.operation != right.operation)
     return byteLess(left.operation, right.operation);
   if (left.origin != right.origin)
@@ -47,7 +41,7 @@ bool rowLess(const OriginRow &left, const OriginRow &right) {
   return byteLess(left.location, right.location);
 }
 
-bool rowEqual(const OriginRow &left, const OriginRow &right) {
+bool rowEqual(const FinalSourceOrigin &left, const FinalSourceOrigin &right) {
   return left.operation == right.operation && left.origin == right.origin &&
          left.location == right.location;
 }
@@ -108,10 +102,10 @@ bool safeRelativePath(StringRef path) {
   });
 }
 
-FailureOr<SmallVector<OriginRow>>
+FailureOr<SmallVector<FinalSourceOrigin>>
 collectOrigins(ArrayRef<Operation *> definitions,
                ac::detail::EmitError emitError) {
-  SmallVector<OriginRow> rows;
+  SmallVector<FinalSourceOrigin> rows;
   LogicalResult result = success();
   for (Operation *definition : definitions)
     definition->walk([&](Operation *operation) {
@@ -129,27 +123,44 @@ collectOrigins(ArrayRef<Operation *> definitions,
       auto package = definition->getParentOfType<mlir::ModuleOp>();
       if (occurrence && package) {
         auto site = occurrence.getAs<DictionaryAttr>("site");
-        auto symbol = site ? site.getAs<FlatSymbolRefAttr>("definition") : FlatSymbolRefAttr();
+        auto symbol = site ? site.getAs<FlatSymbolRefAttr>("definition")
+                           : FlatSymbolRefAttr();
         if (symbol && symbol.getValue() == ac::detail::entryBoundarySymbol) {
           auto systems = package.getOps<ac::SystemOp>();
-          if (!llvm::hasSingleElement(systems)) { result = failure(); return; }
-          auto boundary = (*systems.begin())->getAttrOfType<DictionaryAttr>("ac.entry_boundary");
-          auto logical = boundary ? boundary.getAs<DictionaryAttr>("logical_entry") : DictionaryAttr();
-          if (!logical) { result = failure(); return; }
-          std::function<Attribute(Attribute)> attributeSource = [&](Attribute value) -> Attribute {
+          if (!llvm::hasSingleElement(systems)) {
+            result = failure();
+            return;
+          }
+          auto boundary =
+              (*systems.begin())
+                  ->getAttrOfType<DictionaryAttr>("ac.entry_boundary");
+          auto logical = boundary
+                             ? boundary.getAs<DictionaryAttr>("logical_entry")
+                             : DictionaryAttr();
+          if (!logical) {
+            result = failure();
+            return;
+          }
+          std::function<Attribute(Attribute)> attributeSource =
+              [&](Attribute value) -> Attribute {
             if (auto dictionary = dyn_cast<DictionaryAttr>(value)) {
               NamedAttrList fields;
               for (NamedAttribute field : dictionary) {
                 auto reference = dyn_cast<FlatSymbolRefAttr>(field.getValue());
-                fields.append(field.getName(), field.getName() == "definition" && reference &&
-                    reference.getValue() == ac::detail::entryBoundarySymbol
-                    ? logical.getAs<FlatSymbolRefAttr>("callee") : attributeSource(field.getValue()));
+                fields.append(field.getName(),
+                              field.getName() == "definition" && reference &&
+                                      reference.getValue() ==
+                                          ac::detail::entryBoundarySymbol
+                                  ? logical.getAs<FlatSymbolRefAttr>("callee")
+                                  : attributeSource(field.getValue()));
               }
-              return DictionaryAttr::get(operation->getContext(), fields.getAttrs());
+              return DictionaryAttr::get(operation->getContext(),
+                                         fields.getAttrs());
             }
             if (auto array = dyn_cast<ArrayAttr>(value)) {
               SmallVector<Attribute> elements;
-              for (Attribute element : array) elements.push_back(attributeSource(element));
+              for (Attribute element : array)
+                elements.push_back(attributeSource(element));
               return ArrayAttr::get(operation->getContext(), elements);
             }
             return value;
@@ -186,7 +197,7 @@ FailureOr<std::string> sourceMapPath(DictionaryAttr owner,
 
 FailureOr<std::string> serializeMap(DictionaryAttr owner,
                                     ArrayRef<std::string> files,
-                                    ArrayRef<OriginRow> origins,
+                                    ArrayRef<FinalSourceOrigin> origins,
                                     ac::detail::EmitError emitError) {
   auto package = owner.getAs<StringAttr>("package");
   auto path = owner.getAs<StringAttr>("path");
@@ -198,7 +209,7 @@ FailureOr<std::string> serializeMap(DictionaryAttr owner,
   for (const std::string &file : files)
     generatedFiles.emplace_back(file);
   llvm::json::Array originArray;
-  for (const OriginRow &origin : origins) {
+  for (const FinalSourceOrigin &origin : origins) {
     if (origin.operation.empty() || origin.origin.empty() ||
         origin.location.empty())
       return emitError() << "final source map contains an empty origin field";
@@ -246,7 +257,7 @@ FailureOr<std::string> serializeMap(DictionaryAttr owner,
              << "native source map generated_files changed on parse";
   for (auto [index, row] : llvm::enumerate(*parsedOrigins)) {
     auto object = row.getAsObject();
-    const OriginRow &expected = origins[index];
+    const FinalSourceOrigin &expected = origins[index];
     if (!object || object->size() != 3 ||
         object->getString("operation") != expected.operation ||
         object->getString("origin") != expected.origin ||
@@ -297,7 +308,7 @@ LogicalResult validateMapText(StringRef text, MLIRContext &context,
     havePreviousFile = true;
   }
 
-  OriginRow previous;
+  FinalSourceOrigin previous;
   bool havePrevious = false;
   for (const llvm::json::Value &originValue : *origins) {
     auto object = originValue.getAsObject();
@@ -322,7 +333,8 @@ LogicalResult validateMapText(StringRef text, MLIRContext &context,
         *checkedOrigin != *originText || *checkedLocation != *locationText)
       return emitError()
              << "source map origin/location is not canonical MLIR text";
-    OriginRow current{operation->str(), originText->str(), locationText->str()};
+    FinalSourceOrigin current{operation->str(), originText->str(),
+                              locationText->str()};
     if (havePrevious && !rowLess(previous, current))
       return emitError() << "source map origins must be sorted and unique";
     previous = std::move(current);
@@ -345,17 +357,15 @@ LogicalResult validateFinalSourceMapText(StringRef text, MLIRContext &context,
 }
 
 FailureOr<SmallVector<FinalSourceMap>>
-emitFinalSourceMaps(ModuleOp package,
+emitFinalSourceMaps(ArrayRef<FinalSourceMapPlan> plans,
                     ArrayRef<FinalSourceMembership> membership,
                     ac::detail::EmitError emitError) {
-  if (!package || failed(ac::verifyHardwarePackage(package)))
-    return emitError() << "final source maps require verified hardware IR";
-  auto units = ac::collectFinalSourceUnits(package, emitError);
-  if (failed(units))
-    return failure();
   llvm::DenseMap<Attribute, unsigned> unitIndices;
-  for (auto [index, unit] : llvm::enumerate(*units))
-    unitIndices.try_emplace(unit.owner, index);
+  for (auto [index, plan] : llvm::enumerate(plans))
+    if (failed(verifyFinalSourceMapPlan(plan, emitError)) ||
+        !unitIndices.try_emplace(plan.sourceOwner, index).second)
+      return emitError()
+             << "final source-map plan has a missing or duplicate owner";
 
   llvm::DenseMap<Attribute, SmallVector<std::string>> filesByOwner;
   for (const FinalSourceMembership &group : membership) {
@@ -375,27 +385,78 @@ emitFinalSourceMaps(ModuleOp package,
       return emitError() << "native source membership repeats a generated file";
     filesByOwner[group.sourceOwner] = std::move(files);
   }
-  if (filesByOwner.size() != units->size())
+  if (filesByOwner.size() != plans.size())
     return emitError() << "native source membership omits a final SourceOwner";
 
   SmallVector<FinalSourceMap> maps;
   std::set<std::string> paths;
-  for (const ac::FinalSourceUnitView &unit : *units) {
-    DictionaryAttr owner = unit.owner;
+  for (const FinalSourceMapPlan &plan : plans) {
+    if (!paths.insert(plan.path).second)
+      return emitError() << "legalized source-map paths collide";
+    auto files = filesByOwner.lookup(plan.sourceOwner);
+    auto text = serializeMap(plan.sourceOwner, files, plan.origins, emitError);
+    if (failed(text))
+      return failure();
+    maps.push_back(
+        {plan.sourceOwner, plan.path, std::move(*text), std::move(files)});
+  }
+  return maps;
+}
+
+FailureOr<SmallVector<FinalSourceMapPlan>>
+prepareFinalSourceMaps(ArrayRef<ac::FinalSourceUnitView> units,
+                       ac::detail::EmitError emitError) {
+  SmallVector<FinalSourceMapPlan> plans;
+  std::set<std::string> paths;
+  for (const ac::FinalSourceUnitView &unit : units) {
     auto origins = collectOrigins(unit.declarations, emitError);
-    auto path = sourceMapPath(owner, emitError);
+    auto path = sourceMapPath(unit.owner, emitError);
     if (failed(origins) || failed(path))
       return failure();
     if (!paths.insert(*path).second)
       return emitError() << "legalized source-map paths collide";
-    auto files = filesByOwner.lookup(owner);
-    auto text = serializeMap(owner, files, *origins, emitError);
-    if (failed(text))
-      return failure();
-    maps.push_back(
-        {owner, std::move(*path), std::move(*text), std::move(files)});
+    plans.push_back({unit.owner, std::move(*path), std::move(*origins)});
   }
-  return maps;
+  return plans;
+}
+
+LogicalResult verifyFinalSourceMapPlan(const FinalSourceMapPlan &plan,
+                                       ac::detail::EmitError emitError) {
+  if (!plan.sourceOwner ||
+      failed(ac::detail::verifySourceOwner(plan.sourceOwner, emitError)))
+    return emitError() << "final source-map plan has an invalid SourceOwner";
+  auto expectedPath = sourceMapPath(plan.sourceOwner, emitError);
+  if (failed(expectedPath) || plan.path != *expectedPath)
+    return emitError() << "final source-map plan has a noncanonical path";
+  FinalSourceOrigin previous;
+  bool havePrevious = false;
+  for (const FinalSourceOrigin &origin : plan.origins) {
+    if (origin.operation.empty() || origin.origin.empty() ||
+        origin.location.empty())
+      return emitError() << "final source-map plan has an empty origin field";
+    Attribute parsedOrigin =
+        parseAttribute(origin.origin, plan.sourceOwner.getContext());
+    auto checkedOrigin =
+        printAndVerifyOccurrence(dyn_cast_or_null<DictionaryAttr>(parsedOrigin),
+                                 plan.sourceOwner.getContext(), emitError);
+    auto parsedLocation = dyn_cast_or_null<LocationAttr>(
+        parseAttribute(origin.location, plan.sourceOwner.getContext()));
+    if (!parsedLocation)
+      return emitError()
+             << "final source-map plan location is not a Location attribute";
+    auto checkedLocation = printAndVerifyLocation(
+        Location(parsedLocation), plan.sourceOwner.getContext(), emitError);
+    if (failed(checkedOrigin) || failed(checkedLocation) ||
+        *checkedOrigin != origin.origin || *checkedLocation != origin.location)
+      return emitError()
+             << "final source-map plan origin/location is not canonical";
+    if (havePrevious && !rowLess(previous, origin))
+      return emitError()
+             << "final source-map plan origins must be sorted and unique";
+    previous = origin;
+    havePrevious = true;
+  }
+  return success();
 }
 
 } // namespace acir::compiler

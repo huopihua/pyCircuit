@@ -1,4 +1,5 @@
 #include "FinalEmitCpp.h"
+#include "BackendPlanning.h"
 #include "CppWorkOutlining.h"
 #include "FinalCppNames.h"
 #include "HardwareEmitCommon.h"
@@ -15,7 +16,7 @@ LogicalResult emitEnum(HardwareEmitContext &context, ac::EnumOp declaration,
                        raw_ostream &out) {
   auto type =
       ac::EnumType::get(declaration.getContext(), declaration.getSymNameAttr());
-  auto definition = context.analysis.resolveEnum(type, declaration);
+  auto definition = context.resolveEnum(type, declaration);
   auto name = context.cppType(type, declaration);
   if (failed(definition) || failed(name))
     return failure();
@@ -42,7 +43,8 @@ LogicalResult emitRecord(HardwareEmitContext &context, ac::StructOp record,
     while (auto table = dyn_cast<ac::TableType>(dependency))
       dependency = table.getElementType();
     if (auto nested = dyn_cast<ac::StructType>(dependency)) {
-      auto declaration = context.analysis.lookupStruct(nested);
+      auto declaration = dyn_cast_or_null<ac::StructOp>(
+          context.lookupDefinition(nested.getName().getValue()));
       if (!declaration || failed(emitRecord(context, declaration, out, done)))
         return failure();
     }
@@ -94,7 +96,7 @@ FailureOr<ac::ModuleOp> rootModule(HardwareEmitContext &context) {
   auto system = *systems.begin();
   auto callee = system.getEntry().getAs<FlatSymbolRefAttr>("callee");
   auto root = callee ? dyn_cast_or_null<ac::ModuleOp>(
-                           context.analysis.lookupDefinition(callee.getValue()))
+                           context.lookupDefinition(callee.getValue()))
                      : ac::ModuleOp();
   if (!root)
     return system.emitOpError() << "root module is unresolved";
@@ -256,10 +258,9 @@ LogicalResult emitDefinitionOnce(HardwareEmitContext &context,
     return success();
   for (auto &op : module.getBody().front())
     if (isa<ac::InstanceOp, ac::CollectionOp>(op)) {
-      auto *callee =
-          isa<ac::InstanceOp>(op)
-              ? context.analysis.resolveCallee(cast<ac::InstanceOp>(op))
-              : context.analysis.resolveCallee(cast<ac::CollectionOp>(op));
+      auto *callee = isa<ac::InstanceOp>(op)
+                         ? context.resolveCallee(cast<ac::InstanceOp>(op))
+                         : context.resolveCallee(cast<ac::CollectionOp>(op));
       if (auto nested = dyn_cast_or_null<ac::ModuleOp>(callee))
         if (nested.getSourceOwner() == module.getSourceOwner() &&
             failed(emitDefinitionOnce(context, nested, out, done)))
@@ -270,8 +271,11 @@ LogicalResult emitDefinitionOnce(HardwareEmitContext &context,
 }
 } // namespace
 FailureOr<FinalCppSourceParts>
-emitCppSourceParts(ModuleOp package, ac::HardwareAnalysis &analysis) {
-  HardwareEmitContext context(package, analysis);
+prepareCppSourceParts(const VerifiedHardwareEmissionPlan &hardware) {
+  ModuleOp package = hardware->package;
+  HardwareEmitContext context(
+      hardware.get(), BackendPlanningAccess::sourceChecks(hardware),
+      BackendPlanningAccess::observationPlan(hardware), nullptr);
   // Native preparation builds the shared observation and source-check plans.
   // Closed systems and checked module roots consume reachable checks through
   // their generated execution boundary. Checks belonging only to unselected
@@ -286,11 +290,8 @@ emitCppSourceParts(ModuleOp package, ac::HardwareAnalysis &analysis) {
 FailureOr<FinalCppSourceParts>
 emitPreparedCppSourceParts(HardwareEmitContext &context) {
   auto package = context.package;
-  auto &analysis = context.analysis;
   // The retained view never grants authority after mutation. Both public and
   // internal native gates consume this exact verified emission implementation.
-  if (failed(analysis.verifySourceCheckPlan(context.sourceChecks())))
-    return failure();
   auto root = rootModule(context);
   if (failed(root))
     return failure();
@@ -298,11 +299,6 @@ emitPreparedCppSourceParts(HardwareEmitContext &context) {
   if (failed(rootLayout))
     return failure();
   FinalCppSourceParts parts;
-  auto portMap = context.rootPortMap(/*rtl=*/false);
-  if (failed(portMap))
-    return failure();
-  parts.portMap = std::move(*portMap);
-  parts.sourceCheckCount = context.sourceChecks().checks.size();
   auto rootType = context.rootCppType();
   if (failed(rootType))
     return failure();
@@ -371,58 +367,46 @@ emitPreparedCppSourceParts(HardwareEmitContext &context) {
       if (failed(emitEnum(context, declaration, out)))
         return failure();
     llvm::DenseSet<Operation *> done;
-    for (auto record : analysis.getStructs())
-      if (failed(emitRecord(context, record, out, done)))
-        return failure();
+    for (Operation &operation : package.getBody()->getOperations())
+      if (auto record = dyn_cast<ac::StructOp>(operation))
+        if (failed(emitRecord(context, record, out, done)))
+          return failure();
     out.flush();
   }
-  auto emitError = [&] { return package.emitOpError(); };
-  auto units = ac::collectFinalSourceUnits(package, emitError);
-  if (failed(units))
-    return failure();
-  llvm::StringMap<DictionaryAttr> paths;
-  for (const ac::FinalSourceUnitView &unit : *units) {
+  for (const HardwareEmissionSourceUnitPlan &unit : context.plan.sourceUnits) {
     FinalCppSourceGroup group;
-    group.sourceOwner = unit.owner;
-    auto owner = sourceOwnerComponents(unit.owner, emitError);
-    if (failed(owner))
-      return failure();
-    auto headerPath = sourcePathName(owner->filePath, ".hpp", emitError);
-    if (failed(headerPath))
-      return failure();
-    group.headerPath = std::move(*headerPath);
-    if (!paths.try_emplace(group.headerPath, unit.owner).second)
-      return emitError() << "source owner header path collision";
-    for (Operation *declaration : unit.declarations)
-      if (auto module = dyn_cast<ac::ModuleOp>(declaration)) {
-        group.sourcePath = context.names(module).source;
-        break;
-      }
+    group.sourceOwner = unit.sourceOwner;
+    group.headerPath = unit.cppHeaderPath;
+    group.sourcePath = unit.cppSourcePath;
     group.header = "#pragma once\n#include \"pycircuit_support.hpp\"\n";
     llvm::StringSet<> includes;
-    for (Operation *declaration : unit.declarations)
-      if (auto module = dyn_cast<ac::ModuleOp>(declaration))
-        for (auto &op : module.getBody().front())
-          if (isa<ac::InstanceOp, ac::CollectionOp>(op)) {
-            auto *callee =
-                isa<ac::InstanceOp>(op)
-                    ? analysis.resolveCallee(cast<ac::InstanceOp>(op))
-                    : analysis.resolveCallee(cast<ac::CollectionOp>(op));
-            if (auto nested = dyn_cast_or_null<ac::ModuleOp>(callee)) {
-              auto childHeader = context.names(nested).header;
-              if (childHeader != group.headerPath)
-                includes.insert(childHeader);
-            }
+    for (unsigned definitionIndex : unit.definitionIndices) {
+      auto module = cast<ac::ModuleOp>(
+          context.plan.definitions[definitionIndex].diagnosticAnchor);
+      for (auto &op : module.getBody().front())
+        if (isa<ac::InstanceOp, ac::CollectionOp>(op)) {
+          auto *callee =
+              isa<ac::InstanceOp>(op)
+                  ? context.resolveCallee(cast<ac::InstanceOp>(op))
+                  : context.resolveCallee(cast<ac::CollectionOp>(op));
+          if (auto nested = dyn_cast_or_null<ac::ModuleOp>(callee)) {
+            auto childHeader = context.names(nested).header;
+            if (childHeader != group.headerPath)
+              includes.insert(childHeader);
           }
+        }
+    }
     for (auto &item : includes)
       group.header += "#include \"" + item.getKey().str() + "\"\n";
     {
       llvm::raw_string_ostream out(group.header);
       llvm::DenseSet<Operation *> done;
-      for (Operation *declaration : unit.declarations)
-        if (auto module = dyn_cast<ac::ModuleOp>(declaration))
-          if (failed(emitDefinitionOnce(context, module, out, done)))
-            return failure();
+      for (unsigned definitionIndex : unit.definitionIndices) {
+        auto module = cast<ac::ModuleOp>(
+            context.plan.definitions[definitionIndex].diagnosticAnchor);
+        if (failed(emitDefinitionOnce(context, module, out, done)))
+          return failure();
+      }
       out.flush();
     }
     if (!group.sourcePath.empty())
@@ -544,16 +528,5 @@ emitPreparedCppSourceParts(HardwareEmitContext &context) {
         context.resetIfOne());
   }
   return parts;
-}
-LogicalResult emitCpp(ModuleOp package, ac::HardwareAnalysis &analysis,
-                      llvm::raw_ostream &out) {
-  auto parts = emitCppSourceParts(package, analysis);
-  if (failed(parts))
-    return failure();
-  out << parts->supportHeader;
-  for (auto &group : parts->sourceGroups)
-    out << "\n" << group.header;
-  out << "\n" << parts->systemHeader;
-  return success();
 }
 } // namespace acir::compiler

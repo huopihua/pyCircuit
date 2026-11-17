@@ -88,8 +88,7 @@ bool closedStatic(Attribute attribute, const ac::HardwareBindings &bindings,
     if (context && kind && kind.getValue() == "select") {
       auto condition = dictionary.getAs<ac::StaticExprAttr>("condition");
       if (closedStatic(condition, bindings, context, site)) {
-        auto value =
-            context->analysis.evaluateStatic(condition, bindings, site);
+        auto value = context->evaluatedStatic(condition, bindings);
         if (succeeded(value))
           if (auto boolean = dyn_cast<BoolAttr>(*value))
             return closedStatic(dictionary.getAs<ac::StaticExprAttr>(
@@ -103,7 +102,7 @@ bool closedStatic(Attribute attribute, const ac::HardwareBindings &bindings,
           (opcode.getValue() == "and_bool" || opcode.getValue() == "or_bool")) {
         auto lhs = dictionary.getAs<ac::StaticExprAttr>("lhs");
         if (closedStatic(lhs, bindings, context, site)) {
-          auto value = context->analysis.evaluateStatic(lhs, bindings, site);
+          auto value = context->evaluatedStatic(lhs, bindings);
           if (succeeded(value))
             if (auto boolean = dyn_cast<BoolAttr>(*value))
               if ((opcode.getValue() == "and_bool" && !boolean.getValue()) ||
@@ -183,17 +182,6 @@ staticTree(HardwareEmitContext const &context, DictionaryAttr tree,
   StringRef tag = kind.getValue();
   ac::HardwareBindings empty;
   auto &scope = bindings ? *bindings : empty;
-  if (closedStatic(tree, scope, &context, site)) {
-    auto value = context.analysis.evaluateStatic(
-        ac::StaticExprAttr::get(tree.getContext(), tree), scope, site);
-    if (failed(value))
-      return failure();
-    if (auto integer = dyn_cast<ac::MathIntAttr>(*value))
-      return integer.getCanonicalValue().str();
-    if (auto boolean = dyn_cast<BoolAttr>(*value))
-      return std::string(boolean.getValue() ? "1" : "0");
-  }
-
   if (tag == "literal") {
     auto data = tree.getAs<DictionaryAttr>("value");
     auto value = data ? data.get("value") : Attribute();
@@ -203,6 +191,17 @@ staticTree(HardwareEmitContext const &context, DictionaryAttr tree,
       return std::string(boolean.getValue() ? "1" : "0");
     return site->emitOpError() << "unsupported static literal";
   }
+  if (closedStatic(tree, scope, &context, site)) {
+    auto value = context.evaluatedStatic(
+        ac::StaticExprAttr::get(tree.getContext(), tree), scope);
+    if (failed(value))
+      return failure();
+    if (auto integer = dyn_cast<ac::MathIntAttr>(*value))
+      return integer.getCanonicalValue().str();
+    if (auto boolean = dyn_cast<BoolAttr>(*value))
+      return std::string(boolean.getValue() ? "1" : "0");
+  }
+
   if (tag == "reference") {
     auto ref = tree.getAs<DictionaryAttr>("ref");
     auto name = ref ? ref.getAs<StringAttr>("name") : StringAttr();
@@ -228,7 +227,7 @@ staticTree(HardwareEmitContext const &context, DictionaryAttr tree,
       return site->emitOpError() << "type_width has no type";
     auto payload = type.getValue();
     if (bindings) {
-      auto resolved = context.analysis.resolveType(payload, *bindings, site);
+      auto resolved = context.resolvedType(payload, *bindings);
       if (failed(resolved))
         return failure();
       payload = *resolved;
@@ -367,7 +366,7 @@ FailureOr<ac::ModuleOp> observationRoot(HardwareEmitContext &context) {
   auto system = *systems.begin();
   auto callee = system.getEntry().getAs<FlatSymbolRefAttr>("callee");
   auto root = callee ? dyn_cast_or_null<ac::ModuleOp>(
-                           context.analysis.lookupDefinition(callee.getValue()))
+                           context.lookupDefinition(callee.getValue()))
                      : ac::ModuleOp();
   if (!root)
     return system.emitOpError() << "root module is unresolved";
@@ -444,15 +443,13 @@ buildObservationPlan(HardwareEmitContext &context) {
     for (Operation &op : definition.getBody().front()) {
       if (!isa<ac::InstanceOp, ac::CollectionOp>(op))
         continue;
-      auto *callee =
-          isa<ac::InstanceOp>(op)
-              ? context.analysis.resolveCallee(cast<ac::InstanceOp>(op))
-              : context.analysis.resolveCallee(cast<ac::CollectionOp>(op));
+      auto *callee = isa<ac::InstanceOp>(op)
+                         ? context.resolveCallee(cast<ac::InstanceOp>(op))
+                         : context.resolveCallee(cast<ac::CollectionOp>(op));
       auto child = dyn_cast_or_null<ac::ModuleOp>(callee);
       uint64_t shape = 1;
       if (auto collection = dyn_cast<ac::CollectionOp>(op)) {
-        auto extents =
-            context.analysis.resolveShape(collection.getShape(), parent, &op);
+        auto extents = context.occurrenceShape(&op, parent);
         if (failed(extents))
           return failure();
         for (uint64_t extent : *extents) {
@@ -463,11 +460,7 @@ buildObservationPlan(HardwareEmitContext &context) {
           shape *= extent;
         }
       }
-      auto bindings =
-          isa<ac::InstanceOp>(op)
-              ? context.analysis.bindInstance(cast<ac::InstanceOp>(op), parent)
-              : context.analysis.bindInstance(cast<ac::CollectionOp>(op),
-                                              parent);
+      auto bindings = context.bindOccurrence(&op, parent);
       if (failed(bindings))
         return failure();
       auto *site = &plan.children[definition].emplace_back(
@@ -529,11 +522,9 @@ buildObservationPlan(HardwareEmitContext &context) {
       for (const auto &site : sites->second) {
         if (logicalSuffixes.contains(site.op))
           continue;
-        auto logical = ac::detail::resolveObservationOwner(
-            context.analysis, cast<ac::SourceObserveOp>(site.op), bindings, {});
-        if (failed(logical))
-          return failure();
-        logicalSuffixes.try_emplace(site.op, std::move(logical->path));
+        auto logical = context.observationLogicalSuffix(
+            cast<ac::SourceObserveOp>(site.op), bindings);
+        logicalSuffixes.try_emplace(site.op, logical.begin(), logical.end());
       }
     for (uint64_t lane = 0; lane < lanes; ++lane) {
       if (sites != plan.definitions.end())
@@ -560,8 +551,7 @@ buildObservationPlan(HardwareEmitContext &context) {
       // changes cannot reuse the first layout for an observed subtree.
       if (auto collection = dyn_cast<ac::CollectionOp>(child.op);
           collection && plan.subtreeWidth.lookup(child.definition) != 0) {
-        auto extents = context.analysis.resolveShape(collection.getShape(),
-                                                     bindings, collection);
+        auto extents = context.occurrenceShape(collection, bindings);
         if (failed(extents))
           return failure();
         uint64_t shape = 1;
@@ -589,12 +579,7 @@ buildObservationPlan(HardwareEmitContext &context) {
             childPaths.push_back(path);
             childPaths.back().emplace_back(child.op, lane);
           }
-        auto childBindings =
-            isa<ac::InstanceOp>(child.op)
-                ? context.analysis.bindInstance(cast<ac::InstanceOp>(child.op),
-                                                bindings)
-                : context.analysis.bindInstance(
-                      cast<ac::CollectionOp>(child.op), bindings);
+        auto childBindings = context.bindOccurrence(child.op, bindings);
         if (failed(childBindings) ||
             failed(layout(child.definition, childPaths, *childBindings)))
           return failure();
@@ -619,17 +604,35 @@ buildObservationPlan(HardwareEmitContext &context) {
   return plan;
 }
 } // namespace
-HardwareEmitContext::HardwareEmitContext(ModuleOp package,
-                                         ac::HardwareAnalysis &analysis,
-                                         bool physical)
-    : package(package), analysis(analysis), physical_(physical) {}
+HardwareEmitContext::HardwareEmitContext(
+    const HardwareEmissionPlan &plan,
+    const ac::HardwareSourceCheckPlan &sourceChecks,
+    std::shared_ptr<const ObservationEmissionPlan> &observationPlanCache,
+    const ac::HardwarePhysicalProjection *physicalProjection, bool physical)
+    : package(plan.package), plan(plan), frozenSourceChecks(sourceChecks),
+      observationPlanCache(observationPlanCache),
+      frozenPhysicalProjection(physicalProjection), physical_(physical) {}
 LogicalResult HardwareEmitContext::prepare() { return prepareImpl(false); }
 LogicalResult HardwareEmitContext::prepareNativeChecks() {
-  return prepareImpl(true);
+  if (failed(prepareImpl(true)))
+    return failure();
+  if (!observationPlanCache) {
+    auto observations = buildObservationPlan(*this);
+    if (failed(observations))
+      return failure();
+    observationPlanCache =
+        std::make_shared<ObservationEmissionPlan>(std::move(*observations));
+  }
+  observationPlan_ = observationPlanCache;
+  return success();
 }
 const ac::HardwareSourceCheckPlan &HardwareEmitContext::sourceChecks() const {
   assert(sourceChecks_ && "emission context must be prepared");
   return *sourceChecks_;
+}
+const ObservationEmissionPlan &HardwareEmitContext::observationPlan() const {
+  assert(observationPlan_ && "observation plan must be prepared");
+  return *observationPlan_;
 }
 bool HardwareEmitContext::managesChecks() {
   return !physical_ &&
@@ -649,14 +652,15 @@ std::string HardwareEmitContext::rtlReset(StringRef expression) const {
 }
 LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
   sourceChecks_.reset();
+  observationPlan_.reset();
   names_.clear();
+  definitions_.clear();
+  primitiveKinds_.clear();
   if (!package)
     return failure();
   // Building the plan includes full package verification. Retain that result
   // instead of verifying and expanding the same occurrence closure twice.
-  auto checks = analysis.getSourceCheckPlan();
-  if (failed(checks))
-    return failure();
+  const ac::HardwareSourceCheckPlan &checks = frozenSourceChecks;
   // The C++ native observation plan prepares through `prepareNativeChecks()`
   // and then re-closes the one instrumentation op it still cannot emit. This
   // shared gate stays closed for `ac.observe` because the Verilog target has no
@@ -697,14 +701,14 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
       bool demand = symbolic || !isClosedStatic(expression);
       if (!demand)
         return success();
-      auto value = analysis.evaluateStatic(expression, bindings, site);
+      auto value = evaluatedStatic(expression, bindings);
       if (failed(value) || failed(checkInteger(*value, site)))
         return failure();
       auto tree = expression.getTree();
       auto op = tree.getAs<StringAttr>("operator");
       if (op && (op.getValue() == "shl" || op.getValue() == "shr")) {
-        auto count = analysis.evaluateStatic(
-            tree.getAs<ac::StaticExprAttr>("rhs"), bindings, site);
+        auto count =
+            evaluatedStatic(tree.getAs<ac::StaticExprAttr>("rhs"), bindings);
         if (failed(count))
           return failure();
         auto integer = dyn_cast<ac::MathIntAttr>(*count);
@@ -715,10 +719,10 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
                                         "below 63 in both emitted targets";
       }
       if (op && (op.getValue() == "floordiv" || op.getValue() == "mod")) {
-        auto lhs = analysis.evaluateStatic(
-                 tree.getAs<ac::StaticExprAttr>("lhs"), bindings, site),
-             rhs = analysis.evaluateStatic(
-                 tree.getAs<ac::StaticExprAttr>("rhs"), bindings, site);
+        auto lhs = evaluatedStatic(tree.getAs<ac::StaticExprAttr>("lhs"),
+                                   bindings),
+             rhs = evaluatedStatic(tree.getAs<ac::StaticExprAttr>("rhs"),
+                                   bindings);
         if (failed(lhs) || failed(rhs))
           return failure();
         if (cast<ac::MathIntAttr>(*lhs).getCanonicalValue() ==
@@ -732,7 +736,7 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
         auto condition = tree.getAs<ac::StaticExprAttr>("condition");
         if (failed(inspect(condition, bindings, site, true)))
           return failure();
-        auto selected = analysis.evaluateStatic(condition, bindings, site);
+        auto selected = evaluatedStatic(condition, bindings);
         if (failed(selected))
           return failure();
         return inspect(tree.getAs<ac::StaticExprAttr>(
@@ -743,7 +747,7 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
         auto lhs = tree.getAs<ac::StaticExprAttr>("lhs");
         if (failed(inspect(lhs, bindings, site, true)))
           return failure();
-        auto selected = analysis.evaluateStatic(lhs, bindings, site);
+        auto selected = evaluatedStatic(lhs, bindings);
         if (failed(selected))
           return failure();
         bool value = cast<BoolAttr>(*selected).getValue();
@@ -790,7 +794,7 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
     if (!isa<ac::BitsType, ac::StructType, ac::EnumType, ac::TypeParamType,
              ac::TableType>(type))
       return success();
-    auto width = analysis.getPackedWidth(type, bindings, site);
+    auto width = packedWidth(type, bindings);
     if (failed(width))
       return failure();
     if (*width > std::numeric_limits<unsigned>::max() / multiplicity)
@@ -808,7 +812,7 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
     for (auto &value : bindings.integers) {
       auto actual = value.second;
       if (auto expr = dyn_cast<ac::StaticExprAttr>(actual)) {
-        auto evaluated = analysis.evaluateStatic(expr, bindings, module);
+        auto evaluated = evaluatedStatic(expr, bindings);
         if (failed(evaluated))
           return failure();
         actual = *evaluated;
@@ -847,9 +851,10 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
     for (auto &op : module.getBody().front()) {
       if (auto queue = dyn_cast<ac::InstanceOp>(op);
           queue && ac::isQueueInstance(queue)) {
-        auto config = analysis.resolveQueue(queue, bindings);
-        if (failed(config))
-          return failure();
+        const auto *config = queuePlan(&op, bindings);
+        if (!config)
+          return op.emitOpError()
+                 << "queue is absent from the frozen emission plan";
         if (config->depth > uint64_t(std::numeric_limits<int64_t>::max()))
           return op.emitOpError()
                  << "queue depth exceeds emitted signed 64-bit indexing";
@@ -857,15 +862,11 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
             config->tokenCardinality >
                 std::numeric_limits<uint64_t>::max() / multiplicity)
           return op.emitOpError() << "queue family token geometry overflows";
-        auto elementWidth =
-            analysis.getPackedWidth(config->tokenElementType, bindings, &op);
-        if (failed(elementWidth))
-          return failure();
         // Tables hold independent scalar wires: round each scalar first, not
         // the packed token. These bytes estimate storage, never hardware
         // layout.
         uint64_t scalarBytes =
-            ((*elementWidth - 1) / 64 + 1) * 3 * sizeof(uint64_t);
+            ((config->tokenElementWidth - 1) / 64 + 1) * 3 * sizeof(uint64_t);
         if (config->tokenCardinality >
             std::numeric_limits<uint64_t>::max() / scalarBytes)
           return op.emitOpError() << "queue token representation overflows";
@@ -903,16 +904,13 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
       }
       if (!isa<ac::InstanceOp, ac::CollectionOp>(op))
         continue;
-      auto child =
-          isa<ac::InstanceOp>(op)
-              ? analysis.bindInstance(cast<ac::InstanceOp>(op), bindings)
-              : analysis.bindInstance(cast<ac::CollectionOp>(op), bindings);
+      auto child = bindOccurrence(&op, bindings);
       if (failed(child))
         return failure();
       for (const auto &binding : child->integers) {
         Attribute value = binding.second;
         if (auto expression = dyn_cast<ac::StaticExprAttr>(value)) {
-          auto evaluated = analysis.evaluateStatic(expression, *child, &op);
+          auto evaluated = evaluatedStatic(expression, *child);
           if (failed(evaluated))
             return failure();
           value = *evaluated;
@@ -922,8 +920,7 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
       }
       uint64_t childMultiplicity = multiplicity;
       if (auto collection = dyn_cast<ac::CollectionOp>(op)) {
-        auto shape =
-            analysis.resolveShape(collection.getShape(), bindings, &op);
+        auto shape = occurrenceShape(&op, bindings);
         if (failed(shape))
           return failure();
         for (uint64_t extent : *shape) {
@@ -935,12 +932,12 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
       }
       // Storage arrays are not port planes. Check their concrete host-index
       // capacity too, before a generated std::array bound can overflow.
-      auto primitive = analysis.getPrimitiveKind(child->owner);
+      auto primitive = primitiveKind(child->owner);
       if (primitive == "sync_mem" || primitive == "sync_mem_dp" ||
           primitive == "byte_mem") {
         Attribute rawDepth = child->integers.lookup("DEPTH");
         if (auto expr = dyn_cast<ac::StaticExprAttr>(rawDepth)) {
-          auto value = analysis.evaluateStatic(expr, *child, &op);
+          auto value = evaluatedStatic(expr, *child);
           if (failed(value))
             return failure();
           rawDepth = *value;
@@ -955,8 +952,8 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
                  << "memory depth exceeds target storage indexing";
         auto typeName = cast<StringAttr>(
             child->owner->getAttrOfType<ArrayAttr>("type_parameters")[0]);
-        auto bits = analysis.getPackedWidth(
-            child->types.lookup(typeName.getValue()), *child, &op);
+        auto bits =
+            packedWidth(child->types.lookup(typeName.getValue()), *child);
         if (failed(bits))
           return failure();
         uint64_t wordBytes = ((*bits - 1) / 64 + 1) * 8;
@@ -987,7 +984,8 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
   // Every non-generic definition emits a concrete scalar wrapper, even when the
   // selected root does not instantiate it. Validate that emitted closure too;
   // unbound generic definitions must not acquire facts from their defaults.
-  for (auto definition : analysis.getDefinitions()) {
+  for (const HardwareEmissionDefinitionPlan &planned : plan.definitions) {
+    auto definition = cast<ac::ModuleOp>(planned.diagnosticAnchor);
     if (!definition.getParameters().empty() ||
         !definition.getTypeParameters().empty() ||
         checkedConcreteDefinitions.contains(definition))
@@ -1012,6 +1010,9 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
       return site->emitOpError() << "emitted hardware name collision";
     return success();
   };
+  for (Operation *declaration : plan.nominalDeclarations)
+    definitions_.try_emplace(SymbolTable::getSymbolName(declaration).getValue(),
+                             declaration);
   // Validate the complete nominal declaration closure shared by both targets.
   for (Operation &op : package.getBody()->getOperations()) {
     Type type;
@@ -1031,63 +1032,436 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
     if (!rtlTypes.insert(*rtlName).second)
       return op.emitOpError() << "emitted hardware name collision";
   }
-  for (auto definition : analysis.getDefinitions()) {
-    Operation *site = definition;
-    auto symbol = definition.getSymName();
-    auto q = qualified(symbol, site, "::");
-    auto r = qualified(symbol, site, "_");
-    if (failed(q) || failed(r))
+  for (const HardwareEmissionDefinitionPlan &definition : plan.definitions) {
+    Operation *site = definition.diagnosticAnchor;
+    if (failed(reserveCppName(definition.names.cppQualified, site)) ||
+        failed(reserveCppName(definition.names.cppFamilyQualified, site)))
       return failure();
-    SmallVector<StringRef> pieces;
-    StringRef(*q).split(pieces, "::");
-    EmitNames names;
-    names.cppQualified = "::" + *q;
-    names.cppClass = pieces.back().str();
-    names.cppNamespace = q->substr(0, q->size() - pieces.back().size());
-    if (names.cppNamespace.ends_with("::"))
-      names.cppNamespace.resize(names.cppNamespace.size() - 2);
-    // Source identifiers beginning with pyc_ are encoded by the shared
-    // legalizer. Generated symbols live in that disjoint, non-hex subdomain.
-    names.cppFamilyClass = "pyc_family_" + names.cppClass;
-    names.cppFamilyQualified =
-        "::" + (names.cppNamespace.empty() ? "" : names.cppNamespace + "::") +
-        names.cppFamilyClass;
-    names.rtl = "ac_" + *r;
-    auto owner = sourceOwnerComponents(definition.getSourceOwner(),
-                                       [&] { return site->emitOpError(); });
-    if (failed(owner))
-      return failure();
-    auto header = sourcePathName(owner->filePath, ".hpp",
-                                 [&] { return site->emitOpError(); });
-    auto source = sourcePathName(owner->filePath, ".cpp",
-                                 [&] { return site->emitOpError(); });
-    auto v = sourcePathName(owner->filePath, ".v",
-                            [&] { return site->emitOpError(); });
-    if (failed(header) || failed(source) || failed(v))
-      return failure();
-    names.header = *header;
-    names.source = *source;
-    names.verilog = *v;
-    if (failed(reserveCppName(names.cppQualified, site)) ||
-        failed(reserveCppName(names.cppFamilyQualified, site)))
-      return failure();
-    if (!rtl.insert(names.rtl).second)
+    if (!rtl.insert(definition.names.rtl).second)
       return site->emitOpError() << "emitted hardware name collision";
-    // Owners may intentionally share a basename; grouping checks unequal
-    // owners.
-    names_.try_emplace(site, std::move(names));
+    names_.try_emplace(site, definition.names);
+    definitions_.try_emplace(definition.symbol, site);
+  }
+  for (const HardwareEmissionPrimitivePlan &primitive : plan.primitives) {
+    definitions_.try_emplace(primitive.symbol, primitive.diagnosticAnchor);
+    primitiveKinds_.try_emplace(primitive.diagnosticAnchor, primitive.kind);
   }
   if (physical_) {
-    auto projection = analysis.getPhysicalProjection(*checks);
-    if (failed(projection))
-      return failure();
-    physicalProjection_ = *projection;
+    if (!frozenPhysicalProjection)
+      return package.emitOpError()
+             << "physical projection is absent from the frozen plan";
+    physicalProjection_ = *frozenPhysicalProjection;
   }
-  sourceChecks_ = std::move(*checks);
+  sourceChecks_ = checks;
   return success();
 }
 const EmitNames &HardwareEmitContext::names(Operation *definition) const {
   return names_.find(definition)->second;
+}
+Operation *HardwareEmitContext::lookupDefinition(StringRef symbol) const {
+  auto found = definitions_.find(symbol);
+  return found == definitions_.end() ? nullptr : found->second;
+}
+ac::StructOp HardwareEmitContext::lookupStruct(ac::StructType type) const {
+  return dyn_cast_or_null<ac::StructOp>(
+      lookupDefinition(type.getName().getValue()));
+}
+FailureOr<ac::EnumDefinitionView>
+HardwareEmitContext::resolveEnum(ac::EnumType type, Operation *site) const {
+  auto declaration =
+      dyn_cast_or_null<ac::EnumOp>(lookupDefinition(type.getName().getValue()));
+  if (!declaration)
+    return site->emitOpError() << "unresolved enum declaration '"
+                               << type.getName().getValue() << "'";
+  return ac::validateEnumDeclaration(declaration, site);
+}
+Operation *HardwareEmitContext::resolveCallee(ac::InstanceOp instance) const {
+  return lookupDefinition(instance.getCallee());
+}
+Operation *
+HardwareEmitContext::resolveCallee(ac::CollectionOp collection) const {
+  return lookupDefinition(collection.getCallee());
+}
+StringRef HardwareEmitContext::primitiveKind(Operation *definition) const {
+  auto found = primitiveKinds_.find(definition);
+  return found == primitiveKinds_.end() ? StringRef() : found->second;
+}
+ArrayRef<Operation *>
+HardwareEmitContext::independentWorkChildren(Operation *definition) const {
+  for (const HardwareEmissionDefinitionPlan &planned : plan.definitions)
+    if (planned.diagnosticAnchor == definition)
+      return planned.independentWorkChildren;
+  return {};
+}
+FailureOr<ac::HardwareBindings>
+HardwareEmitContext::bindOccurrence(Operation *occurrence,
+                                    const ac::HardwareBindings &parent) const {
+  for (const HardwareEmissionModulePlan &module : plan.modules) {
+    if (module.diagnosticAnchor != parent.owner)
+      continue;
+    bool matches =
+        module.concreteBindings.integers.size() == parent.integers.size() &&
+        module.concreteBindings.types.size() == parent.types.size();
+    for (const auto &binding : parent.integers)
+      matches &= module.concreteBindings.integers.lookup(binding.getKey()) ==
+                 binding.getValue();
+    for (const auto &binding : parent.types)
+      matches &= module.concreteBindings.types.lookup(binding.getKey()) ==
+                 binding.getValue();
+    if (!matches)
+      continue;
+    for (const HardwareEmissionChildPlan &child : module.children)
+      if (child.diagnosticAnchor == occurrence)
+        return child.concreteBindings;
+  }
+  if (parent.owner && parent.integers.empty() && parent.types.empty())
+    for (const HardwareEmissionDefinitionPlan &definition : plan.definitions)
+      if (definition.diagnosticAnchor == parent.owner)
+        for (const HardwareEmissionOccurrenceBinding &child :
+             definition.templateChildren)
+          if (child.diagnosticAnchor == occurrence)
+            return child.bindings;
+  return occurrence->emitOpError()
+         << "hardware emission occurrence is absent from the frozen plan";
+}
+FailureOr<SmallVector<uint64_t>>
+HardwareEmitContext::occurrenceShape(Operation *occurrence,
+                                     const ac::HardwareBindings &parent) const {
+  for (const HardwareEmissionModulePlan &module : plan.modules) {
+    if (module.diagnosticAnchor != parent.owner)
+      continue;
+    bool matches =
+        module.concreteBindings.integers.size() == parent.integers.size() &&
+        module.concreteBindings.types.size() == parent.types.size();
+    for (const auto &binding : parent.integers)
+      matches &= module.concreteBindings.integers.lookup(binding.getKey()) ==
+                 binding.getValue();
+    for (const auto &binding : parent.types)
+      matches &= module.concreteBindings.types.lookup(binding.getKey()) ==
+                 binding.getValue();
+    if (!matches)
+      continue;
+    for (const HardwareEmissionChildPlan &child : module.children)
+      if (child.diagnosticAnchor == occurrence) {
+        SmallVector<uint64_t> shape(child.shape.begin(), child.shape.end());
+        return shape;
+      }
+  }
+  if (parent.owner && parent.integers.empty() && parent.types.empty())
+    for (const HardwareEmissionDefinitionPlan &definition : plan.definitions)
+      if (definition.diagnosticAnchor == parent.owner)
+        for (const HardwareEmissionOccurrenceBinding &child :
+             definition.templateChildren)
+          if (child.diagnosticAnchor == occurrence && !child.shape.empty())
+            return SmallVector<uint64_t>(child.shape.begin(),
+                                         child.shape.end());
+  return occurrence->emitOpError()
+         << "hardware emission occurrence shape is absent from the frozen plan";
+}
+const HardwareEmissionQueuePlan *
+HardwareEmitContext::queuePlan(Operation *occurrence,
+                               const ac::HardwareBindings &parent) const {
+  for (const HardwareEmissionModulePlan &module : plan.modules) {
+    if (module.diagnosticAnchor != parent.owner ||
+        module.concreteBindings.integers.size() != parent.integers.size() ||
+        module.concreteBindings.types.size() != parent.types.size())
+      continue;
+    bool matches = true;
+    for (const auto &binding : parent.integers)
+      matches &= module.concreteBindings.integers.lookup(binding.getKey()) ==
+                 binding.getValue();
+    for (const auto &binding : parent.types)
+      matches &= module.concreteBindings.types.lookup(binding.getKey()) ==
+                 binding.getValue();
+    if (!matches)
+      continue;
+    for (const HardwareEmissionChildPlan &child : module.children)
+      if (child.diagnosticAnchor == occurrence)
+        return child.queue ? &*child.queue : nullptr;
+  }
+  return nullptr;
+}
+const HardwareEmissionTypePlan *HardwareEmitContext::concreteValueType(
+    Value value, const ac::HardwareBindings &bindings) const {
+  for (const HardwareEmissionModulePlan &module : plan.modules) {
+    bool matches =
+        module.diagnosticAnchor == bindings.owner &&
+        module.concreteBindings.integers.size() == bindings.integers.size() &&
+        module.concreteBindings.types.size() == bindings.types.size();
+    if (matches) {
+      for (const auto &binding : bindings.integers)
+        matches &= module.concreteBindings.integers.lookup(binding.getKey()) ==
+                   binding.getValue();
+      for (const auto &binding : bindings.types)
+        matches &= module.concreteBindings.types.lookup(binding.getKey()) ==
+                   binding.getValue();
+    }
+    if (!matches)
+      continue;
+    auto found = llvm::find_if(module.values, [&](const auto &planned) {
+      return planned.source == value;
+    });
+    return found == module.values.end() ? nullptr : &found->type;
+  }
+  return nullptr;
+}
+namespace {
+template <class Callback>
+bool withEmissionQueries(const HardwareEmissionPlan &plan,
+                         const ac::HardwareBindings &bindings,
+                         Callback callback) {
+  for (const HardwareEmissionModulePlan &module : plan.modules) {
+    if (module.diagnosticAnchor == bindings.owner &&
+        module.concreteBindings.integers.size() == bindings.integers.size() &&
+        module.concreteBindings.types.size() == bindings.types.size()) {
+      bool matches = true;
+      for (const auto &binding : bindings.integers)
+        matches &= module.concreteBindings.integers.lookup(binding.getKey()) ==
+                   binding.getValue();
+      for (const auto &binding : bindings.types)
+        matches &= module.concreteBindings.types.lookup(binding.getKey()) ==
+                   binding.getValue();
+      if (matches && callback(module.staticValues, module.types))
+        return true;
+    }
+    for (const HardwareEmissionChildPlan &child : module.children) {
+      const auto &actual = child.concreteBindings;
+      if (actual.owner != bindings.owner ||
+          actual.integers.size() != bindings.integers.size() ||
+          actual.types.size() != bindings.types.size())
+        continue;
+      bool childMatches = true;
+      for (const auto &binding : bindings.integers)
+        childMatches &=
+            actual.integers.lookup(binding.getKey()) == binding.getValue();
+      for (const auto &binding : bindings.types)
+        childMatches &=
+            actual.types.lookup(binding.getKey()) == binding.getValue();
+      if (childMatches && callback(child.staticValues, child.types))
+        return true;
+    }
+  }
+  if (bindings.integers.empty() && bindings.types.empty())
+    for (const HardwareEmissionDefinitionPlan &definition : plan.definitions)
+      if ((!bindings.owner || definition.diagnosticAnchor == bindings.owner) &&
+          callback(definition.staticValues, definition.types))
+        return true;
+  return false;
+}
+} // namespace
+FailureOr<Attribute> HardwareEmitContext::evaluatedStatic(
+    ac::StaticExprAttr expression, const ac::HardwareBindings &bindings) const {
+  Attribute result;
+  bool found =
+      withEmissionQueries(plan, bindings,
+                          [&](ArrayRef<HardwareEmissionStaticPlan> values,
+                              ArrayRef<HardwareEmissionTypeQueryPlan>) {
+                            auto item =
+                                llvm::find_if(values, [&](const auto &value) {
+                                  return value.expression == expression;
+                                });
+                            if (item == values.end())
+                              return false;
+                            result = item->value;
+                            return true;
+                          });
+  if (!found && !isClosedStatic(expression, bindings))
+    return expression;
+  if (!found)
+    return failure();
+  return result;
+}
+FailureOr<Type>
+HardwareEmitContext::resolvedType(Type type,
+                                  const ac::HardwareBindings &bindings) const {
+  if (auto formal = dyn_cast<ac::TypeParamType>(type)) {
+    auto actual = bindings.types.find(formal.getName().getValue());
+    if (actual != bindings.types.end())
+      return actual->second;
+  }
+  for (const auto &binding : bindings.types)
+    if (binding.getValue() == type)
+      return type;
+  if (auto table = dyn_cast<ac::TableType>(type)) {
+    bool concrete = true;
+    for (Attribute extent : table.getShape())
+      concrete &= isClosedStatic(cast<ac::StaticExprAttr>(extent), bindings);
+    if (concrete)
+      return type;
+  }
+  if (auto bits = dyn_cast<ac::BitsType>(type);
+      bits && isClosedStatic(bits.getWidth(), bindings))
+    return type;
+  Type result;
+  bool found = withEmissionQueries(
+      plan, bindings,
+      [&](ArrayRef<HardwareEmissionStaticPlan>,
+          ArrayRef<HardwareEmissionTypeQueryPlan> types) {
+        auto item = llvm::find_if(
+            types, [&](const auto &value) { return value.source == type; });
+        if (item == types.end())
+          return false;
+        result = item->resolved;
+        return true;
+      });
+  if (!found)
+    return failure();
+  return result;
+}
+FailureOr<uint64_t>
+HardwareEmitContext::packedWidth(Type type,
+                                 const ac::HardwareBindings &bindings) const {
+  std::optional<uint64_t> result;
+  withEmissionQueries(
+      plan, bindings,
+      [&](ArrayRef<HardwareEmissionStaticPlan>,
+          ArrayRef<HardwareEmissionTypeQueryPlan> types) {
+        auto item = llvm::find_if(types, [&](const auto &value) {
+          return value.source == type && value.packedWidth.has_value();
+        });
+        if (item == types.end())
+          return false;
+        result = item->packedWidth;
+        return true;
+      });
+  if (!result)
+    return failure();
+  return *result;
+}
+FailureOr<SmallVector<ac::FieldPath>>
+HardwareEmitContext::fieldPaths(Type type,
+                                const ac::HardwareBindings &bindings) const {
+  SmallVector<ac::FieldPath> result;
+  bool found = withEmissionQueries(
+      plan, bindings,
+      [&](ArrayRef<HardwareEmissionStaticPlan>,
+          ArrayRef<HardwareEmissionTypeQueryPlan> types) {
+        auto item = llvm::find_if(
+            types, [&](const auto &value) { return value.source == type; });
+        if (item == types.end())
+          return false;
+        for (const auto &path : item->fieldPaths) {
+          ac::FieldPath materialized;
+          for (const std::string &component : path)
+            materialized.push_back(
+                StringAttr::get(type.getContext(), component));
+          result.push_back(std::move(materialized));
+        }
+        return true;
+      });
+  if (!found)
+    return failure();
+  return result;
+}
+const HardwareEmissionTableViewPlan *
+HardwareEmitContext::tableViewPlan(ac::TableViewOp view,
+                                   const ac::HardwareBindings &bindings) const {
+  for (const HardwareEmissionModulePlan &module : plan.modules) {
+    if ((bindings.owner && module.diagnosticAnchor != bindings.owner) ||
+        (!bindings.owner &&
+         module.diagnosticAnchor != view->getParentOfType<ac::ModuleOp>()) ||
+        module.concreteBindings.integers.size() != bindings.integers.size() ||
+        module.concreteBindings.types.size() != bindings.types.size())
+      continue;
+    bool matches = true;
+    for (const auto &binding : bindings.integers)
+      matches &= module.concreteBindings.integers.lookup(binding.getKey()) ==
+                 binding.getValue();
+    for (const auto &binding : bindings.types)
+      matches &= module.concreteBindings.types.lookup(binding.getKey()) ==
+                 binding.getValue();
+    if (!matches)
+      continue;
+    auto found = llvm::find_if(module.tableViews, [&](const auto &planned) {
+      return planned.diagnosticAnchor == view.getOperation();
+    });
+    return found == module.tableViews.end() ? nullptr : &*found;
+  }
+  return nullptr;
+}
+ArrayRef<Operation *> HardwareEmitContext::observationLogicalSuffix(
+    ac::SourceObserveOp observe, const ac::HardwareBindings &bindings) const {
+  for (const HardwareEmissionModulePlan &module : plan.modules) {
+    if (module.diagnosticAnchor != bindings.owner ||
+        module.concreteBindings.integers.size() != bindings.integers.size() ||
+        module.concreteBindings.types.size() != bindings.types.size())
+      continue;
+    bool matches = true;
+    for (const auto &binding : bindings.integers)
+      matches &= module.concreteBindings.integers.lookup(binding.getKey()) ==
+                 binding.getValue();
+    for (const auto &binding : bindings.types)
+      matches &= module.concreteBindings.types.lookup(binding.getKey()) ==
+                 binding.getValue();
+    if (!matches)
+      continue;
+    auto found = llvm::find_if(plan.observations, [&](const auto &planned) {
+      return planned.moduleIndex == &module - plan.modules.data() &&
+             planned.diagnosticAnchor == observe.getOperation();
+    });
+    if (found != plan.observations.end())
+      return found->logicalSuffix;
+  }
+  return {};
+}
+FailureOr<SmallVector<ac::WireEndpoint>>
+HardwareEmitContext::dependencies(Value value, ArrayRef<StringAttr> path,
+                                  const ac::HardwareBindings &bindings) const {
+  auto matchesPath = [&](ArrayRef<std::string> candidate) {
+    if (candidate.size() != path.size())
+      return false;
+    for (auto [left, right] : llvm::zip_equal(candidate, path))
+      if (left != right.getValue())
+        return false;
+    return true;
+  };
+  auto materialize = [&](ArrayRef<HardwareEmissionDependencyPlan> rows)
+      -> FailureOr<SmallVector<ac::WireEndpoint>> {
+    for (const HardwareEmissionDependencyPlan &row : rows) {
+      if (row.output.value != value || !matchesPath(row.output.path))
+        continue;
+      SmallVector<ac::WireEndpoint> result;
+      for (const HardwareEmissionDependencyEndpoint &input : row.inputs) {
+        ac::FieldPath fieldPath;
+        for (const std::string &component : input.path)
+          fieldPath.push_back(StringAttr::get(value.getContext(), component));
+        result.push_back({input.value, std::move(fieldPath)});
+      }
+      return result;
+    }
+    return failure();
+  };
+  for (const HardwareEmissionModulePlan &module : plan.modules) {
+    auto owner = value.getParentRegion()
+                     ? value.getParentRegion()->getParentOfType<ac::ModuleOp>()
+                     : ac::ModuleOp();
+    if ((bindings.owner && module.diagnosticAnchor != bindings.owner) ||
+        (!bindings.owner && module.diagnosticAnchor != owner))
+      continue;
+    bool matches =
+        module.concreteBindings.integers.size() == bindings.integers.size() &&
+        module.concreteBindings.types.size() == bindings.types.size();
+    for (const auto &binding : bindings.integers)
+      matches &= module.concreteBindings.integers.lookup(binding.getKey()) ==
+                 binding.getValue();
+    for (const auto &binding : bindings.types)
+      matches &= module.concreteBindings.types.lookup(binding.getKey()) ==
+                 binding.getValue();
+    if (matches)
+      if (auto result = materialize(module.dependencies); succeeded(result))
+        return result;
+  }
+  if (bindings.integers.empty() && bindings.types.empty())
+    for (const HardwareEmissionDefinitionPlan &definition : plan.definitions)
+      if (!bindings.owner || definition.diagnosticAnchor == bindings.owner)
+        if (auto result = materialize(definition.dependencies);
+            succeeded(result))
+          return result;
+  Operation *site = value.getDefiningOp();
+  if (!site)
+    site = bindings.owner;
+  return site->emitOpError()
+         << "hardware dependency is absent from the frozen plan";
 }
 FailureOr<std::string>
 HardwareEmitContext::cppFormalName(StringRef name, Operation *site) const {
@@ -1127,7 +1501,7 @@ FailureOr<std::string> HardwareEmitContext::unsignedStaticValue(
     ac::StaticExprAttr expression, Operation *site, bool rtl,
     const ac::HardwareBindings &bindings) const {
   if (isClosedStatic(expression, bindings)) {
-    auto value = analysis.evaluateStatic(expression, bindings, site);
+    auto value = evaluatedStatic(expression, bindings);
     if (failed(value))
       return failure();
     auto integer = dyn_cast<ac::MathIntAttr>(*value);
@@ -1152,7 +1526,7 @@ FailureOr<std::string> HardwareEmitContext::unsignedStaticValue(
 FailureOr<std::string>
 HardwareEmitContext::cppType(Type type, const ac::HardwareBindings &bindings,
                              Operation *site) const {
-  auto resolved = analysis.resolveType(type, bindings, site);
+  auto resolved = resolvedType(type, bindings);
   if (failed(resolved))
     return failure();
   if (auto bits = dyn_cast<ac::BitsType>(*resolved)) {
@@ -1187,7 +1561,7 @@ FailureOr<std::string> HardwareEmitContext::cppType(Type type,
   if (auto param = dyn_cast<ac::TypeParamType>(type))
     return cppFormalName(param.getName().getValue(), site);
   if (auto enumeration = dyn_cast<ac::EnumType>(type)) {
-    if (failed(analysis.resolveEnum(enumeration, site)))
+    if (!lookupDefinition(enumeration.getName().getValue()))
       return failure();
     auto q = qualified(enumeration.getName().getValue(), site, "::");
     if (failed(q))
@@ -1220,11 +1594,9 @@ FailureOr<std::string> HardwareEmitContext::rtlType(Type type,
     return rtlFormalName(param.getName().getValue(), site);
   Operation *declaration;
   if (auto enumeration = dyn_cast<ac::EnumType>(type)) {
-    if (failed(analysis.resolveEnum(enumeration, site)))
-      return failure();
-    declaration = analysis.lookupEnum(enumeration);
+    declaration = lookupDefinition(enumeration.getName().getValue());
   } else if (auto record = dyn_cast<ac::StructType>(type)) {
-    declaration = analysis.lookupStruct(record);
+    declaration = lookupDefinition(record.getName().getValue());
   } else {
     return site->emitOpError() << "unsupported RTL hardware type";
   }
@@ -1240,11 +1612,11 @@ FailureOr<std::string> HardwareEmitContext::rtlType(Type type,
 }
 FailureOr<std::string>
 HardwareEmitContext::cppInstanceType(ac::InstanceOp instance) const {
-  auto *callee = analysis.resolveCallee(instance);
+  auto *callee = resolveCallee(instance);
   if (!callee)
     return instance.emitOpError() << "unresolved C++ callee";
   std::string result;
-  auto kind = analysis.getPrimitiveKind(callee);
+  auto kind = primitiveKind(callee);
   if (!kind.empty())
     result = "::gfsim::" + kind.str();
   else
@@ -1263,7 +1635,7 @@ HardwareEmitContext::cppInstanceType(ac::InstanceOp instance) const {
     return failure();
   ac::HardwareBindings parent;
   parent.owner = instance->getParentOp();
-  auto bindings = analysis.bindInstance(instance, parent);
+  auto bindings = bindOccurrence(instance, parent);
   if (failed(bindings))
     return failure();
   for (auto raw : callee->getAttrOfType<ArrayAttr>("parameters")) {
@@ -1290,8 +1662,8 @@ static FailureOr<std::string>
 rtlOccurrenceParameters(const HardwareEmitContext &context,
                         Occurrence instance) {
   SmallVector<std::string> assignments;
-  Operation *callee = context.analysis.resolveCallee(instance);
-  const bool primitive = !context.analysis.getPrimitiveKind(callee).empty();
+  Operation *callee = context.resolveCallee(instance);
+  const bool primitive = !context.primitiveKind(callee).empty();
   auto formals = callee->getAttrOfType<ArrayAttr>("parameters");
   if (primitive) {
     for (auto [i, raw] : llvm::enumerate(instance.getParameters())) {
@@ -1311,7 +1683,7 @@ rtlOccurrenceParameters(const HardwareEmitContext &context,
     // empty positional parameter slots are not portable SystemVerilog.
     ac::HardwareBindings parent;
     parent.owner = instance->getParentOp();
-    auto bindings = context.analysis.bindInstance(instance, parent);
+    auto bindings = context.bindOccurrence(instance, parent);
     if (failed(bindings))
       return failure();
     for (auto raw : formals) {
@@ -1365,100 +1737,9 @@ FailureOr<std::string> HardwareEmitContext::cppWireExpression(
 } // namespace acir::compiler
 namespace acir::compiler {
 FailureOr<ac::HardwareBindings> HardwareEmitContext::rootBindings() const {
-  return ac::detail::resolveHardwareRootBindings(analysis);
-}
-FailureOr<std::string> HardwareEmitContext::rootPortMap(bool rtl) {
-  auto system = *package.getOps<ac::SystemOp>().begin();
-  auto root = cast<ac::ModuleOp>(analysis.lookupDefinition(
-      system.getEntry().getAs<FlatSymbolRefAttr>("callee").getValue()));
-  auto bindings = rootBindings();
-  auto layout = ac::getModulePortLayout(root);
-  if (failed(bindings) || failed(layout))
+  if (plan.rootModule >= plan.modules.size())
     return failure();
-  auto signature = root.getFunctionType();
-  llvm::json::Array inputs, outputs, controls;
-  auto describe = [&](Type type, StringRef name,
-                      unsigned ordinal) -> FailureOr<llvm::json::Object> {
-    auto wire = legalizeIdentifier(name, [&] { return root.emitOpError(); });
-    auto width = analysis.getPackedWidth(type, *bindings, root);
-    auto leaves = analysis.getLeaves(type, *bindings, root);
-    if (failed(wire) || failed(width) || failed(leaves))
-      return failure();
-    llvm::json::Array fields;
-    for (const auto &leaf : *leaves) {
-      llvm::json::Array path;
-      for (auto part : leaf.path)
-        path.emplace_back(part.getValue());
-      fields.emplace_back(llvm::json::Object{
-          {"path", std::move(path)}, {"low", leaf.low}, {"width", leaf.width}});
-    }
-    return llvm::json::Object{{"ordinal", ordinal},
-                              {"name", name},
-                              {"wire", *wire},
-                              {"width", *width},
-                              {"fields", std::move(fields)}};
-  };
-  for (unsigned i = 0; i < layout->sourceInputCount; ++i) {
-    auto row =
-        describe(signature.getInput(i),
-                 cast<StringAttr>(root.getInputNames()[i]).getValue(), i);
-    if (failed(row))
-      return failure();
-    inputs.emplace_back(std::move(*row));
-  }
-  llvm::DenseSet<int64_t> companions;
-  for (unsigned i = 0; i < layout->sourceOutputCount; ++i) {
-    auto row =
-        describe(signature.getResult(i),
-                 cast<StringAttr>(root.getOutputNames()[i]).getValue(), i);
-    if (failed(row))
-      return failure();
-    (*row)["availability"] = nullptr;
-    int64_t companion = layout->outputValidity[i];
-    if (companion >= 0) {
-      auto wire = legalizeIdentifier(
-          cast<StringAttr>(root.getOutputNames()[companion]).getValue(),
-          [&] { return root.emitOpError(); });
-      if (failed(wire))
-        return failure();
-      (*row)["availability"] = *wire;
-      if (companions.insert(companion).second)
-        controls.emplace_back(llvm::json::Object{{"direction", "output"},
-                                                 {"role", "availability"},
-                                                 {"wire", *wire},
-                                                 {"width", 1}});
-    }
-    outputs.emplace_back(std::move(*row));
-  }
-  llvm::json::Object domains{{"clock", nullptr}, {"reset", nullptr}};
-  if (auto domain = root->getAttrOfType<DictionaryAttr>("ac.domain_inputs"))
-    for (StringRef role : {StringRef("clock"), StringRef("reset")})
-      if (auto ordinal = domain.getAs<IntegerAttr>(role))
-        domains[role] = ordinal.getValue().getZExtValue();
-  if (rtl && managesChecks()) {
-    auto control = [&](StringRef direction, StringRef role, StringRef wire,
-                       unsigned width) {
-      controls.emplace_back(llvm::json::Object{{"direction", direction},
-                                               {"role", role},
-                                               {"wire", wire},
-                                               {"width", width}});
-    };
-    control("input", "phase", "pyc_phase", 3);
-    control("input", "commit_permission", "pyc_root_commit_ok", 1);
-    control("output", "check_complete", "pyc_check_complete", 1);
-    control("output", "sampling_error", "pyc_sampling_error", 1);
-    control("output", "local_error", "pyc_local_error", 1);
-  }
-  llvm::json::Value map(llvm::json::Object{{"schema_version", 1},
-                                           {"target", rtl ? "verilog" : "cpp"},
-                                           {"inputs", std::move(inputs)},
-                                           {"outputs", std::move(outputs)},
-                                           {"domains", std::move(domains)},
-                                           {"controls", std::move(controls)}});
-  std::string text;
-  llvm::raw_string_ostream stream(text);
-  stream << map;
-  return text;
+  return plan.modules[plan.rootModule].concreteBindings;
 }
 FailureOr<std::string> HardwareEmitContext::rootCppType() const {
   auto bindings = rootBindings();
@@ -1533,7 +1814,7 @@ HardwareEmitContext::shapeSize(ArrayAttr shape, Operation *site, bool rtl,
 FailureOr<std::string>
 HardwareEmitContext::payloadWidth(Type type, Operation *site, bool rtl,
                                   const ac::HardwareBindings &bindings) const {
-  auto resolved = analysis.resolveType(type, bindings, site);
+  auto resolved = resolvedType(type, bindings);
   if (failed(resolved))
     return failure();
   type = *resolved;
@@ -1549,7 +1830,7 @@ HardwareEmitContext::payloadWidth(Type type, Operation *site, bool rtl,
   if (rtl && isa<ac::StructType, ac::EnumType>(type)) {
     // Nominal layouts are verified by common analysis. Render their finite
     // width directly: $bits(package::type) is not portable in packed ranges.
-    auto width = analysis.getPackedWidth(type, bindings, site);
+    auto width = packedWidth(type, bindings);
     if (failed(width))
       return failure();
     return std::to_string(*width);
@@ -1564,7 +1845,7 @@ FailureOr<std::string>
 HardwareEmitContext::cppBoundModuleType(Operation *definition,
                                         const ac::HardwareBindings &bindings,
                                         Operation *site, bool kernel) const {
-  StringRef kind = analysis.getPrimitiveKind(definition);
+  StringRef kind = primitiveKind(definition);
   if (kernel && kind.empty())
     return site->emitOpError()
            << "only standard storage leaves have a kernel type";
@@ -1658,7 +1939,7 @@ HardwareEmitContext::viewIndex(ac::TableViewOp view, StringRef ordinal,
       auto size = cast<ac::StaticExprAttr>(output.getShape()[axis]);
       bool singleton = false;
       if (isClosedStatic(size, bindings)) {
-        auto n = analysis.evaluateStatic(size, bindings, view);
+        auto n = evaluatedStatic(size, bindings);
         singleton = succeeded(n) &&
                     cast<ac::MathIntAttr>(*n).getCanonicalValue() == "1";
       }
@@ -1690,18 +1971,19 @@ HardwareEmitContext::viewIndex(ac::TableViewOp view, StringRef ordinal,
                          bindings) &&
           isClosedStatic(cast<ac::StaticExprAttr>(parameters.get("axis")),
                          bindings)) {
-        auto source = analysis.getViewSourceOrdinal(view, 0, bindings);
-        auto shape = analysis.getTableShape(input, bindings, view);
-        if (failed(source) || failed(shape))
-          return failure();
+        const auto *planned = tableViewPlan(view, bindings);
+        if (!planned)
+          return view.emitOpError()
+                 << "table view is absent from the frozen emission plan";
         uint64_t stride = 1;
-        for (size_t j = axis + 1; j < shape->size(); ++j)
-          stride *= (*shape)[j];
-        shift = std::to_string((*source / stride) % (*shape)[axis]);
+        for (size_t j = axis + 1; j < planned->inputShape.size(); ++j)
+          stride *= planned->inputShape[j];
+        shift = std::to_string((planned->sourceOrdinalZero / stride) %
+                               planned->inputShape[axis]);
       } else {
         auto offsetExpr = cast<ac::StaticExprAttr>(parameters.get("offset"));
         if (isClosedStatic(offsetExpr, bindings)) {
-          auto value = analysis.evaluateStatic(offsetExpr, bindings, view);
+          auto value = evaluatedStatic(offsetExpr, bindings);
           if (failed(value))
             return failure();
           llvm::APSInt integer(
@@ -1751,7 +2033,7 @@ namespace acir::compiler {
 FailureOr<std::string> HardwareEmitContext::cppBoundFamilyType(
     Operation *definition, const ac::HardwareBindings &bindings,
     Operation *site, StringRef count) const {
-  if (!analysis.getPrimitiveKind(definition).empty())
+  if (!primitiveKind(definition).empty())
     return site->emitOpError()
            << "standard leaves use collection_storage of their kernel";
   auto type = cppBoundModuleType(definition, bindings, site);
@@ -1774,11 +2056,7 @@ observationPayloadWidth(HardwareEmitContext &context,
   ac::HardwareBindings bindings = std::move(*rootBindings);
   for (auto [operation, lane] : occurrence.path) {
     (void)lane;
-    auto child = isa<ac::InstanceOp>(operation)
-                     ? context.analysis.bindInstance(
-                           cast<ac::InstanceOp>(operation), bindings)
-                     : context.analysis.bindInstance(
-                           cast<ac::CollectionOp>(operation), bindings);
+    auto child = context.bindOccurrence(operation, bindings);
     if (failed(child))
       return failure();
     bindings = std::move(*child);
@@ -1787,33 +2065,32 @@ observationPayloadWidth(HardwareEmitContext &context,
   Value observed = occurrence.site.carriesValue
                        ? observe.getValues()[occurrence.site.valueIndex]
                        : observe.getPath();
-  auto width =
-      context.analysis.getPackedWidth(observed.getType(), bindings, observe);
-  if (failed(width))
-    return failure();
-  if (*width == 0 || *width > std::numeric_limits<std::uint32_t>::max())
+  const auto *type = context.concreteValueType(observed, bindings);
+  if (!type)
+    return observe.emitOpError()
+           << "observation payload is absent from the frozen type plan";
+  uint64_t width = type->packedWidth;
+  if (width == 0 || width > std::numeric_limits<std::uint32_t>::max())
     return observe.emitOpError()
            << "observation payload width exceeds Runtime capacity";
-  if (occurrence.site.gauge && *width > 64)
+  if (occurrence.site.gauge && width > 64)
     return observe.emitOpError() << "numeric report requires at most 64 bits";
-  return *width;
+  return width;
 }
 FailureOr<std::string>
 cppObservationDescriptorTable(HardwareEmitContext &context) {
-  auto plan = buildObservationPlan(context);
-  if (failed(plan))
-    return failure();
+  const ObservationEmissionPlan &plan = context.observationPlan();
   // An unobserved design keeps the empty configuration and emits no table at
   // all, so its generated glue stays byte-identical to the previous emitter.
-  if (plan->table.empty())
+  if (plan.table.empty())
     return std::string();
   std::string text;
   llvm::raw_string_ostream out(text);
   out << "static constexpr gfsim::ObservationDescriptor "
          "pyc_observation_descriptors["
-      << plan->table.size() << "] = {";
-  for (auto [index, entry] : llvm::enumerate(plan->table)) {
-    const auto &occurrence = plan->occurrences[index];
+      << plan.table.size() << "] = {";
+  for (auto [index, entry] : llvm::enumerate(plan.table)) {
+    const auto &occurrence = plan.occurrences[index];
     auto observe = cast<ac::SourceObserveOp>(occurrence.site.op);
     auto width = observationPayloadWidth(context, occurrence);
     if (failed(width))
@@ -1831,41 +2108,32 @@ cppObservationDescriptorTable(HardwareEmitContext &context) {
 }
 FailureOr<std::string>
 cppObservationConfigureCall(HardwareEmitContext &context) {
-  auto plan = buildObservationPlan(context);
-  if (failed(plan))
-    return failure();
-  if (plan->table.empty())
+  const ObservationEmissionPlan &plan = context.observationPlan();
+  if (plan.table.empty())
     return std::string("observations_.Configure({}, 0)");
   return "observations_.Configure(pyc_observation_descriptors, " +
-         std::to_string(plan->events) + ")";
+         std::to_string(plan.events) + ")";
 }
 FailureOr<std::string> cppObservationChildBase(HardwareEmitContext &context,
                                                ac::ModuleOp definition,
                                                unsigned childIndex) {
-  auto plan = buildObservationPlan(context);
-  if (failed(plan))
-    return failure();
-  auto bases = plan->childBaseUnits.find(definition);
-  if (bases == plan->childBaseUnits.end() || childIndex >= bases->second.size())
+  const ObservationEmissionPlan &plan = context.observationPlan();
+  auto bases = plan.childBaseUnits.find(definition);
+  if (bases == plan.childBaseUnits.end() || childIndex >= bases->second.size())
     return definition.emitOpError() << "native observation child is unplanned";
   return std::to_string(bases->second[childIndex]);
 }
 FailureOr<uint64_t> cppObservationLaneStride(HardwareEmitContext &context,
                                              ac::ModuleOp definition) {
-  auto plan = buildObservationPlan(context);
-  if (failed(plan))
-    return failure();
-  auto sites = plan->definitions.find(definition);
-  return sites == plan->definitions.end()
+  const ObservationEmissionPlan &plan = context.observationPlan();
+  auto sites = plan.definitions.find(definition);
+  return sites == plan.definitions.end()
              ? uint64_t{0}
              : static_cast<uint64_t>(sites->second.size());
 }
 FailureOr<uint64_t> cppObservationSubtreeWidth(HardwareEmitContext &context,
                                                ac::ModuleOp definition) {
-  auto plan = buildObservationPlan(context);
-  if (failed(plan))
-    return failure();
-  return plan->subtreeWidth.lookup(definition);
+  return context.observationPlan().subtreeWidth.lookup(definition);
 }
 LogicalResult
 cppObservationStaging(HardwareEmitContext &context, ac::ModuleOp definition,
@@ -1873,11 +2141,9 @@ cppObservationStaging(HardwareEmitContext &context, ac::ModuleOp definition,
                       llvm::StringRef object, llvm::StringRef count,
                       const std::function<FailureOr<std::string>(Value)> &value,
                       llvm::raw_ostream &out) {
-  auto plan = buildObservationPlan(context);
-  if (failed(plan))
-    return failure();
-  auto sites = plan->definitions.find(definition);
-  if (sites == plan->definitions.end() || sites->second.empty())
+  const ObservationEmissionPlan &plan = context.observationPlan();
+  auto sites = plan.definitions.find(definition);
+  if (sites == plan.definitions.end() || sites->second.empty())
     return success();
   // One staged value per descriptor, so every observed operand keeps its own
   // `ObservationDescriptor` and therefore its own globally unique ordinal.
@@ -1892,11 +2158,11 @@ cppObservationStaging(HardwareEmitContext &context, ac::ModuleOp definition,
       return failure();
     Value observed = site.carriesValue ? observe.getValues()[site.valueIndex]
                                        : observe.getPath();
-    auto resolvedWidth =
-        context.analysis.getPackedWidth(observed.getType(), bindings, observe);
-    if (failed(resolvedWidth))
-      return failure();
-    uint64_t width = *resolvedWidth;
+    const auto *type = context.concreteValueType(observed, bindings);
+    if (!type)
+      return observe.emitOpError()
+             << "observation payload is absent from the frozen type plan";
+    uint64_t width = type->packedWidth;
     if (site.gauge && width > 64)
       return observe.emitOpError() << "numeric report requires at most 64 bits";
     auto payload = context.cppType(observed.getType(), bindings, observe);
@@ -1936,14 +2202,14 @@ bool HardwareEmitContext::isSystem() {
     return false;
   auto callee =
       (*entries.begin()).getEntry().getAs<FlatSymbolRefAttr>("callee");
-  auto *root = callee ? analysis.lookupDefinition(callee.getValue()) : nullptr;
+  auto *root = callee ? lookupDefinition(callee.getValue()) : nullptr;
   auto kind =
       root ? root->getAttrOfType<StringAttr>("ac.root_kind") : StringAttr();
   return kind && kind.getValue() == "system";
 }
 FailureOr<ObservationEmissionPlan>
 observationEmissionPlan(HardwareEmitContext &context) {
-  return buildObservationPlan(context);
+  return context.observationPlan();
 }
 namespace {
 FailureOr<llvm::json::Value> metadataValue(Attribute value, Operation *site) {

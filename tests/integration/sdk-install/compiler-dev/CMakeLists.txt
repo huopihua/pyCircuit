@@ -6,6 +6,7 @@ add_executable(compiler_dev_consumer main.cpp)
 target_compile_features(compiler_dev_consumer PRIVATE cxx_std_20)
 target_link_libraries(compiler_dev_consumer PRIVATE
   pycircuit::ACIRDialect
+  pycircuit::ACIRCodegen
   pycircuit::GFIRDialect
   pycircuit::ACIRSourceCompiler
 )

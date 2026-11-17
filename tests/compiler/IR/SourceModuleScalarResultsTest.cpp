@@ -1,6 +1,5 @@
 // Production source capture and owning interfaces authenticate scalar results.
-#include "Compiler/FinalCppSourceParts.h"
-#include "Compiler/FinalVerilogSourceParts.h"
+#include "Compiler/BackendRenderPlan.h"
 #include "Compiler/LiteralPayloadWires.h"
 #include "Compiler/SourceLink.h"
 #include "Compiler/SourceUnit.h"
@@ -10,6 +9,7 @@
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "pycircuit/Dialect/ACIR/ACIRDialect.h"
+#include "pycircuit/Dialect/ACIR/HardwareAnalysis.h"
 #include "pycircuit/Dialect/GFIR/GFIRDialect.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
@@ -114,16 +114,16 @@ output.write_text(_emit_source_transport(_capture_source_file(source, source_roo
         SymbolTable::lookupSymbolIn(file, symbol));
   }
   void dualEmit(ModuleOp file) {
-    ac::HardwareAnalysis analysis(file);
-    ASSERT_TRUE(succeeded(analysis.verify())) << diagnostics;
-    auto cpp = compiler::emitCppSourceParts(file, analysis);
+    auto hardware = compiler::prepareHardwareEmissionPlan(file);
+    ASSERT_TRUE(succeeded(hardware)) << diagnostics;
+    auto cpp = compiler::prepareCppRenderPlan(*hardware);
     ASSERT_TRUE(succeeded(cpp)) << diagnostics;
-    EXPECT_FALSE(cpp->sourceGroups.empty());
-    EXPECT_FALSE(cpp->systemHeader.empty());
-    auto rtl = compiler::emitVerilogSourceParts(file, analysis);
+    EXPECT_FALSE(cpp->get().parts.sourceGroups.empty());
+    EXPECT_FALSE(cpp->get().parts.systemHeader.empty());
+    auto rtl = compiler::prepareVerilogRenderPlan(*hardware);
     ASSERT_TRUE(succeeded(rtl)) << diagnostics;
-    EXPECT_FALSE(rtl->sourceGroups.empty());
-    EXPECT_FALSE(rtl->core.empty());
+    EXPECT_FALSE(rtl->get().parts.sourceGroups.empty());
+    EXPECT_FALSE(rtl->get().parts.core.empty());
   }
   std::string text(Operation *operation) {
     std::string result;

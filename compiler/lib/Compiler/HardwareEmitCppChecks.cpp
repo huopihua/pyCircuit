@@ -49,16 +49,11 @@ FailureOr<Address> address(HardwareEmitContext &context, uint64_t ownerIndex) {
       return failure();
     result.object += "->pyc_instance_" + *name;
     result.suffix += "." + raw.getValue().str();
-    auto child = isa<ac::InstanceOp>(step.allocation)
-                     ? context.analysis.bindInstance(
-                           cast<ac::InstanceOp>(step.allocation), scope)
-                     : context.analysis.bindInstance(
-                           cast<ac::CollectionOp>(step.allocation), scope);
+    auto child = context.bindOccurrence(step.allocation, scope);
     if (failed(child))
       return failure();
     if (auto collection = dyn_cast<ac::CollectionOp>(step.allocation)) {
-      auto shape = context.analysis.resolveShape(collection.getShape(), scope,
-                                                 collection);
+      auto shape = context.occurrenceShape(collection, scope);
       if (failed(shape) || shape->size() != step.coordinates.size())
         return failure();
       uint64_t count = 1, coordinate = 0;

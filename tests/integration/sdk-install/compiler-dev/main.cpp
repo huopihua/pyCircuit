@@ -1,10 +1,21 @@
-#include "pycircuit/Dialect/ACIR/ACIRDialect.h"
-#include "pycircuit/Dialect/GFIR/GFIRDialect.h"
+#include "Compiler/BackendRenderPlan.h"
 #include "Compiler/FinalCppSourceParts.h"
+#include "Compiler/HardwareEmissionPlan.h"
 #include "Compiler/SourceUnit.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/MLIRContext.h"
+#include "pycircuit/Dialect/ACIR/ACIRDialect.h"
+#include "pycircuit/Dialect/GFIR/GFIRDialect.h"
+
+#include <type_traits>
+
+static_assert(!std::is_copy_constructible_v<
+              acir::compiler::VerifiedHardwareEmissionPlan>);
+static_assert(
+    !std::is_copy_constructible_v<acir::compiler::VerifiedCppRenderPlan>);
+static_assert(
+    !std::is_copy_constructible_v<acir::compiler::VerifiedVerilogRenderPlan>);
 
 int main() {
   mlir::DialectRegistry registry;
@@ -23,8 +34,16 @@ int main() {
 
   acir::compiler::SourceUnitArtifacts unitArtifacts;
   acir::compiler::FinalCppSourceParts cppParts;
+  acir::compiler::CppRenderPlan cppRenderPlan;
+  acir::compiler::VerilogRenderPlan verilogRenderPlan;
+  acir::compiler::HardwareEmissionPlan hardwarePlan;
   return dialect == nullptr || mlir::failed(sourceHeaders) ||
-                 !cppParts.sourceGroups.empty() || unitArtifacts.body
+                 mlir::succeeded(acir::compiler::verifyHardwareEmissionPlan(
+                     hardwarePlan)) ||
+                 !cppParts.sourceGroups.empty() ||
+                 !cppRenderPlan.parts.sourceGroups.empty() ||
+                 !verilogRenderPlan.parts.sourceGroups.empty() ||
+                 unitArtifacts.body
              ? 1
              : 0;
 }

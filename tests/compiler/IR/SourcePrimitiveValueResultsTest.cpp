@@ -1,7 +1,6 @@
 // Typed Module results remain ordinary values when canonical storage leaves
 // are allocated and bound through Module-scope structural wiring.
-#include "Compiler/FinalCppSourceParts.h"
-#include "Compiler/FinalVerilogSourceParts.h"
+#include "Compiler/BackendRenderPlan.h"
 #include "Compiler/SourceLink.h"
 #include "Compiler/SourceUnit.h"
 #include "mlir/IR/Builders.h"
@@ -121,16 +120,16 @@ output.write_text(_emit_source_transport(_capture_source_file(source, source_roo
   }
 
   void dualEmit(ModuleOp file) {
-    ac::HardwareAnalysis analysis(file);
-    ASSERT_TRUE(succeeded(analysis.verify())) << diagnostics;
-    auto cpp = compiler::emitCppSourceParts(file, analysis);
+    auto hardware = compiler::prepareHardwareEmissionPlan(file);
+    ASSERT_TRUE(succeeded(hardware)) << diagnostics;
+    auto cpp = compiler::prepareCppRenderPlan(*hardware);
     ASSERT_TRUE(succeeded(cpp)) << diagnostics;
-    EXPECT_FALSE(cpp->sourceGroups.empty());
-    EXPECT_FALSE(cpp->systemHeader.empty());
-    auto rtl = compiler::emitVerilogSourceParts(file, analysis);
+    EXPECT_FALSE(cpp->get().parts.sourceGroups.empty());
+    EXPECT_FALSE(cpp->get().parts.systemHeader.empty());
+    auto rtl = compiler::prepareVerilogRenderPlan(*hardware);
     ASSERT_TRUE(succeeded(rtl)) << diagnostics;
-    EXPECT_FALSE(rtl->sourceGroups.empty());
-    EXPECT_FALSE(rtl->core.empty());
+    EXPECT_FALSE(rtl->get().parts.sourceGroups.empty());
+    EXPECT_FALSE(rtl->get().parts.core.empty());
   }
 
   void expectResultKinds(ac::ModuleImportOp declaration,

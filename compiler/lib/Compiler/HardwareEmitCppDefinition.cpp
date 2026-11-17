@@ -88,7 +88,7 @@ public:
       return failure();
     if (resetting) {
       for (auto &leaf : storage) {
-        StringRef kind = ctx.analysis.getPrimitiveKind(leaf.bindings.owner);
+        StringRef kind = ctx.primitiveKind(leaf.bindings.owner);
         if (kind == "dff" || kind == "dffe") {
           unsigned index = kind == "dff" ? 3 : 4;
           auto init = emit(*leaf.scope, leaf.op->getOperand(index));
@@ -106,11 +106,9 @@ public:
       }
       return success();
     }
-    auto partitions =
-        ctx.analysis.getIndependentWorkSubtrees(scopes.front().definition);
-    if (failed(partitions))
-      return failure();
-    delegated = std::move(*partitions);
+    delegated.append(
+        ctx.independentWorkChildren(scopes.front().definition).begin(),
+        ctx.independentWorkChildren(scopes.front().definition).end());
     // Prepare immutable task inputs through the existing pure SSA schedule.
     // Self-feedback reads temporal outputs; no leaf Work runs in this step.
     for (Operation *task : delegated)
@@ -197,7 +195,7 @@ private:
     return legalizeIdentifier(raw, [&] { return site->emitOpError(); });
   }
   FailureOr<Type> type(Type t, Scope &s, Operation *site) {
-    return ctx.analysis.resolveType(t, s.bindings, site);
+    return ctx.resolvedType(t, s.bindings);
   }
   FailureOr<std::string> payload(Type t, Scope &s, Operation *site) {
     auto r = type(t, s, site);
@@ -270,8 +268,7 @@ private:
       if (failed(unwrap()))
         return failure();
       auto record = dyn_cast<ac::StructType>(t);
-      auto declaration = record ? ctx.analysis.lookupStruct(record)
-                                : ac::StructOp();
+      auto declaration = record ? ctx.lookupStruct(record) : ac::StructOp();
       if (!declaration)
         return site->emitOpError() << "field plan projects non-struct payload";
       bool after = false;
@@ -339,10 +336,7 @@ private:
     return nullptr;
   }
   FailureOr<ac::HardwareBindings> bind(Operation *op, Scope &s) {
-    return isa<ac::InstanceOp>(op)
-               ? ctx.analysis.bindInstance(cast<ac::InstanceOp>(op), s.bindings)
-               : ctx.analysis.bindInstance(cast<ac::CollectionOp>(op),
-                                           s.bindings);
+    return ctx.bindOccurrence(op, s.bindings);
   }
   LogicalResult collect(Scope &s) {
     for (Operation &op : s.definition.getBody().front())
@@ -359,8 +353,7 @@ private:
             return failure();
           count = "(" + count + " * (" + *n + "))";
         }
-        if (isQueue(&op) ||
-            !ctx.analysis.getPrimitiveKind(b->owner).empty()) {
+        if (isQueue(&op) || !ctx.primitiveKind(b->owner).empty()) {
           auto kernel = isQueue(&op)
                             ? queueKernelType(ctx, cast<ac::InstanceOp>(op),
                                               s.bindings)
@@ -382,7 +375,7 @@ private:
   FailureOr<std::string> pinName(Operation *op, unsigned port, bool output) {
     if (isQueue(op))
       return id(queuePinNames(output)[port], op);
-    auto *callee = ctx.analysis.lookupDefinition(
+    auto *callee = ctx.lookupDefinition(
         op->getAttrOfType<FlatSymbolRefAttr>("callee").getValue());
     return id(
         cast<StringAttr>(callee->getAttrOfType<ArrayAttr>(
@@ -401,10 +394,7 @@ private:
     if (failed(b))
       return failure();
     return s.object + ownerPrefix(op).str() + *name +
-           (!isQueue(op) &&
-                    ctx.analysis.getPrimitiveKind(b->owner).empty()
-                ? "->"
-                : "_") +
+           (!isQueue(op) && ctx.primitiveKind(b->owner).empty() ? "->" : "_") +
            *pin;
   }
   LogicalResult setPort(Scope &s, Operation *op, unsigned port, Path path,
@@ -441,7 +431,7 @@ private:
       return "typename " + leaf.kernel + "::Inputs{" + join(pins, ", ") + "}";
     }
     auto names = leaf.bindings.owner->getAttrOfType<ArrayAttr>("input_names");
-    StringRef kind = ctx.analysis.getPrimitiveKind(leaf.bindings.owner);
+    StringRef kind = ctx.primitiveKind(leaf.bindings.owner);
     SmallVector<std::string> pins;
     for (auto raw : names) {
       auto name = id(cast<StringAttr>(raw).getValue(), leaf.op);
@@ -489,7 +479,7 @@ private:
         return failure();
       pins.push_back(leaf.prefix + *name + ".element(" + lane.str() + ")");
     }
-    StringRef kind = ctx.analysis.getPrimitiveKind(leaf.bindings.owner);
+    StringRef kind = ctx.primitiveKind(leaf.bindings.owner);
     if (kind == "sync_mem" || kind == "sync_mem_dp") {
       unsigned reads = kind == "sync_mem_dp" ? 2 : 1;
       if (pins.size() != 2 * reads)
@@ -552,7 +542,7 @@ private:
         << "; ++pyc_lane) " << leaf.prefix << "state->work(pyc_lane, " << *in
         << ", " << *q << ");\n";
     leaf.sampled = true;
-    if (ctx.analysis.getPrimitiveKind(leaf.bindings.owner) == "byte_mem")
+    if (ctx.primitiveKind(leaf.bindings.owner) == "byte_mem")
       leaf.readComputed = true;
     return success();
   }
@@ -584,8 +574,7 @@ private:
       return failure();
     FailureOr<std::string> result = failure();
     if (isa<ac::StructType>(*selected)) {
-      auto leaves =
-          ctx.analysis.getFieldPaths(*selected, s.bindings, s.definition);
+      auto leaves = ctx.fieldPaths(*selected, s.bindings);
       auto temp = declarePlane(s, v, path);
       auto count = planeCount(v.getType(), s, s.definition, path);
       if (failed(leaves) || failed(temp) || failed(count))
@@ -651,7 +640,7 @@ private:
     if (failed(w))
       return failure();
     if (ctx.isClosedStatic(op.getValue(), s.bindings)) {
-      auto raw = ctx.analysis.evaluateStatic(op.getValue(), s.bindings, op);
+      auto raw = ctx.evaluatedStatic(op.getValue(), s.bindings);
       if (failed(raw))
         return failure();
       auto integer = dyn_cast<ac::MathIntAttr>(*raw);
@@ -701,8 +690,7 @@ private:
     if (auto constantOp = dyn_cast<ac::BitsConstantOp>(op))
       return constant(constantOp, s);
     if (auto create = dyn_cast<ac::EnumCreateOp>(op)) {
-      auto definition =
-          ctx.analysis.resolveEnum(create.getResult().getType(), op);
+      auto definition = ctx.resolveEnum(create.getResult().getType(), op);
       if (failed(definition))
         return failure();
       for (const auto &member : definition->members)
@@ -718,8 +706,7 @@ private:
         return failure();
       if (cast<OpResult>(value).getResultNumber() == 0)
         return *raw;
-      auto definition =
-          ctx.analysis.resolveEnum(fromBits.getValue().getType(), op);
+      auto definition = ctx.resolveEnum(fromBits.getValue().getType(), op);
       if (failed(definition))
         return failure();
       SmallVector<std::string> membership;
@@ -749,8 +736,7 @@ private:
       return operand(get.getValue(), p);
     }
     if (auto create = dyn_cast<ac::StructCreateOp>(op)) {
-      auto fields =
-          ctx.analysis.lookupStruct(create.getResult().getType()).getFields();
+      auto fields = ctx.lookupStruct(create.getResult().getType()).getFields();
       if (!path.empty())
         for (auto [i, raw] : llvm::enumerate(fields))
           if (cast<DictionaryAttr>(raw).getAs<StringAttr>("name") ==
@@ -809,7 +795,7 @@ private:
         }
         return *base;
       }
-      auto leaves = ctx.analysis.getFieldPaths(value.getType(), s.bindings, op);
+      auto leaves = ctx.fieldPaths(value.getType(), s.bindings);
       if (failed(leaves))
         return failure();
       std::string text;
@@ -960,8 +946,7 @@ private:
         return isa<ac::StructType, ac::EnumType>(current);
       }
       auto record = dyn_cast<ac::StructType>(current);
-      auto declaration =
-          record ? ctx.analysis.lookupStruct(record) : ac::StructOp();
+      auto declaration = record ? ctx.lookupStruct(record) : ac::StructOp();
       if (!declaration)
         return site->emitOpError() << "constant field path requires a struct";
       Type selected;
@@ -1002,8 +987,7 @@ private:
     if (auto enumeration = dyn_cast<ac::EnumCreateOp>(op)) {
       if (!path.empty())
         return false;
-      auto definition =
-          ctx.analysis.resolveEnum(enumeration.getResult().getType(), op);
+      auto definition = ctx.resolveEnum(enumeration.getResult().getType(), op);
       if (failed(definition))
         return failure();
       return llvm::any_of(definition->members, [&](const auto &member) {
@@ -1030,8 +1014,7 @@ private:
       return true;
     }
     if (auto create = dyn_cast<ac::StructCreateOp>(op)) {
-      auto declaration =
-          ctx.analysis.lookupStruct(create.getResult().getType());
+      auto declaration = ctx.lookupStruct(create.getResult().getType());
       if (!declaration)
         return op->emitOpError() << "unresolved constant-plane struct";
       if (path.empty()) {
@@ -1283,7 +1266,7 @@ private:
       if (failed(b))
         return failure();
       unsigned port = cast<OpResult>(v).getResultNumber();
-      if (ctx.analysis.getPrimitiveKind(b->owner).empty()) {
+      if (ctx.primitiveKind(b->owner).empty()) {
         if (tasksFinished && &s == &scopes.front() &&
             llvm::is_contained(delegated, op)) {
           auto pin = pinObject(s, op, port, true);
@@ -1298,7 +1281,7 @@ private:
             cast<ac::YieldOp>(nested->definition.getBody().front().back());
         return emit(*nested, yield.getValues()[port], path);
       }
-      if (ctx.analysis.getPrimitiveKind(b->owner) == "byte_mem")
+      if (ctx.primitiveKind(b->owner) == "byte_mem")
         for (auto &leaf : storage)
           if (leaf.scope == &s && leaf.op == op) {
             // Read only committed storage while evaluating combinational SSA.
@@ -1326,8 +1309,7 @@ private:
     if (auto create = dyn_cast<ac::StructCreateOp>(op);
         create && !path.empty()) {
       for (auto [i, raw] : llvm::enumerate(
-               ctx.analysis.lookupStruct(create.getResult().getType())
-                   .getFields()))
+               ctx.lookupStruct(create.getResult().getType()).getFields()))
         if (cast<DictionaryAttr>(raw).getAs<StringAttr>("name") == path.front())
           return emit(s, create.getValues()[i],
                       Path(path.begin() + 1, path.end()));
@@ -1371,7 +1353,7 @@ private:
         inputs.push_back({i, p, *text});
         return success();
       }
-      auto deps = ctx.analysis.getDependencies(v, p, s.bindings);
+      auto deps = ctx.dependencies(v, p, s.bindings);
       if (failed(deps))
         return failure();
       for (auto d : *deps)
@@ -1770,9 +1752,7 @@ FailureOr<SmallVector<ChildInfo>> childInfo(HardwareEmitContext &ctx,
       auto name = legalizeIdentifier(
           op.getAttrOfType<StringAttr>("instance_name").getValue(),
           [&] { return op.emitOpError(); });
-      auto b = isa<ac::InstanceOp>(op)
-              ? ctx.analysis.bindInstance(cast<ac::InstanceOp>(op), parent)
-              : ctx.analysis.bindInstance(cast<ac::CollectionOp>(op), parent);
+      auto b = ctx.bindOccurrence(&op, parent);
       if (failed(name) || failed(b))
         return failure();
       std::string count = "pyc_count";
@@ -1782,8 +1762,7 @@ FailureOr<SmallVector<ChildInfo>> childInfo(HardwareEmitContext &ctx,
           return failure();
         count = "(pyc_count * (" + *n + "))";
       }
-      bool leaf = isQueue(&op) ||
-                  !ctx.analysis.getPrimitiveKind(b->owner).empty();
+      bool leaf = isQueue(&op) || !ctx.primitiveKind(b->owner).empty();
       auto type = isQueue(&op)
                       ? queueKernelType(ctx, cast<ac::InstanceOp>(op), parent)
                   : leaf ? ctx.cppBoundModuleType(b->owner, *b, &op, true)
@@ -2035,7 +2014,7 @@ LogicalResult emitHardwareCppDefinition(HardwareEmitContext &ctx,
               return failure();
             q.push_back(child.name + "_" + *n + ".element(pyc_lane)");
           }
-        auto kind = ctx.analysis.getPrimitiveKind(child.bindings.owner);
+        auto kind = ctx.primitiveKind(child.bindings.owner);
         std::string result;
         if (kind == "sync_mem" || kind == "sync_mem_dp") {
           unsigned reads = kind == "sync_mem_dp" ? 2 : 1;

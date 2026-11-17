@@ -41,10 +41,12 @@ target_include_directories(ACIRSourceCompiler PUBLIC
 )
 
 add_acir_library(ACIRCodegen SOURCES
+  BackendRenderPlan.cpp
   FinalCppNames.cpp
   FinalEmitCpp.cpp
   FinalEmitVerilog.cpp
   FinalSourceMap.cpp
+  HardwareEmissionPlan.cpp
   HardwareEmitCommon.cpp
   HardwareEmitCppChecks.cpp
   HardwareEmitCppDefinition.cpp

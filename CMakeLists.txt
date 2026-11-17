@@ -46,6 +46,7 @@ if(PYC_BUILD_COMPILER_DEV)
   # Install the active Compiler interface closure, not every historical header
   # kept for future semantic migration. An unbuilt header is not an SDK API.
   set(_pyc_compiler_headers
+    BackendRenderPlan.h
     FinalCppNames.h
     FinalCppSourceParts.h
     FinalEmitCpp.h
@@ -53,6 +54,7 @@ if(PYC_BUILD_COMPILER_DEV)
     FinalSourceMap.h
     FinalVerilogSourceParts.h
     HardwareEmitCommon.h
+    HardwareEmissionPlan.h
     PythonImportAST.h
     PythonImportContext.h
     PythonImportEnumSyntax.h

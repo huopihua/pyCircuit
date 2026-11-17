@@ -1,5 +1,6 @@
 #ifndef PYCIRCUIT_HARDWARE_EMIT_COMMON_H
 #define PYCIRCUIT_HARDWARE_EMIT_COMMON_H
+#include "HardwareEmissionPlan.h"
 #include "pycircuit/Dialect/ACIR/HardwareAnalysis.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SetVector.h"
@@ -7,21 +8,13 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 namespace acir::compiler {
-struct EmitNames {
-  std::string cppQualified;
-  std::string cppClass;
-  std::string cppNamespace;
-  std::string cppFamilyClass;
-  std::string cppFamilyQualified;
-  std::string rtl;
-  std::string header;
-  std::string source;
-  std::string verilog;
-};
+struct ObservationEmissionPlan;
+using EmitNames = HardwareEmissionDefinitionNames;
 // Actual definition-local references, recorded while emitting physical RTL.
 struct PhysicalVerilogLayout {
   llvm::DenseMap<mlir::Value, std::string> nets;
@@ -34,8 +27,12 @@ struct RtlPackageDependencies {
 };
 class HardwareEmitContext {
 public:
-  HardwareEmitContext(mlir::ModuleOp package, ac::HardwareAnalysis &analysis,
-                      bool physical = false);
+  HardwareEmitContext(
+      const HardwareEmissionPlan &plan,
+      const ac::HardwareSourceCheckPlan &sourceChecks,
+      std::shared_ptr<const ObservationEmissionPlan> &observationPlanCache,
+      const ac::HardwarePhysicalProjection *physicalProjection,
+      bool physical = false);
   mlir::LogicalResult prepare();
   bool isSystem();
   bool managesChecks();
@@ -47,10 +44,50 @@ public:
   // checked module callers; each emitter retains its observation boundary.
   mlir::LogicalResult prepareNativeChecks();
   const ac::HardwareSourceCheckPlan &sourceChecks() const;
+  const ObservationEmissionPlan &observationPlan() const;
   bool resetIfOne() const;
   std::string cppReset(llvm::StringRef expression) const;
   std::string rtlReset(llvm::StringRef expression) const;
   const EmitNames &names(mlir::Operation *definition) const;
+  mlir::Operation *lookupDefinition(llvm::StringRef symbol) const;
+  ac::StructOp lookupStruct(ac::StructType type) const;
+  mlir::FailureOr<ac::EnumDefinitionView>
+  resolveEnum(ac::EnumType type, mlir::Operation *site) const;
+  mlir::Operation *resolveCallee(ac::InstanceOp instance) const;
+  mlir::Operation *resolveCallee(ac::CollectionOp collection) const;
+  llvm::StringRef primitiveKind(mlir::Operation *definition) const;
+  llvm::ArrayRef<mlir::Operation *>
+  independentWorkChildren(mlir::Operation *definition) const;
+  mlir::FailureOr<ac::HardwareBindings>
+  bindOccurrence(mlir::Operation *occurrence,
+                 const ac::HardwareBindings &parent) const;
+  mlir::FailureOr<llvm::SmallVector<uint64_t>>
+  occurrenceShape(mlir::Operation *occurrence,
+                  const ac::HardwareBindings &parent) const;
+  const HardwareEmissionQueuePlan *
+  queuePlan(mlir::Operation *occurrence,
+            const ac::HardwareBindings &parent) const;
+  mlir::FailureOr<llvm::SmallVector<ac::WireEndpoint>>
+  dependencies(mlir::Value value, llvm::ArrayRef<mlir::StringAttr> path,
+               const ac::HardwareBindings &bindings) const;
+  const HardwareEmissionTypePlan *
+  concreteValueType(mlir::Value value,
+                    const ac::HardwareBindings &bindings) const;
+  mlir::FailureOr<mlir::Attribute>
+  evaluatedStatic(ac::StaticExprAttr expression,
+                  const ac::HardwareBindings &bindings) const;
+  mlir::FailureOr<mlir::Type>
+  resolvedType(mlir::Type type, const ac::HardwareBindings &bindings) const;
+  mlir::FailureOr<uint64_t>
+  packedWidth(mlir::Type type, const ac::HardwareBindings &bindings) const;
+  mlir::FailureOr<llvm::SmallVector<ac::FieldPath>>
+  fieldPaths(mlir::Type type, const ac::HardwareBindings &bindings) const;
+  const HardwareEmissionTableViewPlan *
+  tableViewPlan(ac::TableViewOp view,
+                const ac::HardwareBindings &bindings) const;
+  llvm::ArrayRef<mlir::Operation *>
+  observationLogicalSuffix(ac::SourceObserveOp observe,
+                           const ac::HardwareBindings &bindings) const;
   mlir::FailureOr<std::string> cppFormalName(llvm::StringRef name,
                                              mlir::Operation *site) const;
   mlir::FailureOr<std::string> rtlFormalName(llvm::StringRef name,
@@ -72,7 +109,6 @@ public:
   mlir::FailureOr<std::string> staticRtlValue(ac::StaticExprAttr expression,
                                               mlir::Operation *site) const;
   mlir::FailureOr<ac::HardwareBindings> rootBindings() const;
-  mlir::FailureOr<std::string> rootPortMap(bool rtl = true);
   mlir::FailureOr<std::string> rootCppType() const;
   mlir::FailureOr<std::string> rootRtlParameters() const;
   mlir::FailureOr<std::string> cppInstanceType(ac::InstanceOp instance) const;
@@ -105,7 +141,10 @@ public:
   cppWireExpression(mlir::Value value, const ac::HardwareBindings &bindings,
                     mlir::Operation *site) const;
   mlir::ModuleOp package;
-  ac::HardwareAnalysis &analysis;
+  const HardwareEmissionPlan &plan;
+  const ac::HardwareSourceCheckPlan &frozenSourceChecks;
+  std::shared_ptr<const ObservationEmissionPlan> &observationPlanCache;
+  const ac::HardwarePhysicalProjection *frozenPhysicalProjection;
   PhysicalVerilogLayout physicalLayout;
   RtlPackageDependencies *rtlPackage = nullptr;
 
@@ -114,7 +153,10 @@ private:
   bool physical_ = false;
   std::optional<ac::HardwarePhysicalProjection> physicalProjection_;
   std::optional<ac::HardwareSourceCheckPlan> sourceChecks_;
+  std::shared_ptr<const ObservationEmissionPlan> observationPlan_;
   llvm::DenseMap<mlir::Operation *, EmitNames> names_;
+  llvm::StringMap<mlir::Operation *> definitions_;
+  llvm::DenseMap<mlir::Operation *, std::string> primitiveKinds_;
 };
 mlir::LogicalResult emitHardwareCppDefinition(HardwareEmitContext &context,
                                               ac::ModuleOp definition,

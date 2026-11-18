@@ -3,6 +3,7 @@
 
 #include "Compiler/BackendPlanning.h"
 #include "Compiler/HardwareEmitCommon.h"
+#include "mlir/IR/Diagnostics.h"
 
 #include <memory>
 
@@ -15,24 +16,38 @@ class HardwareEmitTestContext final {
 public:
   static mlir::FailureOr<std::unique_ptr<HardwareEmitTestContext>>
   prepare(mlir::ModuleOp package) {
+    mlir::MLIRContext *sourceContext = package.getContext();
     auto hardware = prepareHardwareEmissionPlan(package);
     if (mlir::failed(hardware))
       return mlir::failure();
     return std::unique_ptr<HardwareEmitTestContext>(
-        new HardwareEmitTestContext(std::move(*hardware)));
+        new HardwareEmitTestContext(std::move(*hardware), sourceContext));
   }
 
   HardwareEmitContext &emitter() { return context; }
   const VerifiedHardwareEmissionPlan &hardware() const { return plan; }
 
 private:
-  explicit HardwareEmitTestContext(VerifiedHardwareEmissionPlan plan)
+  explicit HardwareEmitTestContext(VerifiedHardwareEmissionPlan plan,
+                                   mlir::MLIRContext *sourceContext)
       : plan(std::move(plan)),
-        context(this->plan.get(), BackendPlanningAccess::sourceChecks(this->plan),
-                BackendPlanningAccess::observationPlan(this->plan), nullptr) {}
+        context(this->plan.get(),
+                BackendPlanningAccess::sourceChecks(this->plan),
+                BackendPlanningAccess::observationPlan(this->plan), nullptr),
+        diagnosticForwarder(std::make_unique<mlir::ScopedDiagnosticHandler>(
+            context.mlirContext(),
+            [sourceContext](mlir::Diagnostic &diagnostic) {
+              std::string text;
+              llvm::raw_string_ostream out(text);
+              diagnostic.print(out);
+              out.flush();
+              mlir::emitError(mlir::UnknownLoc::get(sourceContext)) << text;
+              return mlir::success();
+            })) {}
 
   VerifiedHardwareEmissionPlan plan;
   HardwareEmitContext context;
+  std::unique_ptr<mlir::ScopedDiagnosticHandler> diagnosticForwarder;
 };
 
 } // namespace acir::compiler::test

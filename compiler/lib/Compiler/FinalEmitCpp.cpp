@@ -90,16 +90,13 @@ LogicalResult emitRecord(HardwareEmitContext &context, ac::StructOp record,
   return success();
 }
 FailureOr<ac::ModuleOp> rootModule(HardwareEmitContext &context) {
-  auto systems = context.package.getOps<ac::SystemOp>();
-  if (!llvm::hasSingleElement(systems))
-    return context.package.emitOpError() << "one system required";
-  auto system = *systems.begin();
-  auto callee = system.getEntry().getAs<FlatSymbolRefAttr>("callee");
-  auto root = callee ? dyn_cast_or_null<ac::ModuleOp>(
-                           context.lookupDefinition(callee.getValue()))
-                     : ac::ModuleOp();
+  auto root =
+      context.plan.rootModule < context.plan.modules.size()
+          ? dyn_cast_or_null<ac::ModuleOp>(
+                context.plan.modules[context.plan.rootModule].diagnosticAnchor)
+          : ac::ModuleOp();
   if (!root)
-    return system.emitOpError() << "root module is unresolved";
+    return context.emitPlanError() << "root module is unresolved";
   return root;
 }
 bool isSystemRoot(ac::ModuleOp root) {
@@ -251,28 +248,9 @@ std::string systemSimulationMain(const SystemControls &controls,
   out.flush();
   return text;
 }
-LogicalResult emitDefinitionOnce(HardwareEmitContext &context,
-                                 ac::ModuleOp module, raw_ostream &out,
-                                 llvm::DenseSet<Operation *> &done) {
-  if (done.contains(module))
-    return success();
-  for (auto &op : module.getBody().front())
-    if (isa<ac::InstanceOp, ac::CollectionOp>(op)) {
-      auto *callee = isa<ac::InstanceOp>(op)
-                         ? context.resolveCallee(cast<ac::InstanceOp>(op))
-                         : context.resolveCallee(cast<ac::CollectionOp>(op));
-      if (auto nested = dyn_cast_or_null<ac::ModuleOp>(callee))
-        if (nested.getSourceOwner() == module.getSourceOwner() &&
-            failed(emitDefinitionOnce(context, nested, out, done)))
-          return failure();
-    }
-  done.insert(module);
-  return emitHardwareCppDefinition(context, module, out);
-}
 } // namespace
 FailureOr<FinalCppSourceParts>
 prepareCppSourceParts(const VerifiedHardwareEmissionPlan &hardware) {
-  ModuleOp package = hardware->package;
   HardwareEmitContext context(
       hardware.get(), BackendPlanningAccess::sourceChecks(hardware),
       BackendPlanningAccess::observationPlan(hardware), nullptr);
@@ -281,15 +259,19 @@ prepareCppSourceParts(const VerifiedHardwareEmissionPlan &hardware) {
   // their generated execution boundary. Checks belonging only to unselected
   // definitions are still verified but do not require a root check lifecycle.
   if (failed(context.prepareNativeChecks()))
-    return failure();
+    return hardware.get().package->emitOpError()
+           << "C++ emission preparation failed";
   auto root = rootModule(context);
   if (failed(root))
     return failure();
-  return emitPreparedCppSourceParts(context);
+  auto parts = emitPreparedCppSourceParts(context);
+  if (failed(parts))
+    return hardware.get().package->emitOpError()
+           << "C++ source generation failed";
+  return parts;
 }
 FailureOr<FinalCppSourceParts>
 emitPreparedCppSourceParts(HardwareEmitContext &context) {
-  auto package = context.package;
   // The retained view never grants authority after mutation. Both public and
   // internal native gates consume this exact verified emission implementation.
   auto root = rootModule(context);
@@ -363,11 +345,12 @@ emitPreparedCppSourceParts(HardwareEmitContext &context) {
       "\n";
   {
     llvm::raw_string_ostream out(parts.supportHeader);
-    for (auto declaration : package.getOps<ac::EnumOp>())
-      if (failed(emitEnum(context, declaration, out)))
+    for (Operation *declaration : context.plan.nominalDeclarations)
+      if (auto enumeration = dyn_cast<ac::EnumOp>(declaration);
+          enumeration && failed(emitEnum(context, enumeration, out)))
         return failure();
     llvm::DenseSet<Operation *> done;
-    for (Operation &operation : package.getBody()->getOperations())
+    for (Operation *operation : context.plan.nominalDeclarations)
       if (auto record = dyn_cast<ac::StructOp>(operation))
         if (failed(emitRecord(context, record, out, done)))
           return failure();
@@ -400,12 +383,11 @@ emitPreparedCppSourceParts(HardwareEmitContext &context) {
       group.header += "#include \"" + item.getKey().str() + "\"\n";
     {
       llvm::raw_string_ostream out(group.header);
-      llvm::DenseSet<Operation *> done;
-      for (unsigned definitionIndex : unit.definitionIndices) {
+      for (unsigned definitionIndex : unit.emissionOrder) {
         auto module = cast<ac::ModuleOp>(
             context.plan.definitions[definitionIndex].diagnosticAnchor);
-        if (failed(emitDefinitionOnce(context, module, out, done)))
-          return failure();
+        if (failed(emitHardwareCppDefinition(context, module, out)))
+          return module.emitOpError() << "C++ definition emission failed";
       }
       out.flush();
     }

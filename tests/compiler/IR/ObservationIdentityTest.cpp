@@ -377,11 +377,17 @@ TEST_F(ObservationIdentityTest,
   auto emission = acir::compiler::observationEmissionPlan(emitter);
   ASSERT_TRUE(succeeded(emission)) << diagnostics;
   ASSERT_EQ(emission->occurrences.size(), 3u);
-  EXPECT_EQ(emission->occurrences[0].site.op, earlier.getOperation());
+  auto event = [](const acir::compiler::ObservationEmissionOccurrence &item) {
+    return cast<ac::SourceObserveOp>(item.site.diagnosticAnchor)
+        ->getAttrOfType<DictionaryAttr>("spec")
+        .getAs<StringAttr>("event")
+        .getValue();
+  };
+  EXPECT_EQ(event(emission->occurrences[0]), "earlier");
   EXPECT_EQ(emission->occurrences[0].site.valueIndex, 0u);
-  EXPECT_EQ(emission->occurrences[1].site.op, later.getOperation());
+  EXPECT_EQ(event(emission->occurrences[1]), "later");
   EXPECT_EQ(emission->occurrences[1].site.valueIndex, 0u);
-  EXPECT_EQ(emission->occurrences[2].site.op, later.getOperation());
+  EXPECT_EQ(event(emission->occurrences[2]), "later");
   EXPECT_EQ(emission->occurrences[2].site.valueIndex, 1u);
 
   auto metadata = acir::compiler::observationSiteMetadataJson(earlier);
@@ -413,13 +419,20 @@ TEST_F(ObservationIdentityTest,
   auto emission = acir::compiler::observationEmissionPlan(emitter);
   ASSERT_TRUE(succeeded(emission)) << diagnostics;
   ASSERT_EQ(emission->occurrences.size(), 4u);
-  EXPECT_EQ(emission->occurrences[0].site.op, first.getOperation());
+  auto event = [](const acir::compiler::ObservationEmissionOccurrence &item) {
+    return cast<ac::SourceObserveOp>(item.site.diagnosticAnchor)
+        ->getAttrOfType<DictionaryAttr>("spec")
+        .getAs<StringAttr>("event")
+        .getValue();
+  };
+  EXPECT_EQ(event(emission->occurrences[0]), "repeated");
   EXPECT_EQ(emission->occurrences[0].site.valueIndex, 0u);
-  EXPECT_EQ(emission->occurrences[1].site.op, first.getOperation());
+  EXPECT_EQ(emission->occurrences[0].site.id, emission->occurrences[1].site.id);
   EXPECT_EQ(emission->occurrences[1].site.valueIndex, 1u);
-  EXPECT_EQ(emission->occurrences[2].site.op, second.getOperation());
+  EXPECT_EQ(event(emission->occurrences[2]), "repeated");
   EXPECT_EQ(emission->occurrences[2].site.valueIndex, 0u);
-  EXPECT_EQ(emission->occurrences[3].site.op, second.getOperation());
+  EXPECT_EQ(emission->occurrences[2].site.id, emission->occurrences[3].site.id);
+  EXPECT_NE(emission->occurrences[0].site.id, emission->occurrences[2].site.id);
   EXPECT_EQ(emission->occurrences[3].site.valueIndex, 1u);
   EXPECT_EQ(emission->occurrences[0].site.siteKey,
             emission->occurrences[1].site.siteKey);
@@ -611,8 +624,12 @@ TEST_F(ObservationIdentityTest,
   ASSERT_EQ(emission->occurrences.size(), 1u);
   EXPECT_TRUE(emission->occurrences.front().path.empty());
   ASSERT_EQ(emission->occurrences.front().logicalOwnerPath.size(), 1u);
-  EXPECT_EQ(emission->occurrences.front().logicalOwnerPath.front().first,
-            allocation.getOperation());
+  EXPECT_EQ(cast<ac::InstanceOp>(emission->occurrences.front()
+                                     .logicalOwnerPath.front()
+                                     .diagnosticAnchor)
+                .getInstanceName(),
+            allocation.getInstanceName());
+  EXPECT_EQ(emission->occurrences.front().logicalOwnerPath.front().id, 0u);
 
   auto metadata = acir::compiler::observationSiteMetadataJson(relocated);
   ASSERT_TRUE(succeeded(metadata));

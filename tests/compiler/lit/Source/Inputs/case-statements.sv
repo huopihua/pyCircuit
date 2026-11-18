@@ -9,7 +9,11 @@ module tb;
   wire pyc_5f5f7079635f76616c69645f6f75745f30;
 `endif
   task automatic host_reset;
-    pyc_phase=4;#1;pyc_root_commit_ok=1;pyc_phase=2;#1;
+    // Let continuous initializer pins settle before the managed RESET_PREPARE
+    // edge.  Entering phase 4 in the time-zero delta can otherwise sample Z
+    // in four-state simulators even though the generated initializer is 0.
+    pyc_root_commit_ok=0;pyc_phase=0;#1;pyc_phase=4;#1;
+    pyc_root_commit_ok=1;pyc_phase=2;#1;
     pyc_phase=0;pyc_root_commit_ok=0;#1;
   endtask
   task automatic managed_commit;
@@ -34,7 +38,9 @@ module tb;
         if(result !== golden(row))$fatal(1,"case statements members/selection/defaults/old-Q row%0d got%b expected%b",row,result,golden(row));
         $display("WORK %0d %b",row,result);
 `ifdef CASE_STATEMENTS_STATE
-        pyc_7079635f636c6b=next_clock;
+        // Settle the generated collection broadcasts before PREPARE samples
+        // their per-lane clocks and resets.
+        pyc_7079635f636c6b=next_clock;#1;
         managed_commit();
 `endif
 

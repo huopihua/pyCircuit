@@ -5,6 +5,7 @@
 #include "pycircuit/Dialect/ACIR/ACIRDialect.h"
 
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/Path.h"
 #include "gtest/gtest.h"
@@ -83,9 +84,10 @@ TEST_F(HardwareEmissionPlanTest, FreezesFinalClosureChecksAndMetadata) {
       EXPECT_GT(value.type.packedWidth, 0u);
       EXPECT_FALSE(value.type.canonicalType.empty());
     }
-    for (const auto &step : module.schedule) {
+    for (auto [stepIndex, step] : llvm::enumerate(module.schedule)) {
+      EXPECT_EQ(step.id, stepIndex);
       EXPECT_NE(step.diagnosticAnchor, nullptr);
-      EXPECT_FALSE(step.operation.empty());
+      EXPECT_FALSE(step.opcode.empty());
       for (auto value : step.inputs)
         EXPECT_LT(value, module.values.size());
       for (auto value : step.outputs)
@@ -159,6 +161,50 @@ TEST_F(HardwareEmissionPlanTest, FreezesAndPureRendersBothTargets) {
   EXPECT_FALSE(rtlSource.empty());
 }
 
+TEST_F(HardwareEmissionPlanTest,
+       OwnsFinalSnapshotAcrossSourceMutationAndDestruction) {
+  auto package =
+      parse("tests/compiler/lit/CodeGen/Inputs/sampled-admission.mlir");
+  ASSERT_TRUE(package);
+  ModuleOp input = *package;
+  auto hardware = compiler::prepareHardwareEmissionPlan(*package);
+  ASSERT_TRUE(succeeded(hardware));
+  ASSERT_NE(hardware->get().package, input);
+
+  (*package)->setAttr("ac.stage", StringAttr::get(&context, "source"));
+  package = OwningOpRef<ModuleOp>();
+
+  auto cpp = compiler::prepareCppRenderPlan(*hardware);
+  auto verilog = compiler::prepareVerilogRenderPlan(*hardware);
+  ASSERT_TRUE(succeeded(cpp));
+  ASSERT_TRUE(succeeded(verilog));
+  EXPECT_FALSE(cpp->get().parts.supportHeader.empty());
+  EXPECT_FALSE(verilog->get().parts.core.empty());
+}
+
+TEST(HardwareEmissionPlanLifetimeTest, OwnsItsMlirContext) {
+  std::optional<compiler::VerifiedHardwareEmissionPlan> hardware;
+  {
+    MLIRContext sourceContext;
+    sourceContext.loadDialect<ac::ACIRDialect>();
+    SmallString<256> path(PYCIRCUIT_TEST_REPO_ROOT);
+    llvm::sys::path::append(
+        path, "tests/compiler/lit/CodeGen/Inputs/sampled-admission.mlir");
+    auto package = parseSourceFile<ModuleOp>(path, &sourceContext);
+    ASSERT_TRUE(package);
+    auto prepared = compiler::prepareHardwareEmissionPlan(*package);
+    ASSERT_TRUE(succeeded(prepared));
+    hardware.emplace(std::move(*prepared));
+  }
+
+  auto cpp = compiler::prepareCppRenderPlan(*hardware);
+  auto verilog = compiler::prepareVerilogRenderPlan(*hardware);
+  ASSERT_TRUE(succeeded(cpp));
+  ASSERT_TRUE(succeeded(verilog));
+  EXPECT_FALSE(cpp->get().parts.supportHeader.empty());
+  EXPECT_FALSE(verilog->get().parts.core.empty());
+}
+
 TEST_F(HardwareEmissionPlanTest, RejectsMutatedTargetPublicationInventory) {
   auto package =
       parse("tests/compiler/lit/CodeGen/Inputs/sampled-admission.mlir");
@@ -194,6 +240,9 @@ TEST_F(HardwareEmissionPlanTest, RetainsDistinctGenericSpecializations) {
   ASSERT_TRUE(succeeded(plan));
   ASSERT_EQ(plan->get().modules.size(), 3u);
   const auto &root = plan->get().modules[plan->get().rootModule];
+  ASSERT_FALSE(plan->get().reachableDefinitions.empty());
+  for (const auto &unit : plan->get().sourceUnits)
+    EXPECT_EQ(unit.emissionOrder.size(), unit.definitionIndices.size());
   ASSERT_EQ(root.children.size(), 2u);
   ASSERT_TRUE(root.children[0].moduleIndex);
   ASSERT_TRUE(root.children[1].moduleIndex);
@@ -203,6 +252,62 @@ TEST_F(HardwareEmissionPlanTest, RetainsDistinctGenericSpecializations) {
   ASSERT_EQ(scalar.key.types.size(), 1u);
   ASSERT_EQ(aggregate.key.types.size(), 1u);
   EXPECT_NE(scalar.key.types.front().value, aggregate.key.types.front().value);
+
+  llvm::DenseSet<compiler::HardwareEmissionOccurrenceId> occurrences;
+  for (const auto &module : plan->get().modules)
+    for (const auto &child : module.children)
+      EXPECT_TRUE(occurrences.insert(child.id).second);
+  for (const auto &definition : plan->get().definitions)
+    for (const auto &child : definition.templateChildren)
+      EXPECT_TRUE(occurrences.insert(child.id).second);
+  EXPECT_EQ(occurrences.size(), plan->get().occurrenceAnchors.size());
+}
+
+TEST_F(HardwareEmissionPlanTest, RejectsMutatedFrozenIdentities) {
+  auto package =
+      parse("tests/compiler/lit/CodeGen/Inputs/sampled-admission.mlir");
+  ASSERT_TRUE(package);
+  auto prepared = compiler::prepareHardwareEmissionPlan(*package);
+  ASSERT_TRUE(succeeded(prepared));
+
+  compiler::HardwareEmissionPlan mutated = prepared->get();
+  ASSERT_FALSE(mutated.modules.empty());
+  ASSERT_FALSE(mutated.modules.front().dependencies.empty());
+  mutated.modules.front().dependencies.front().output.id =
+      mutated.modules.front().values.size();
+  EXPECT_TRUE(failed(compiler::verifyHardwareEmissionPlan(mutated)));
+
+  mutated = prepared->get();
+  ASSERT_FALSE(mutated.modules.front().types.empty());
+  mutated.modules.front().types.front().id =
+      std::numeric_limits<compiler::HardwareEmissionTypeQueryId>::max();
+  EXPECT_TRUE(failed(compiler::verifyHardwareEmissionPlan(mutated)));
+
+  mutated = prepared->get();
+  ASSERT_FALSE(mutated.occurrenceAnchors.empty());
+  mutated.occurrenceAnchors.pop_back();
+  EXPECT_TRUE(failed(compiler::verifyHardwareEmissionPlan(mutated)));
+}
+
+TEST_F(HardwareEmissionPlanTest, ReportsFrozenPhysicalProjectionRejection) {
+  auto package =
+      parse("tests/compiler/lit/CodeGen/Inputs/sampled-admission.mlir");
+  ASSERT_TRUE(package);
+  auto prepared = compiler::prepareHardwareEmissionPlan(*package);
+  ASSERT_TRUE(succeeded(prepared));
+
+  std::string diagnostics;
+  ScopedDiagnosticHandler handler(
+      prepared->get().package->getContext(), [&](Diagnostic &diagnostic) {
+        llvm::raw_string_ostream out(diagnostics);
+        diagnostic.print(out);
+        return success();
+      });
+  EXPECT_TRUE(failed(compiler::prepareVerilogRenderPlan(*prepared, true)));
+  EXPECT_NE(diagnostics.find("physical RTL projection is unavailable"),
+            std::string::npos);
+  EXPECT_NE(diagnostics.find("physical RTL requires"), std::string::npos)
+      << diagnostics;
 }
 
 TEST_F(HardwareEmissionPlanTest, RejectsExplicitNonFinalPackages) {

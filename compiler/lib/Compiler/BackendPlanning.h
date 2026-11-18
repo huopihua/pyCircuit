@@ -15,8 +15,10 @@ struct BackendPlanningAccess {
   sourceChecks(const VerifiedHardwareEmissionPlan &hardware);
   static std::shared_ptr<const ObservationEmissionPlan> &
   observationPlan(const VerifiedHardwareEmissionPlan &hardware);
-  static mlir::FailureOr<const ac::HardwarePhysicalProjection *>
+  static const ac::HardwarePhysicalProjection *
   physicalProjection(const VerifiedHardwareEmissionPlan &hardware);
+  static llvm::StringRef physicalProjectionUnavailableReason(
+      const VerifiedHardwareEmissionPlan &hardware);
 };
 
 /// Operation-level target planning from a verified backend-neutral plan.

@@ -85,7 +85,7 @@ public:
   bool needsOutlining() const { return exceededSize; }
   LogicalResult run() {
     if (failed(collect(scopes.front())))
-      return failure();
+      return definitionError("collecting frozen child inventory");
     if (resetting) {
       for (auto &leaf : storage) {
         StringRef kind = ctx.primitiveKind(leaf.bindings.owner);
@@ -139,7 +139,7 @@ public:
     }
     tasksFinished = true;
     if (failed(outputs(scopes.front())))
-      return failure();
+      return definitionError("emitting root outputs");
     for (auto &leaf : storage) {
       if (isDelegated(*leaf.scope))
         continue;
@@ -175,6 +175,10 @@ public:
   }
 
 private:
+  LogicalResult definitionError(StringRef stage) {
+    return scopes.front().definition.emitOpError()
+           << "C++ work failed while " << stage;
+  }
   void statement() {
     if (outline)
       outline->finishStatement();
@@ -195,7 +199,10 @@ private:
     return legalizeIdentifier(raw, [&] { return site->emitOpError(); });
   }
   FailureOr<Type> type(Type t, Scope &s, Operation *site) {
-    return ctx.resolvedType(t, s.bindings);
+    auto resolved = ctx.resolvedType(t, s.bindings);
+    if (failed(resolved))
+      site->emitOpError() << "C++ type is absent from the frozen query plan";
+    return resolved;
   }
   FailureOr<std::string> payload(Type t, Scope &s, Operation *site) {
     auto r = type(t, s, site);
@@ -242,8 +249,10 @@ private:
     // A Table reached after a Struct field instead lives in that packed pin.
     while (auto table = dyn_cast<ac::TableType>(t)) {
       auto n = ctx.shapeSize(table.getShape(), site, false, s.bindings);
-      if (failed(n))
+      if (failed(n)) {
+        site->emitOpError() << "C++ table shape planning failed";
         return failure();
+      }
       result.count += " * (" + *n + ")";
       t = table.getElementType();
     }
@@ -339,8 +348,10 @@ private:
     return ctx.bindOccurrence(op, s.bindings);
   }
   LogicalResult collect(Scope &s) {
-    for (Operation &op : s.definition.getBody().front())
-      if (isa<ac::InstanceOp, ac::CollectionOp>(op)) {
+    auto scheduled = ctx.scheduledOperations(s.definition, s.bindings);
+    for (Operation *scheduledOp : scheduled)
+      if (auto &op = *scheduledOp;
+          isa<ac::InstanceOp, ac::CollectionOp>(op)) {
         auto name =
             id(op.getAttrOfType<StringAttr>("instance_name").getValue(), &op);
         auto b = bind(&op, s);
@@ -570,15 +581,23 @@ private:
     auto selected =
         fieldType(v.getType(), path, s,
                   v.getDefiningOp() ? v.getDefiningOp() : s.definition);
-    if (failed(selected))
+    if (failed(selected)) {
+      (v.getDefiningOp() ? v.getDefiningOp() : s.definition.getOperation())
+          ->emitOpError()
+          << "C++ field type planning failed";
       return failure();
+    }
     FailureOr<std::string> result = failure();
     if (isa<ac::StructType>(*selected)) {
       auto leaves = ctx.fieldPaths(*selected, s.bindings);
       auto temp = declarePlane(s, v, path);
       auto count = planeCount(v.getType(), s, s.definition, path);
-      if (failed(leaves) || failed(temp) || failed(count))
+      if (failed(leaves) || failed(temp) || failed(count)) {
+        (v.getDefiningOp() ? v.getDefiningOp() : s.definition.getOperation())
+            ->emitOpError()
+            << "C++ structured field planning failed";
         return failure();
+      }
       for (auto suffix : *leaves) {
         Path full = path;
         llvm::append_range(full, suffix);
@@ -597,8 +616,12 @@ private:
       result = *temp;
     } else
       result = build(s, v, path);
-    if (failed(result))
+    if (failed(result)) {
+      (v.getDefiningOp() ? v.getDefiningOp() : s.definition.getOperation())
+          ->emitOpError()
+          << "C++ operation lowering failed";
       return failure();
+    }
     memoize(s, v, path, *result);
     statement();
     return *result;
@@ -920,7 +943,7 @@ private:
   };
   ConstantKey constantKey(Scope &s, Value value, ArrayRef<StringAttr> path) {
     SmallVector<Attribute> fields(path.begin(), path.end());
-    return {&s, value, ArrayAttr::get(ctx.package.getContext(), fields)};
+    return {&s, value, ArrayAttr::get(ctx.mlirContext(), fields)};
   }
   FailureOr<bool> constantLayoutClosed(Scope &s, Type current,
                                        ArrayRef<StringAttr> path,
@@ -1452,8 +1475,11 @@ private:
       auto yielded = cast<ac::YieldOp>(map.getBody().front().back())
                          .getValues()[cast<OpResult>(v).getResultNumber()];
       auto source = emit(region, yielded, path);
-      if (failed(source))
+      if (failed(source)) {
+        yielded.getDefiningOp()->emitOpError()
+            << "C++ Table.map yielded value emission failed";
         return failure();
+      }
       out << "    for (std::size_t pyc_lane = 0; pyc_lane < " << *resultCount
           << "; ++pyc_lane) " << *result << ".element(pyc_lane) = " << *source
           << ".element(pyc_lane);\n";
@@ -1705,12 +1731,16 @@ private:
     auto yield = cast<ac::YieldOp>(s.definition.getBody().front().back());
     for (auto [port, value] : llvm::enumerate(yield.getValues())) {
       auto text = emit(s, value);
+      if (failed(text))
+        value.getDefiningOp()->emitOpError()
+            << "C++ value emission failed for module output " << port;
       auto name =
           id(cast<StringAttr>(s.definition.getOutputNames()[port]).getValue(),
              s.definition);
       auto count = planeCount(value.getType(), s, s.definition);
       if (failed(text) || failed(name) || failed(count))
-        return failure();
+        return s.definition.emitOpError()
+               << "C++ output " << port << " emission failed";
       out << "    for (std::size_t pyc_pin = 0; pyc_pin < " << *count
           << "; ++pyc_pin) " << s.object << *name
           << ".element(pyc_pin) = " << *text << ".element(pyc_pin);\n";
@@ -1746,8 +1776,10 @@ FailureOr<SmallVector<ChildInfo>> childInfo(HardwareEmitContext &ctx,
   unsigned observationIndex = 0;
   ac::HardwareBindings parent;
   parent.owner = definition;
-  for (Operation &op : definition.getBody().front())
-    if (isa<ac::InstanceOp, ac::CollectionOp>(op)) {
+  auto scheduled = ctx.scheduledOperations(definition, parent);
+  for (Operation *scheduledOp : scheduled)
+    if (auto &op = *scheduledOp;
+        isa<ac::InstanceOp, ac::CollectionOp>(op)) {
       bool observed = true;
       auto name = legalizeIdentifier(
           op.getAttrOfType<StringAttr>("instance_name").getValue(),
@@ -1837,7 +1869,7 @@ LogicalResult emitHardwareCppDefinition(HardwareEmitContext &ctx,
   }
   auto children = childInfo(ctx, definition);
   if (failed(children))
-    return failure();
+    return definition.emitOpError() << "C++ child planning failed";
   if (!names.cppNamespace.empty())
     out << "namespace " << names.cppNamespace << " {\n";
   out << "template <std::size_t pyc_count"
@@ -1866,8 +1898,10 @@ LogicalResult emitHardwareCppDefinition(HardwareEmitContext &ctx,
       out << child.name << "(std::make_shared<" << child.type
           << ">(instanceName + \"." << child.name << "\", executor";
       if (observes && *observedChild != 0) {
+        ac::HardwareBindings parent;
+        parent.owner = definition;
         auto units =
-            cppObservationChildBase(ctx, definition, child.observationIndex);
+            cppObservationChildBase(ctx, definition, child.op, parent);
         if (failed(units))
           return failure();
         out << ", pyc_sink, pyc_observation_base + pyc_count * (" << *units
@@ -1977,13 +2011,13 @@ LogicalResult emitHardwareCppDefinition(HardwareEmitContext &ctx,
   WorkEmitter work(ctx, definition, workStream, false, nullptr, true);
   auto emitted = work.run();
   if (failed(emitted) && !work.needsOutlining())
-    return failure();
+    return definition.emitOpError() << "C++ work emission failed";
   if (work.needsOutlining() ||
       workBody.size() > CppWorkOutlining::outlineTriggerBytes) {
     CppWorkOutlining outline;
     WorkEmitter outlined(ctx, definition, outline.stream, false, &outline);
     if (failed(outlined.run()))
-      return failure();
+      return definition.emitOpError() << "outlined C++ work emission failed";
     outline.emit(out);
   } else {
     out << "  void Work() {\n    pyc_clear_check_snapshots();\n    try {\n"
@@ -2044,7 +2078,7 @@ LogicalResult emitHardwareCppDefinition(HardwareEmitContext &ctx,
          "    pyc_stage_sampling_reset();\n";
   WorkEmitter reset(ctx, definition, out, true);
   if (failed(reset.run()))
-    return failure();
+    return definition.emitOpError() << "C++ reset emission failed";
   out << "  }\nprivate:\n  gfsim::WorkExecutor *pyc_work_executor_;\n";
   if (observes)
     out << "  pyc_observation_sink *pyc_sink_ = nullptr;\n"

@@ -159,7 +159,7 @@ FailureOr<Address> ownerAddress(HardwareEmitContext &context, uint64_t owner,
   for (const auto &step : plan.owners[owner].path)
     if (failed(descend(context, result, step.allocation, step.coordinates)))
       return failure();
-  Builder builder(context.package.getContext());
+  Builder builder(context.mlirContext());
   NamedAttrList integers, types;
   for (const auto &entry : result.bindings.integers)
     integers.append(entry.first(), entry.second);

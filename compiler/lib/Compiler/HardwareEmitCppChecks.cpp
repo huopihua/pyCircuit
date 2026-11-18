@@ -37,8 +37,7 @@ struct Address {
 FailureOr<Address> address(HardwareEmitContext &context, uint64_t ownerIndex) {
   const auto &plan = context.sourceChecks();
   if (ownerIndex >= plan.owners.size())
-    return context.package.emitOpError()
-           << "native check owner is outside plan";
+    return context.emitPlanError() << "native check owner is outside plan";
   Address result;
   auto scope = plan.owners.front().bindings;
   for (const auto &step : plan.owners[ownerIndex].path) {
@@ -79,25 +78,22 @@ FailureOr<Address> address(HardwareEmitContext &context, uint64_t ownerIndex) {
 FailureOr<size_t> localIndex(HardwareEmitContext &context, uint64_t global) {
   const auto &plan = context.sourceChecks();
   if (global >= plan.bindings.size())
-    return context.package.emitOpError()
-           << "native check binding is outside plan";
+    return context.emitPlanError() << "native check binding is outside plan";
   const auto &binding = plan.bindings[global];
   for (auto site : cppDefinitionChecks(context, binding.definition))
     if (site.binding == &binding)
       return site.ordinal;
-  return context.package.emitOpError()
-         << "native check binding has no local site";
+  return context.emitPlanError() << "native check binding has no local site";
 }
 FailureOr<uint64_t> samplingIndex(HardwareEmitContext &context,
                                   uint64_t occurrenceIndex) {
   const auto &plan = context.sourceChecks();
   if (occurrenceIndex >= plan.samplingOccurrences.size())
-    return context.package.emitOpError()
+    return context.emitPlanError()
            << "native sampling occurrence is outside plan";
   auto bindingIndex = plan.samplingOccurrences[occurrenceIndex].bindingIndex;
   if (bindingIndex >= plan.samplingBindings.size())
-    return context.package.emitOpError()
-           << "native sampling binding is outside plan";
+    return context.emitPlanError() << "native sampling binding is outside plan";
   return plan.samplingBindings[bindingIndex].localOrdinal;
 }
 } // namespace

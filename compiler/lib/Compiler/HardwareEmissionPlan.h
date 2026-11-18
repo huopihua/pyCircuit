@@ -6,8 +6,10 @@
 #include "pycircuit/Dialect/ACIR/HardwareAnalysisContext.h"
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -17,10 +19,24 @@ namespace acir::compiler {
 /// Backend-neutral, concrete facts derived once from verified final hardware.
 ///
 /// This is an in-process code-generation plan, not another IR. Attribute, type,
-/// and operation handles borrow the immutable input context. Renderers must use
-/// the materialized values below; operation handles are diagnostic anchors
-/// only.
+/// and operation handles refer to a private final-ACIR snapshot owned by the
+/// verified wrapper and its private MLIRContext. Renderers must use the
+/// materialized values below; operation handles are diagnostic anchors only.
 using HardwareEmissionValueId = uint64_t;
+using HardwareEmissionObservationId = uint64_t;
+using HardwareEmissionDefinitionId = uint32_t;
+using HardwareEmissionOccurrenceId = uint64_t;
+using HardwareEmissionStaticQueryId = uint64_t;
+using HardwareEmissionTypeQueryId = uint64_t;
+inline constexpr HardwareEmissionDefinitionId
+    InvalidHardwareEmissionDefinitionId =
+        std::numeric_limits<HardwareEmissionDefinitionId>::max();
+
+struct HardwareEmissionBindings {
+  HardwareEmissionDefinitionId owner = InvalidHardwareEmissionDefinitionId;
+  llvm::StringMap<mlir::Attribute> integers;
+  llvm::StringMap<mlir::Type> types;
+};
 
 enum class HardwareEmissionTypeKind { Bits, Table, Struct, Enum };
 
@@ -75,12 +91,14 @@ struct HardwareEmissionDefinitionNames {
 };
 
 struct HardwareEmissionOccurrenceBinding {
+  HardwareEmissionOccurrenceId id = 0;
   mlir::Operation *diagnosticAnchor = nullptr;
-  ac::HardwareBindings bindings;
+  HardwareEmissionBindings bindings;
   llvm::SmallVector<uint64_t, 2> shape;
 };
 
 struct HardwareEmissionDependencyEndpoint {
+  HardwareEmissionValueId id = 0;
   mlir::Value value;
   llvm::SmallVector<std::string, 2> path;
 };
@@ -91,12 +109,14 @@ struct HardwareEmissionDependencyPlan {
 };
 
 struct HardwareEmissionStaticPlan {
-  ac::StaticExprAttr expression;
+  HardwareEmissionStaticQueryId id = 0;
+  ac::StaticExprAttr diagnosticSource;
   mlir::Attribute value;
 };
 
 struct HardwareEmissionTypeQueryPlan {
-  mlir::Type source;
+  HardwareEmissionTypeQueryId id = 0;
+  mlir::Type diagnosticSource;
   mlir::Type resolved;
   std::optional<uint64_t> packedWidth;
   llvm::SmallVector<llvm::SmallVector<std::string, 2>, 2> fieldPaths;
@@ -109,10 +129,12 @@ struct HardwareEmissionTableViewPlan {
 };
 
 struct HardwareEmissionDefinitionPlan {
+  HardwareEmissionDefinitionId id = 0;
   mlir::Operation *diagnosticAnchor = nullptr;
   std::string symbol;
   mlir::DictionaryAttr sourceOwner;
   HardwareEmissionDefinitionNames names;
+  llvm::SmallVector<mlir::Operation *, 4> templateSchedule;
   llvm::SmallVector<HardwareEmissionOccurrenceBinding, 2> templateChildren;
   llvm::SmallVector<mlir::Operation *, 2> independentWorkChildren;
   llvm::SmallVector<HardwareEmissionDependencyPlan, 0> dependencies;
@@ -121,6 +143,7 @@ struct HardwareEmissionDefinitionPlan {
 };
 
 struct HardwareEmissionPrimitivePlan {
+  HardwareEmissionDefinitionId id = 0;
   mlir::Operation *diagnosticAnchor = nullptr;
   std::string symbol;
   std::string kind;
@@ -147,9 +170,19 @@ struct HardwareEmissionPortPlan {
   std::optional<unsigned> availabilityOutput;
 };
 
+enum class HardwareEmissionStepKind {
+  Combinational,
+  Temporal,
+  Instance,
+  Collection,
+  Terminator
+};
+
 struct HardwareEmissionScheduleStep {
+  uint64_t id = 0;
   mlir::Operation *diagnosticAnchor = nullptr;
-  std::string operation;
+  HardwareEmissionStepKind kind = HardwareEmissionStepKind::Combinational;
+  std::string opcode;
   llvm::SmallVector<HardwareEmissionValueId, 4> inputs;
   llvm::SmallVector<HardwareEmissionValueId, 2> outputs;
   bool temporalCut = false;
@@ -165,6 +198,7 @@ struct HardwareEmissionQueuePlan {
 };
 
 struct HardwareEmissionChildPlan {
+  HardwareEmissionOccurrenceId id = 0;
   mlir::Operation *diagnosticAnchor = nullptr;
   HardwareEmissionChildKind kind = HardwareEmissionChildKind::Module;
   std::string instanceName;
@@ -172,7 +206,7 @@ struct HardwareEmissionChildPlan {
   std::string primitiveKind;
   llvm::SmallVector<uint64_t, 2> shape;
   HardwareEmissionModuleKey bindings;
-  ac::HardwareBindings concreteBindings;
+  HardwareEmissionBindings concreteBindings;
   std::optional<unsigned> moduleIndex;
   std::optional<HardwareEmissionQueuePlan> queue;
   llvm::SmallVector<HardwareEmissionStaticPlan, 0> staticValues;
@@ -182,7 +216,7 @@ struct HardwareEmissionChildPlan {
 struct HardwareEmissionModulePlan {
   mlir::Operation *diagnosticAnchor = nullptr;
   HardwareEmissionModuleKey key;
-  ac::HardwareBindings concreteBindings;
+  HardwareEmissionBindings concreteBindings;
   mlir::DictionaryAttr sourceOwner;
   llvm::SmallVector<HardwareEmissionPortPlan, 0> inputs;
   llvm::SmallVector<HardwareEmissionPortPlan, 0> outputs;
@@ -231,6 +265,7 @@ struct HardwareEmissionCheckPlan {
 };
 
 struct HardwareEmissionObservationPlan {
+  HardwareEmissionObservationId id = 0;
   unsigned moduleIndex = 0;
   mlir::Operation *diagnosticAnchor = nullptr;
   std::string kind;
@@ -243,6 +278,10 @@ struct HardwareEmissionSourceUnitPlan {
   mlir::DictionaryAttr sourceOwner;
   llvm::SmallVector<unsigned, 0> moduleIndices;
   llvm::SmallVector<unsigned, 0> definitionIndices;
+  /// Definition indices in the exact dependency-first order used by both
+  /// renderers. This is frozen during planning; renderers must not rediscover
+  /// an order by walking the final ACIR snapshot.
+  llvm::SmallVector<unsigned, 0> emissionOrder;
   std::string cppHeaderPath;
   std::string cppSourcePath;
   std::string verilogPath;
@@ -260,6 +299,14 @@ struct HardwareEmissionPlan {
   /// Frozen package-scope nominal and static type queries.
   llvm::SmallVector<HardwareEmissionTypeQueryPlan, 0> packageTypes;
   llvm::SmallVector<HardwareEmissionDefinitionPlan, 0> definitions;
+  /// Stable ID table for all module and imported hardware definitions.
+  /// Entries are diagnostic bridges into the owned final-ACIR snapshot.
+  llvm::SmallVector<mlir::Operation *, 0> definitionAnchors;
+  llvm::SmallVector<mlir::Operation *, 0> occurrenceAnchors;
+  /// Definitions in the selected root's occurrence closure, in first-visit
+  /// order. Unselected concrete definitions may still be emitted as library
+  /// units, but cannot acquire root instrumentation semantics.
+  llvm::SmallVector<unsigned, 0> reachableDefinitions;
   llvm::SmallVector<mlir::Operation *, 0> nominalDeclarations;
   llvm::SmallVector<HardwareEmissionPrimitivePlan, 0> primitives;
   llvm::SmallVector<std::string, 0> standardVerilogSources;
@@ -291,16 +338,18 @@ public:
 private:
   struct FrozenBackendState;
 
-  VerifiedHardwareEmissionPlan(HardwareEmissionPlan &&plan,
-                               std::unique_ptr<FrozenBackendState> backendState);
+  VerifiedHardwareEmissionPlan(
+      std::unique_ptr<mlir::MLIRContext> context,
+      mlir::OwningOpRef<mlir::ModuleOp> snapshot, HardwareEmissionPlan &&plan,
+      std::unique_ptr<FrozenBackendState> backendState);
+  std::unique_ptr<mlir::MLIRContext> context;
+  mlir::OwningOpRef<mlir::ModuleOp> snapshot;
   HardwareEmissionPlan plan;
   std::unique_ptr<FrozenBackendState> backendState;
 
   friend struct BackendPlanningAccess;
   friend mlir::FailureOr<VerifiedHardwareEmissionPlan>
   prepareHardwareEmissionPlan(mlir::ModuleOp package);
-  friend mlir::FailureOr<VerifiedHardwareEmissionPlan>
-  verifyAndFreezeHardwareEmissionPlan(HardwareEmissionPlan plan);
 };
 
 /// Analyze the existing final-stage ac.* hardware package exactly once and
@@ -312,9 +361,6 @@ prepareHardwareEmissionPlan(mlir::ModuleOp package);
 /// infers a fact from the source IR.
 mlir::LogicalResult
 verifyHardwareEmissionPlan(const HardwareEmissionPlan &plan);
-
-mlir::FailureOr<VerifiedHardwareEmissionPlan>
-verifyAndFreezeHardwareEmissionPlan(HardwareEmissionPlan plan);
 
 } // namespace acir::compiler
 

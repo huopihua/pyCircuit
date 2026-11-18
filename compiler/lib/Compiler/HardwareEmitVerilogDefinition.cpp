@@ -311,7 +311,7 @@ public:
     if (found == plan->definitions.end() || found->second.empty())
       return success();
     for (auto [index, site] : llvm::enumerate(found->second)) {
-      auto observe = cast<ac::SourceObserveOp>(site.op);
+      auto observe = cast<ac::SourceObserveOp>(site.diagnosticAnchor);
       auto path = net(observe.getPath());
       Value observed = site.carriesValue ? observe.getValues()[site.valueIndex]
                                          : observe.getPath();
@@ -371,7 +371,8 @@ public:
       auto name = "pyc_net_" + std::to_string(next++);
       auto type = context.rtlType(value.getType(), op);
       if (failed(type))
-        return failure();
+        return op->emitOpError()
+               << "Verilog instance result type is absent from frozen plan";
       out << "  wire " << *type << " " << name << ";\n";
       names.try_emplace(value, name);
       instances.insert(op);
@@ -390,7 +391,7 @@ public:
             ac::TableViewOp, ac::TableIndexOp, ac::TableReadOp, ac::TableGetOp, ac::TableMatchOp,
             ac::TableChooseOp, ac::TableFoldOp, ac::ValueMergeOp>(op)) {
       if (failed(tableOperation(op)))
-        return failure();
+        return op->emitOpError() << "Verilog table operation emission failed";
       return names.lookup(value);
     }
     // Register the complete net before following producers. A legal
@@ -575,7 +576,8 @@ public:
     for (Value result : op->getResults()) {
       auto type = context.rtlType(result.getType(), op);
       if (failed(type))
-        return failure();
+        return op->emitOpError()
+               << "Verilog table result type is absent from frozen plan";
       auto name = "pyc_net_" + std::to_string(next++);
       out << "  wire " << *type << " " << name << ";\n";
       names.try_emplace(result, name);
@@ -584,14 +586,16 @@ public:
     for (Value value : op->getOperands()) {
       auto source = net(value);
       if (failed(source))
-        return failure();
+        return op->emitOpError() << "Verilog table operand emission failed";
       operands.push_back(*source);
     }
     auto resultName = [&](unsigned i = 0) {
       return names.lookup(op->getResult(i));
     };
     auto width = [&](Type type) {
-      return context.payloadWidth(type, op, true);
+      ac::HardwareBindings bindings;
+      bindings.owner = definition;
+      return context.payloadWidth(type, op, true, bindings);
     };
     auto count = [&](ac::TableType type) {
       return context.shapeSize(type.getShape(), op, true);
@@ -715,14 +719,15 @@ public:
                 : cast<ac::TableType>(op->getOperand(0).getType()).getShape();
       auto n = context.shapeSize(shape, op, true);
       if (failed(n))
-        return failure();
+        return op->emitOpError() << "Verilog Table.map shape planning failed";
       auto i = generate(*n, "pyc_map_" + resultName());
       Block &block = op->getRegion(0).front();
       unsigned arg = 0;
       if (isMap) {
         auto w = width(block.getArgument(0).getType());
         if (failed(w))
-          return failure();
+          return op->emitOpError()
+                 << "Verilog Table.map ordinal width planning failed";
         names[block.getArgument(arg++)] = "(" + *w + ")'(" + i + ")";
       }
       for (auto [j, value] : llvm::enumerate(tables)) {
@@ -730,7 +735,8 @@ public:
         auto selected = element(operands[j], i, type);
         auto dataType = context.rtlType(type.getElementType(), op);
         if (failed(selected) || failed(dataType))
-          return failure();
+          return op->emitOpError()
+                 << "Verilog Table.map input type planning failed";
         auto local = "pyc_lane_" + std::to_string(next++);
         out << "    wire " << *dataType << " " << local << " = " << *selected
             << ";\n";
@@ -742,7 +748,8 @@ public:
       for (auto [j, value] : llvm::enumerate(yielded)) {
         auto source = net(value);
         if (failed(source))
-          return failure();
+          return op->emitOpError()
+                 << "Verilog Table.map yielded value emission failed";
         if (isMap) {
           auto dst = element(resultName(j), i,
                              cast<ac::TableType>(op->getResult(j).getType()));
@@ -918,7 +925,11 @@ public:
   }
 
   LogicalResult emitInstances() {
-    for (auto &operation : definition.getBody().front()) {
+    ac::HardwareBindings parent;
+    parent.owner = definition;
+    auto scheduled = context.scheduledOperations(definition, parent);
+    for (Operation *scheduledOperation : scheduled) {
+      Operation &operation = *scheduledOperation;
       if (auto queue = dyn_cast<ac::InstanceOp>(operation);
           queue && ac::isQueueInstance(queue)) {
         SmallVector<std::string> pins;
@@ -989,11 +1000,10 @@ public:
       auto *callee =
           collection ? context.resolveCallee(cast<ac::CollectionOp>(operation))
                      : context.resolveCallee(cast<ac::InstanceOp>(operation));
-      ac::HardwareBindings parent;
-      parent.owner = operation.getParentOp();
       auto bindings = context.bindOccurrence(&operation, parent);
       if (failed(bindings))
-        return failure();
+        return operation.emitOpError()
+               << "Verilog child binding is absent from the frozen plan";
       auto kind = context.primitiveKind(callee);
       bool managedPrimitive = false;
       if ((context.managesChecks() || context.isPhysical()) && !kind.empty())
@@ -1006,13 +1016,15 @@ public:
       for (auto input : occurrence->getOperands()) {
         auto value = net(input);
         if (failed(value))
-          return failure();
+          return operation.emitOpError()
+                 << "Verilog child input emission failed";
         inputs.push_back(*value);
       }
       for (auto output : occurrence->getResults()) {
         auto value = net(output);
         if (failed(value))
-          return failure();
+          return operation.emitOpError()
+                 << "Verilog child output emission failed";
         outputs.push_back(*value);
       }
       auto parameters =
@@ -1023,7 +1035,8 @@ public:
           occurrence->getAttrOfType<StringAttr>("instance_name").getValue(),
           [&] { return occurrence->emitOpError(); });
       if (failed(parameters) || failed(name))
-        return failure();
+        return operation.emitOpError()
+               << "Verilog child parameter emission failed";
       if (managedPrimitive) {
         if (parameters->empty())
           *parameters = (context.isPhysical() ? " #( .pyc_physical(1'b1) )"
@@ -1043,7 +1056,8 @@ public:
         auto size = context.shapeSize(
             cast<ac::CollectionOp>(operation).getShape(), occurrence, true);
         if (failed(size))
-          return failure();
+          return operation.emitOpError()
+                 << "Verilog collection shape emission failed";
         count = *size;
         i = "pyc_instance_lane_" + std::to_string(next++);
       }
@@ -1109,8 +1123,12 @@ public:
         std::string net = signal.str();
         if (collection) {
           auto width = context.payloadWidth(type, occurrence, true, *bindings);
-          if (failed(width))
+          if (failed(width)) {
+            occurrence->emitOpError()
+                << "Verilog child connection width planning failed for "
+                << port;
             return failure();
+          }
           net += "[((" + count + ")-1-" + i + ")*(" + *width + ") +: (" +
                  *width + ")]";
         }
@@ -1127,11 +1145,13 @@ public:
       for (auto [raw, signal, type] :
            llvm::zip(inputNames, inputs, signature.getInputs()))
         if (failed(connect(cast<StringAttr>(raw).getValue(), signal, type)))
-          return failure();
+          return operation.emitOpError()
+                 << "Verilog child input connection failed";
       for (auto [raw, signal, type] :
            llvm::zip(outputNames, outputs, signature.getResults()))
         if (failed(connect(cast<StringAttr>(raw).getValue(), signal, type)))
-          return failure();
+          return operation.emitOpError()
+                 << "Verilog child output connection failed";
       if ((context.managesChecks() || context.isPhysical())) {
         auto managedConnection = [&](StringRef port, StringRef signal) {
           out << (first ? "\n" : ",\n") << "    ." << port << "(" << signal
@@ -1294,11 +1314,11 @@ LogicalResult emitHardwareVerilogDefinition(HardwareEmitContext &context,
     out << "  assign " << *id << " = " << *wire << ";\n";
   }
   if (failed(nets.emitSourceChecks()))
-    return failure();
+    return definition.emitOpError() << "Verilog source-check emission failed";
   if (failed(nets.emitObservations()))
-    return failure();
+    return definition.emitOpError() << "Verilog observation emission failed";
   if (failed(nets.emitInstances()))
-    return failure();
+    return definition.emitOpError() << "Verilog instance emission failed";
   nets.emitAggregateError();
   nets.recordPhysicalLayout();
   out << "endmodule\n";

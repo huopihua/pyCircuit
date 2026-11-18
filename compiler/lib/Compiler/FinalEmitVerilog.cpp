@@ -103,16 +103,13 @@ LogicalResult emitTypePackage(HardwareEmitContext &context,
   return success();
 }
 FailureOr<ac::ModuleOp> rootModule(HardwareEmitContext &context) {
-  auto systems = context.package.getOps<ac::SystemOp>();
-  if (!llvm::hasSingleElement(systems))
-    return context.package.emitOpError() << "one system required";
-  auto system = *systems.begin();
-  auto symbol = system.getEntry().getAs<FlatSymbolRefAttr>("callee");
-  auto root = symbol ? dyn_cast_or_null<ac::ModuleOp>(
-                           context.lookupDefinition(symbol.getValue()))
-                     : ac::ModuleOp();
+  auto root =
+      context.plan.rootModule < context.plan.modules.size()
+          ? dyn_cast_or_null<ac::ModuleOp>(
+                context.plan.modules[context.plan.rootModule].diagnosticAnchor)
+          : ac::ModuleOp();
   if (!root)
-    return system.emitOpError() << "root module is unresolved";
+    return context.emitPlanError() << "root module is unresolved";
   return root;
 }
 struct SystemControls {
@@ -178,7 +175,8 @@ FailureOr<ObservationAddress>
 observationHierarchy(const ObservationEmissionPlan &plan,
                      const ObservationEmissionOccurrence &occurrence) {
   std::string result = "dut.dut";
-  for (auto [operation, lane] : occurrence.path) {
+  for (const auto &[id, operation, lane] : occurrence.path) {
+    (void)id;
     auto raw = operation->getAttrOfType<StringAttr>("instance_name");
     if (!raw)
       return operation->emitOpError() << "instance has no name";
@@ -190,18 +188,19 @@ observationHierarchy(const ObservationEmissionPlan &plan,
       result += ".pyc_instances_" + *name + "[" + std::to_string(lane) + "]";
     result += ".pyc_instance_" + *name;
   }
-  auto owner = occurrence.site.op->getParentOfType<ac::ModuleOp>();
+  auto owner =
+      occurrence.site.diagnosticAnchor->getParentOfType<ac::ModuleOp>();
   auto sites = plan.definitions.find(owner);
   if (sites == plan.definitions.end())
-    return occurrence.site.op->emitOpError()
+    return occurrence.site.diagnosticAnchor->emitOpError()
            << "observation has no definition layout";
   auto found =
       llvm::find_if(sites->second, [&](const ObservationEmissionSite &site) {
-        return site.op == occurrence.site.op &&
+        return site.id == occurrence.site.id &&
                site.valueIndex == occurrence.site.valueIndex;
       });
   if (found == sites->second.end())
-    return occurrence.site.op->emitOpError()
+    return occurrence.site.diagnosticAnchor->emitOpError()
            << "observation has no local layout slot";
   return ObservationAddress{std::move(result),
                             static_cast<size_t>(found - sites->second.begin())};
@@ -247,12 +246,13 @@ FailureOr<std::string> systemSimulationTop(HardwareEmitContext &context,
   for (const auto &occurrence : plan->occurrences) {
     if (!occurrence.site.gauge)
       continue;
-    auto observe = cast<ac::SourceObserveOp>(occurrence.site.op);
+    auto observe = cast<ac::SourceObserveOp>(occurrence.site.diagnosticAnchor);
     auto name = observe.getSpec().getAs<StringAttr>("name");
     if (!name)
       return observe.emitOpError() << "report observation has no name";
     std::string instance = "root";
-    for (auto [operation, lane] : occurrence.logicalOwnerPath) {
+    for (const auto &[id, operation, lane] : occurrence.logicalOwnerPath) {
+      (void)id;
       auto allocation = operation->getAttrOfType<StringAttr>("instance_name");
       if (!allocation)
         return operation->emitOpError() << "instance has no name";
@@ -329,7 +329,7 @@ FailureOr<std::string> systemSimulationTop(HardwareEmitContext &context,
   SmallVector<ObservationGroup> groups;
   for (size_t begin = 0; begin < plan->occurrences.size();) {
     const auto &first = plan->occurrences[begin];
-    auto observe = cast<ac::SourceObserveOp>(first.site.op);
+    auto observe = cast<ac::SourceObserveOp>(first.site.diagnosticAnchor);
     const size_t size = std::max<size_t>(1, observe.getValues().size());
     if (first.site.valueIndex != 0 || size > plan->occurrences.size() - begin ||
         (first.site.gauge && size != 1))
@@ -337,7 +337,7 @@ FailureOr<std::string> systemSimulationTop(HardwareEmitContext &context,
     ObservationGroup group{begin, size, {}, {}};
     for (size_t index = 0; index < size; ++index) {
       const auto &lane = plan->occurrences[begin + index];
-      if (lane.site.op != first.site.op || lane.path != first.path ||
+      if (lane.site.id != first.site.id || lane.path != first.path ||
           lane.site.valueIndex != index ||
           lane.site.carriesValue != !observe.getValues().empty() ||
           lane.site.gauge != first.site.gauge)
@@ -442,7 +442,7 @@ FailureOr<std::string> systemSimulationTop(HardwareEmitContext &context,
   out << "  task automatic pyc_publish_observations;\n    begin\n";
   for (const auto &group : groups) {
     const auto &occurrence = plan->occurrences[group.begin];
-    auto observe = cast<ac::SourceObserveOp>(occurrence.site.op);
+    auto observe = cast<ac::SourceObserveOp>(occurrence.site.diagnosticAnchor);
     auto identity = observe->getAttrOfType<DictionaryAttr>("ac.observation_id");
     if (!identity)
       return observe.emitOpError() << "observation identity is missing";
@@ -453,7 +453,8 @@ FailureOr<std::string> systemSimulationTop(HardwareEmitContext &context,
     if (failed(registration) || failed(site) || failed(spec))
       return failure();
     std::string instance = "root";
-    for (auto [operation, lane] : occurrence.logicalOwnerPath) {
+    for (const auto &[id, operation, lane] : occurrence.logicalOwnerPath) {
+      (void)id;
       auto name = operation->getAttrOfType<StringAttr>("instance_name");
       instance += "/" + name.getValue().str();
       if (isa<ac::CollectionOp>(operation))
@@ -602,10 +603,10 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
   bool first = true;
   auto port = [&](StringRef direction, Type type,
                   StringRef name) -> LogicalResult {
-    auto resolved = context.resolvedType(type, *bindings);
-    if (failed(resolved))
-      return failure();
-    auto rendered = context.rtlType(*resolved, root);
+    // Wrapper ports live outside the parameterized root definition.  Render
+    // their widths from the frozen concrete entry binding, not from formal
+    // parameter names that are only declared on the child module.
+    auto rendered = context.rtlType(type, *bindings, root);
     auto id = legalizeIdentifier(name, [&] { return root.emitOpError(); });
     if (failed(rendered) || failed(id))
       return failure();
@@ -763,13 +764,14 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
 FailureOr<FinalVerilogSourceParts>
 prepareVerilogSourceParts(const VerifiedHardwareEmissionPlan &hardware,
                           bool physical) {
-  ModuleOp package = hardware->package;
   const ac::HardwarePhysicalProjection *projection = nullptr;
   if (physical) {
-    auto planned = BackendPlanningAccess::physicalProjection(hardware);
-    if (failed(planned))
-      return failure();
-    projection = *planned;
+    projection = BackendPlanningAccess::physicalProjection(hardware);
+    if (!projection)
+      return hardware.get().package->emitOpError()
+             << "physical RTL projection is unavailable: "
+             << BackendPlanningAccess::physicalProjectionUnavailableReason(
+                    hardware);
   }
   HardwareEmitContext context(
       hardware.get(), BackendPlanningAccess::sourceChecks(hardware),
@@ -780,33 +782,25 @@ prepareVerilogSourceParts(const VerifiedHardwareEmissionPlan &hardware,
   auto root = rootModule(context);
   if (failed(root))
     return failure();
-  llvm::DenseSet<Operation *> reachable;
-  SmallVector<ac::ModuleOp> pending{*root};
-  while (!pending.empty()) {
-    auto definition = pending.pop_back_val();
-    if (!reachable.insert(definition).second)
-      continue;
-    for (Operation &operation : definition.getBody().front()) {
-      Operation *callee = nullptr;
-      if (auto instance = dyn_cast<ac::InstanceOp>(operation))
-        callee = context.resolveCallee(instance);
-      else if (auto collection = dyn_cast<ac::CollectionOp>(operation))
-        callee = context.resolveCallee(collection);
-      if (auto child = dyn_cast_or_null<ac::ModuleOp>(callee))
-        pending.push_back(child);
+  if (!system) {
+    llvm::DenseSet<unsigned> reachable(
+        context.plan.reachableDefinitions.begin(),
+        context.plan.reachableDefinitions.end());
+    for (const HardwareEmissionObservationPlan &observation :
+         context.plan.observations) {
+      auto module = context.plan.modules.begin() + observation.moduleIndex;
+      auto definition = llvm::find_if(
+          context.plan.definitions,
+          [&](const HardwareEmissionDefinitionPlan &candidate) {
+            return candidate.diagnosticAnchor == module->diagnosticAnchor;
+          });
+      if (definition != context.plan.definitions.end() &&
+          reachable.contains(static_cast<unsigned>(
+              definition - context.plan.definitions.begin())))
+        return observation.diagnosticAnchor->emitOpError()
+               << "hardware instrumentation emission is not implemented";
     }
   }
-  auto unsupported = package.walk([&](Operation *op) {
-    // Reachable assertions already belong to the verified source-check plan;
-    // an assertion in an unselected definition does not add a root lifecycle.
-    if (!isa<ac::SourceObserveOp>(op) || system ||
-        !reachable.contains(op->getParentOfType<ac::ModuleOp>()))
-      return WalkResult::advance();
-    op->emitOpError() << "hardware instrumentation emission is not implemented";
-    return WalkResult::interrupt();
-  });
-  if (unsupported.wasInterrupted())
-    return failure();
   FinalVerilogSourceParts parts;
   parts.rootRtlName = "pyc_root";
   parts.standardSources.append(context.plan.standardVerilogSources.begin(),
@@ -818,7 +812,7 @@ prepareVerilogSourceParts(const VerifiedHardwareEmissionPlan &hardware,
     group.sourceOwner = unit.sourceOwner;
     group.path = unit.verilogPath;
     llvm::raw_string_ostream out(group.text);
-    for (unsigned definitionIndex : unit.definitionIndices) {
+    for (unsigned definitionIndex : unit.emissionOrder) {
       auto module = cast<ac::ModuleOp>(
           context.plan.definitions[definitionIndex].diagnosticAnchor);
       group.definitions.push_back(

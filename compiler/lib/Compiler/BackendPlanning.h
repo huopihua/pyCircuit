@@ -21,15 +21,18 @@ struct BackendPlanningAccess {
       const VerifiedHardwareEmissionPlan &hardware);
 };
 
-/// Operation-level target planning from a verified backend-neutral plan.
-/// These functions are private compiler implementation details and are absent
-/// from the installed CompilerDev header closure.
+/// Target lowering from a verified backend-neutral plan into complete native
+/// source payloads. This migration bridge may read the plan's private,
+/// read-only final-ACIR anchors for target-specific lowering, but it must use
+/// frozen plan inventories for common scheduling, dependencies, source units,
+/// and publication. These functions are private compiler implementation
+/// details and are absent from the installed CompilerDev header closure.
 mlir::FailureOr<FinalCppSourceParts>
-prepareCppSourceParts(const VerifiedHardwareEmissionPlan &hardware);
+lowerCppSourceParts(const VerifiedHardwareEmissionPlan &hardware);
 
 mlir::FailureOr<FinalVerilogSourceParts>
-prepareVerilogSourceParts(const VerifiedHardwareEmissionPlan &hardware,
-                          bool physical = false);
+lowerVerilogSourceParts(const VerifiedHardwareEmissionPlan &hardware,
+                        bool physical = false);
 
 } // namespace acir::compiler
 

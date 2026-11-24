@@ -350,6 +350,18 @@ LogicalResult validateMapText(StringRef text, MLIRContext &context,
 
 } // namespace
 
+FailureOr<FinalSourceOwner>
+freezeFinalSourceOwner(DictionaryAttr owner,
+                       ac::detail::EmitError emitError) {
+  if (!owner || failed(ac::detail::verifySourceOwner(owner, emitError)))
+    return failure();
+  auto package = owner.getAs<StringAttr>("package");
+  auto path = owner.getAs<StringAttr>("path");
+  if (!package || !path)
+    return emitError() << "SourceOwner is missing package or path";
+  return FinalSourceOwner{package.getValue().str(), path.getValue().str()};
+}
+
 LogicalResult validateFinalSourceMapText(StringRef text, MLIRContext &context,
                                          ac::detail::EmitError emitError,
                                          std::string *canonicalPath) {
@@ -360,18 +372,25 @@ FailureOr<SmallVector<FinalSourceMap>>
 emitFinalSourceMaps(ArrayRef<FinalSourceMapPlan> plans,
                     ArrayRef<FinalSourceMembership> membership,
                     ac::detail::EmitError emitError) {
-  llvm::DenseMap<Attribute, unsigned> unitIndices;
-  for (auto [index, plan] : llvm::enumerate(plans))
-    if (failed(verifyFinalSourceMapPlan(plan, emitError)) ||
-        !unitIndices.try_emplace(plan.sourceOwner, index).second)
+  auto key = [](const FinalSourceOwner &owner) {
+    return owner.package + "\n" + owner.path;
+  };
+  llvm::StringMap<unsigned> unitIndices;
+  SmallVector<FinalSourceOwner> owners;
+  for (auto [index, plan] : llvm::enumerate(plans)) {
+    auto owner = freezeFinalSourceOwner(plan.sourceOwner, emitError);
+    if (failed(verifyFinalSourceMapPlan(plan, emitError)) || failed(owner) ||
+        !unitIndices.try_emplace(key(*owner), index).second)
       return emitError()
              << "final source-map plan has a missing or duplicate owner";
+    owners.push_back(std::move(*owner));
+  }
 
-  llvm::DenseMap<Attribute, SmallVector<std::string>> filesByOwner;
+  llvm::StringMap<SmallVector<std::string>> filesByOwner;
   for (const FinalSourceMembership &group : membership) {
-    if (!group.sourceOwner || !unitIndices.contains(group.sourceOwner) ||
-        !filesByOwner.try_emplace(group.sourceOwner).second ||
-        failed(ac::detail::verifySourceOwner(group.sourceOwner, emitError)))
+    std::string ownerKey = key(group.sourceOwner);
+    if (group.sourceOwner.empty() || !unitIndices.contains(ownerKey) ||
+        !filesByOwner.try_emplace(ownerKey).second)
       return emitError() << "native source membership has a missing, extra or "
                             "duplicate owner";
     SmallVector<std::string> files = group.generatedFiles;
@@ -383,22 +402,22 @@ emitFinalSourceMaps(ArrayRef<FinalSourceMapPlan> plans,
     });
     if (std::adjacent_find(files.begin(), files.end()) != files.end())
       return emitError() << "native source membership repeats a generated file";
-    filesByOwner[group.sourceOwner] = std::move(files);
+    filesByOwner[ownerKey] = std::move(files);
   }
   if (filesByOwner.size() != plans.size())
     return emitError() << "native source membership omits a final SourceOwner";
 
   SmallVector<FinalSourceMap> maps;
   std::set<std::string> paths;
-  for (const FinalSourceMapPlan &plan : plans) {
+  for (auto [index, plan] : llvm::enumerate(plans)) {
     if (!paths.insert(plan.path).second)
       return emitError() << "legalized source-map paths collide";
-    auto files = filesByOwner.lookup(plan.sourceOwner);
+    auto files = filesByOwner.lookup(key(owners[index]));
     auto text = serializeMap(plan.sourceOwner, files, plan.origins, emitError);
     if (failed(text))
       return failure();
     maps.push_back(
-        {plan.sourceOwner, plan.path, std::move(*text), std::move(files)});
+        {owners[index], plan.path, std::move(*text), std::move(files)});
   }
   return maps;
 }

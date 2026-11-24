@@ -40,6 +40,15 @@ target_include_directories(ACIRSourceCompiler PUBLIC
   "$<INSTALL_INTERFACE:include>"
 )
 
+add_acir_library(ACIRBackendRender SOURCES
+  BackendRender.cpp
+  LINK_LIBRARIES ACIRDialect
+)
+target_include_directories(ACIRBackendRender PUBLIC
+  "$<BUILD_INTERFACE:${PYCIRCUIT_SOURCE_DIR}/lib>"
+  "$<INSTALL_INTERFACE:include>"
+)
+
 add_acir_library(ACIRCodegen SOURCES
   BackendRenderPlan.cpp
   FinalCppNames.cpp
@@ -52,7 +61,7 @@ add_acir_library(ACIRCodegen SOURCES
   HardwareEmitCppDefinition.cpp
   HardwareEmitVerilogFaults.cpp
   HardwareEmitVerilogDefinition.cpp
-  LINK_LIBRARIES ACIRDialect ACIRAnalysis HWIRValidation MLIRParser
+  LINK_LIBRARIES ACIRBackendRender ACIRDialect ACIRAnalysis HWIRValidation MLIRParser
 )
 target_include_directories(ACIRCodegen PUBLIC
   "$<BUILD_INTERFACE:${PYCIRCUIT_SOURCE_DIR}/lib>"

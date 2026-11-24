@@ -10,8 +10,8 @@
 using namespace mlir;
 namespace acir::compiler::detail {
 uint64_t TableQueryBudget::limit(TableQueryResource resource) {
-  constexpr uint64_t limits[] = {128,    4096,    1048576, 65536,
-                                 262144, 1048576, 1048576};
+  constexpr uint64_t limits[] = {128,     4096,    1048576, 65536,
+                                 1048576, 1048576, 1048576};
   return limits[static_cast<unsigned>(resource)];
 }
 uint64_t TableQueryBudget::used(TableQueryResource resource) const {

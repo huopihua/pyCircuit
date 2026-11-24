@@ -3,6 +3,24 @@
   };
   FailureOr<std::optional<MemorySelection>> memorySelection(
       const HardwareIdentityEndpoint &selected, bool locatorOnly = false) {
+    // Aggregate selections may use the compact root ValueMerge form instead
+    // of reconstructing every leaf with BitsSelect.  Authenticate the same
+    // condition/true/fallback triple through the shared peel proof.
+    if (!locatorOnly) {
+      if (auto merge = selected.value.getDefiningOp<ValueMergeOp>()) {
+        if (merge->getNumOperands() == 3) {
+          auto condition = normal(merge->getOperand(1), selected.scope);
+          auto payload = normal(merge->getOperand(2), selected.scope);
+          if (failed(condition) || failed(payload))
+            return failure();
+          auto fallback = peelSelection(selected, *condition, *payload);
+          if (failed(fallback))
+            return failure();
+          return std::optional<MemorySelection>(
+              MemorySelection{*condition, *payload, *fallback});
+        }
+      }
+    }
     auto leaf = selected;
     SmallVector<Attribute, 0> path;
     for (unsigned depth = 0; depth <= 128; ++depth) {

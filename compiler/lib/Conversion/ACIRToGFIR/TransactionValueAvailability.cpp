@@ -392,8 +392,21 @@ class ValueAvailabilityMaterializer {
     if (failed(canonicalProjection(value, projected, site)))
       return failure();
     path = projected;
-    if (uniformDepth >= 128)
-      return (void)error(site, "uniform availability depth exceeds 128"), failure();
+    // Scalars terminate structural uniformity immediately. Do this before the
+    // aggregate recursion guard so a deep record/table projection may still
+    // reach its scalar leaf at the boundary.
+    auto definingMerge = value.getDefiningOp<ac::ValueMergeOp>();
+    if (isa<ac::BitsType, ac::EnumType>(value.getType()) && path.empty() &&
+        (!definingMerge || value == definingMerge.getEn())) {
+      auto result = availability(value, path, site);
+      if (failed(result)) return failure();
+      return UniformResult(*result);
+    }
+    if (uniformDepth >= 128) {
+      Operation *origin = value.getDefiningOp();
+      return (void)error(origin ? origin : site,
+                         "uniform availability depth exceeds 128"), failure();
+    }
     ++uniformDepth;
     llvm::scope_exit depth([&] { --uniformDepth; });
     auto paidKey = keyFor(value, path, site);
@@ -415,12 +428,12 @@ class ValueAvailabilityMaterializer {
   }
   FailureOr<UniformResult> deriveUniformAvailability(Value value,
       ArrayRef<StringAttr> path, Operation *site) {
+    auto definingMerge = value.getDefiningOp<ac::ValueMergeOp>();
     auto scalar = [&]() -> FailureOr<UniformResult> {
       auto result = availability(value, path, site);
       if (failed(result)) return failure();
       return UniformResult(*result);
     };
-    auto definingMerge = value.getDefiningOp<ac::ValueMergeOp>();
     // The en result is an ordinary scalar whose availability depends only on
     // guards. Only next needs the structural merge proof below.
     if (isa<ac::BitsType, ac::EnumType>(value.getType()) && path.empty() &&
@@ -478,31 +491,53 @@ class ValueAvailabilityMaterializer {
     if (auto view = dyn_cast<ac::TableViewOp>(operation))
       return uniformAvailability(view.getInput(), path, site);
     if (auto merge = dyn_cast<ac::ValueMergeOp>(operation)) {
-      if (merge.getGuards().empty()) return uniformAvailability(merge.getBase(), path, site);
-      if (merge.getGuards().size() != 1 || !cast<ArrayAttr>(merge.getPaths()[0]).empty())
-        return UniformResult();
-      auto known = knownGuard(merge.getGuards()[0], {}, site);
-      if (failed(known)) return failure();
-      auto yes = uniformAvailability(*known && !**known ? merge.getBase()
-          : merge.getValues()[0], path, site);
-      if (failed(yes)) return failure();
-      FailureOr<UniformResult> no = UniformResult();
-      if (!*known) no = uniformAvailability(merge.getBase(), path, site);
-      if (failed(no)) return failure();
-      if (!*yes || (!*known && !*no)) return UniformResult();
-      auto guard = availability(merge.getGuards()[0], {}, site);
-      if (failed(guard)) return failure();
-      Value selected = **yes;
-      if (!*known) {
-        auto predicate = raw(merge.getGuards()[0], site);
-        if (failed(predicate)) return failure();
-        auto result = selection(site, *predicate, **yes, **no);
-        if (failed(result)) return failure();
-        selected = *result;
+      struct Step { Value guard, predicate, candidate; };
+      SmallVector<Step> steps;
+      Value base = value;
+      while (auto current = base.getDefiningOp<ac::ValueMergeOp>()) {
+        if (current.getGuards().empty()) {
+          base = current.getBase();
+          continue;
+        }
+        if (current.getGuards().size() != 1 || current.getPaths().size() != 1 ||
+            current.getValues().size() != 1 ||
+            !cast<ArrayAttr>(current.getPaths()[0]).empty())
+          return UniformResult();
+        auto known = knownGuard(current.getGuards()[0], {}, site);
+        if (failed(known)) return failure();
+        auto guard = availability(current.getGuards()[0], {}, site);
+        if (failed(guard)) return failure();
+        if (*known && **known) {
+          steps.push_back({*guard, {}, {}});
+          base = current.getValues()[0];
+          break;
+        }
+        if (*known) {
+          steps.push_back({*guard, {}, {}});
+        } else {
+          auto candidate = uniformAvailability(current.getValues()[0], path, site);
+          auto predicate = raw(current.getGuards()[0], site);
+          if (failed(candidate) || failed(predicate)) return failure();
+          if (!*candidate) return UniformResult();
+          steps.push_back({*guard, *predicate, **candidate});
+        }
+        base = current.getBase();
       }
-      auto result = conjunction(site, *guard, selected);
-      if (failed(result)) return failure();
-      return UniformResult(*result);
+      auto initial = uniformAvailability(base, path, site);
+      if (failed(initial) || !*initial) return initial;
+      UniformResult result = **initial;
+      for (auto &step : llvm::reverse(steps)) {
+        Value selected = *result;
+        if (step.predicate) {
+          auto choice = selection(site, step.predicate, step.candidate, selected);
+          if (failed(choice)) return failure();
+          selected = *choice;
+        }
+        auto joined = conjunction(site, step.guard, selected);
+        if (failed(joined)) return failure();
+        result = *joined;
+      }
+      return result;
     }
     if (auto structure = dyn_cast<ac::StructCreateOp>(operation); structure && !path.empty()) {
       auto fields = hardware.lookupStruct(cast<ac::StructType>(value.getType())).getFields();
@@ -887,6 +922,37 @@ class ValueAvailabilityMaterializer {
   FailureOr<Value> conjunction(Operation *site, Value left, Value right) {
     if (!left) return right;
     if (!right || left == right) return left;
+    // Keep long version histories shallow. AND is associative in the four-
+    // state algebra used by availability, so append to the existing left
+    // spine rather than creating a new root for every authored update.
+    if (auto binary = left.getDefiningOp<ac::BitsBinaryOp>();
+        binary && binary.getOpcode() == "and") {
+      SmallVector<Value> terms;
+      Value cursor = left;
+      while (auto current = cursor.getDefiningOp<ac::BitsBinaryOp>()) {
+        if (current.getOpcode() != "and") break;
+        terms.push_back(current->getOperand(1));
+        cursor = current->getOperand(0);
+      }
+      terms.push_back(cursor);
+      terms.push_back(right);
+      std::reverse(terms.begin(), terms.end());
+      while (terms.size() > 1) {
+        SmallVector<Value> next;
+        next.reserve((terms.size() + 1) / 2);
+        for (unsigned i = 0; i < terms.size(); i += 2) {
+          if (i + 1 == terms.size()) { next.push_back(terms[i]); continue; }
+          Builder balanced(site->getContext());
+          auto *joined = create(site, ac::BitsBinaryOp::getOperationName(),
+              {terms[i], terms[i + 1]}, {bit},
+              {balanced.getNamedAttr("opcode", balanced.getStringAttr("and"))});
+          if (!joined) return failure();
+          next.push_back(joined->getResult(0));
+        }
+        terms = std::move(next);
+      }
+      return terms.front();
+    }
     Builder b(site->getContext());
     auto *operation = create(site, ac::BitsBinaryOp::getOperationName(),
         {left, right}, {bit}, {b.getNamedAttr("opcode", b.getStringAttr("and"))});
@@ -1246,6 +1312,11 @@ class ValueAvailabilityMaterializer {
       }
       return result;
     }
+    // Table.match yields a scalar predicate for every structurally present
+    // table row. Four-state uncertainty belongs to the value, not to the
+    // transaction-availability companion.
+    if (isa<ac::TableMatchOp>(operation))
+      return Value();
     if (isa<ac::TableMapOp, ac::TableViewOp>(operation)) {
       bool totalInputs = true;
       for (Value input : operation->getOperands()) {
@@ -1286,8 +1357,12 @@ class ValueAvailabilityMaterializer {
     if (operation->getNumRegions()) {
       auto inputs = all(site, operation->getOperands());
       if (failed(inputs)) return failure();
-      if (!*inputs && isa<ac::TableMapOp, ac::TableMatchOp>(operation)) return Value();
-      return (void)error(site, "availability requires normalized region provenance"), failure();
+      if (!*inputs) return Value();
+      return (void)error(site,
+                         ("availability requires normalized region provenance for " +
+                          operation->getName().getStringRef())
+                             .str()),
+             failure();
     }
     return all(site, operation->getOperands());
   }
@@ -1297,6 +1372,20 @@ class ValueAvailabilityMaterializer {
   LogicalResult canonicalProjection(Value &value,
                                     SmallVectorImpl<StringAttr> &path,
                                     Operation *site) {
+    // Empty merges are pure aliases. Transaction histories can contain long
+    // linear chains of them; collapse the chain before bounded structural
+    // projection and uniformity analysis.
+    DenseSet<Value> aliases;
+    while (auto merge = value.getDefiningOp<ac::ValueMergeOp>()) {
+      if (!merge.getGuards().empty() || !merge.getPaths().empty() ||
+          !merge.getValues().empty() || value != merge.getNext())
+        break;
+      if (!aliases.insert(value).second)
+        return error(site, "cyclic empty value.merge alias");
+      if (failed(budget.debit(4, site)))
+        return failure();
+      value = merge.getBase();
+    }
     for (unsigned depth = 0; depth <= 128; ++depth) {
       if (failed(budget.debit(4 + path.size(), site)))
         return failure();

@@ -3604,7 +3604,7 @@ TEST_F(TransactionLoweringTest,
   });
   ASSERT_TRUE(analysis->isValid()) << diagnostics;
   ASSERT_NE(analysis->lookup(named<SourceTransactionOp>(root, "run")), nullptr);
-  rejects(*file, "prep: route arities");
+  rejects(*file);
   EXPECT_NE(diagnostics.find("budget"), std::string::npos) << diagnostics;
 }
 

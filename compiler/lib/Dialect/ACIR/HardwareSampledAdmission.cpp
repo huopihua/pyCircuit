@@ -1107,11 +1107,15 @@ parseTransactionWiring(ModuleOp module, const HardwareAnalysis &analysis,
   }
   auto memoryInputs = getMemoryIncomingPortCount(module, analysis, bindings, budget);
   if (failed(memoryInputs)) return failure();
-  if (SourceCheckBudget::add(pairEnd,
-                             SourceCheckBudget::add(SourceCheckBudget::add(validityInputs, queueInputs), *memoryInputs)) !=
-      module.getFunctionType().getNumInputs())
+  uint64_t coveredInputs = SourceCheckBudget::add(
+      pairEnd, SourceCheckBudget::add(
+                   SourceCheckBudget::add(validityInputs, queueInputs),
+                   *memoryInputs));
+  if (coveredInputs != module.getFunctionType().getNumInputs())
     return module->emitOpError()
-           << "transaction, return, Queue, Memory and availability routes must exactly cover appended inputs";
+           << "transaction, return, Queue, Memory and availability routes must exactly cover appended inputs (covered "
+           << coveredInputs << ", actual "
+           << module.getFunctionType().getNumInputs() << ")";
   if (failed(charge(budget, module, states.size(),
                     sizeof(TransactionStateInventoryEntry))) ||
       failed(charge(budget, module, incoming.size(),

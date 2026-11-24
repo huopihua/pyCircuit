@@ -18,10 +18,14 @@ namespace acir::compiler {
 
 /// Backend-neutral, concrete facts derived once from verified final hardware.
 ///
-/// This is an in-process code-generation plan, not another IR. Attribute, type,
-/// and operation handles refer to a private final-ACIR snapshot owned by the
-/// verified wrapper and its private MLIRContext. Renderers must use the
-/// materialized values below; operation handles are diagnostic anchors only.
+/// This is an in-process code-generation plan, not another IR. Operation,
+/// value, attribute, and type handles are read-only target-lowering anchors
+/// into a private final-ACIR snapshot owned by the verified wrapper and its
+/// private MLIRContext. Backend-neutral discovery, identity, scheduling,
+/// dependency, source-unit, and publication decisions must come from the
+/// materialized fields below instead of being rediscovered by IR walks. No MLIR
+/// handle crosses the verified target RenderPlan boundary; pure renderers
+/// consume only owned values and complete source text.
 using HardwareEmissionValueId = uint64_t;
 using HardwareEmissionObservationId = uint64_t;
 using HardwareEmissionDefinitionId = uint32_t;
@@ -90,11 +94,26 @@ struct HardwareEmissionDefinitionNames {
   std::string verilog;
 };
 
+enum class HardwareEmissionQueueReadyPolicy { LocalOccupancy, DownstreamPop };
+struct HardwareEmissionQueuePlan {
+  uint64_t depth = 0;
+  uint64_t tokenCardinality = 0;
+  uint64_t tokenElementWidth = 0;
+  uint64_t availabilityLatency = 0;
+  HardwareEmissionQueueReadyPolicy readyPolicy =
+      HardwareEmissionQueueReadyPolicy::LocalOccupancy;
+  ac::StaticExprAttr depthExpression;
+  ac::StaticExprAttr availabilityLatencyExpression;
+};
+
 struct HardwareEmissionOccurrenceBinding {
   HardwareEmissionOccurrenceId id = 0;
   mlir::Operation *diagnosticAnchor = nullptr;
+  std::string instanceName;
+  bool collection = false;
   HardwareEmissionBindings bindings;
   llvm::SmallVector<uint64_t, 2> shape;
+  std::optional<HardwareEmissionQueuePlan> queue;
 };
 
 struct HardwareEmissionDependencyEndpoint {
@@ -134,7 +153,11 @@ struct HardwareEmissionDefinitionPlan {
   std::string symbol;
   mlir::DictionaryAttr sourceOwner;
   HardwareEmissionDefinitionNames names;
+  /// Schedule derived with the definition's formal/template bindings. Generic
+  /// target lowering must use this inventory instead of borrowing an arbitrary
+  /// concrete specialization's schedule.
   llvm::SmallVector<mlir::Operation *, 4> templateSchedule;
+  llvm::SmallVector<mlir::Value, 2> outputValues;
   llvm::SmallVector<HardwareEmissionOccurrenceBinding, 2> templateChildren;
   llvm::SmallVector<mlir::Operation *, 2> independentWorkChildren;
   llvm::SmallVector<HardwareEmissionDependencyPlan, 0> dependencies;
@@ -190,13 +213,6 @@ struct HardwareEmissionScheduleStep {
 
 enum class HardwareEmissionChildKind { Module, Primitive };
 
-struct HardwareEmissionQueuePlan {
-  uint64_t depth = 0;
-  uint64_t tokenCardinality = 0;
-  uint64_t tokenElementWidth = 0;
-  uint64_t availabilityLatency = 0;
-};
-
 struct HardwareEmissionChildPlan {
   HardwareEmissionOccurrenceId id = 0;
   mlir::Operation *diagnosticAnchor = nullptr;
@@ -247,6 +263,18 @@ struct HardwareEmissionEntryPlan {
   llvm::SmallVector<HardwareEmissionEntryArgument, 2> logicalArguments;
 };
 
+struct HardwareEmissionRootInterfacePlan {
+  llvm::SmallVector<std::string, 0> inputNames;
+  llvm::SmallVector<std::string, 0> outputNames;
+  unsigned publicInputCount = 0;
+  unsigned publicOutputCount = 0;
+  llvm::SmallVector<unsigned, 2> availabilityOutputs;
+  llvm::SmallVector<uint64_t, 2> defaultInputs;
+  std::optional<unsigned> clockInput;
+  std::optional<unsigned> resetInput;
+  bool closedSystem = false;
+};
+
 struct HardwareEmissionExecutionPlan {
   std::string strategy;
   std::string protocol;
@@ -282,6 +310,10 @@ struct HardwareEmissionSourceUnitPlan {
   /// renderers. This is frozen during planning; renderers must not rediscover
   /// an order by walking the final ACIR snapshot.
   llvm::SmallVector<unsigned, 0> emissionOrder;
+  /// Sorted, unique headers required by definitions in this unit.  This is
+  /// frozen from the definition-child inventory so C++ emission never walks
+  /// operation bodies to rediscover native dependencies.
+  llvm::SmallVector<std::string, 0> cppIncludes;
   std::string cppHeaderPath;
   std::string cppSourcePath;
   std::string verilogPath;
@@ -289,7 +321,12 @@ struct HardwareEmissionSourceUnitPlan {
 
 struct HardwareEmissionPlan {
   mlir::ModuleOp package;
+  /// Set only after target capability validation succeeds while constructing
+  /// the verified plan. Renderer preparation must consume this proof rather
+  /// than repeat semantic walks over final ACIR.
+  bool targetCapabilitiesValidated = false;
   unsigned rootModule = 0;
+  HardwareEmissionRootInterfacePlan rootInterface;
   HardwareEmissionEntryPlan entry;
   ac::HardwareResetSemantics resetSemantics =
       ac::HardwareResetSemantics::Strict;

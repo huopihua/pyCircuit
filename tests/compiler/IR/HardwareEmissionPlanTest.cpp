@@ -40,6 +40,18 @@ static_assert(
     !std::is_copy_constructible_v<compiler::VerifiedVerilogRenderPlan>);
 static_assert(
     std::is_move_constructible_v<compiler::VerifiedVerilogRenderPlan>);
+static_assert(std::is_same_v<
+              decltype(compiler::FinalSourceMap::sourceOwner),
+              compiler::FinalSourceOwner>);
+static_assert(std::is_same_v<
+              decltype(compiler::FinalCppSourceGroup::sourceOwner),
+              compiler::FinalSourceOwner>);
+static_assert(std::is_same_v<
+              decltype(compiler::FinalVerilogSourceGroup::sourceOwner),
+              compiler::FinalSourceOwner>);
+static_assert(std::is_same_v<
+              decltype(compiler::FinalVerilogSourceGroup::definitions),
+              llvm::SmallVector<std::string>>);
 
 TEST_F(HardwareEmissionPlanTest, FreezesFinalClosureChecksAndMetadata) {
   auto package =
@@ -205,6 +217,45 @@ TEST(HardwareEmissionPlanLifetimeTest, OwnsItsMlirContext) {
   EXPECT_FALSE(verilog->get().parts.core.empty());
 }
 
+TEST(HardwareEmissionPlanLifetimeTest,
+     RenderPlansOutliveHardwarePlanAndPrivateContext) {
+  std::optional<compiler::VerifiedCppRenderPlan> cpp;
+  std::optional<compiler::VerifiedVerilogRenderPlan> verilog;
+  {
+    MLIRContext sourceContext;
+    sourceContext.loadDialect<ac::ACIRDialect>();
+    SmallString<256> path(PYCIRCUIT_TEST_REPO_ROOT);
+    llvm::sys::path::append(
+        path, "tests/compiler/lit/CodeGen/Inputs/sampled-admission.mlir");
+    auto package = parseSourceFile<ModuleOp>(path, &sourceContext);
+    ASSERT_TRUE(package);
+    auto hardware = compiler::prepareHardwareEmissionPlan(*package);
+    ASSERT_TRUE(succeeded(hardware));
+    auto preparedCpp = compiler::prepareCppRenderPlan(*hardware);
+    auto preparedVerilog = compiler::prepareVerilogRenderPlan(*hardware);
+    ASSERT_TRUE(succeeded(preparedCpp));
+    ASSERT_TRUE(succeeded(preparedVerilog));
+    cpp.emplace(std::move(*preparedCpp));
+    verilog.emplace(std::move(*preparedVerilog));
+  }
+
+  std::string cppJson, cppSource, rtlJson, rtlSource;
+  llvm::raw_string_ostream cppJsonOut(cppJson), cppSourceOut(cppSource),
+      rtlJsonOut(rtlJson), rtlSourceOut(rtlSource);
+  compiler::renderCppJson(*cpp, cppJsonOut);
+  compiler::renderCppSource(*cpp, cppSourceOut);
+  compiler::renderVerilogJson(*verilog, rtlJsonOut);
+  compiler::renderVerilogSource(*verilog, rtlSourceOut);
+  cppJsonOut.flush();
+  cppSourceOut.flush();
+  rtlJsonOut.flush();
+  rtlSourceOut.flush();
+  EXPECT_TRUE(llvm::json::parse(cppJson));
+  EXPECT_TRUE(llvm::json::parse(rtlJson));
+  EXPECT_FALSE(cppSource.empty());
+  EXPECT_FALSE(rtlSource.empty());
+}
+
 TEST_F(HardwareEmissionPlanTest, RejectsMutatedTargetPublicationInventory) {
   auto package =
       parse("tests/compiler/lit/CodeGen/Inputs/sampled-admission.mlir");
@@ -253,6 +304,15 @@ TEST_F(HardwareEmissionPlanTest, RetainsDistinctGenericSpecializations) {
   ASSERT_EQ(aggregate.key.types.size(), 1u);
   EXPECT_NE(scalar.key.types.front().value, aggregate.key.types.front().value);
 
+  auto generic = llvm::find_if(plan->get().definitions, [](const auto &item) {
+    return item.symbol == "identity";
+  });
+  ASSERT_NE(generic, plan->get().definitions.end());
+  ASSERT_FALSE(generic->templateSchedule.empty());
+  for (Operation *operation : generic->templateSchedule)
+    EXPECT_EQ(operation->getParentOfType<ac::ModuleOp>(),
+              generic->diagnosticAnchor);
+
   llvm::DenseSet<compiler::HardwareEmissionOccurrenceId> occurrences;
   for (const auto &module : plan->get().modules)
     for (const auto &child : module.children)
@@ -261,6 +321,46 @@ TEST_F(HardwareEmissionPlanTest, RetainsDistinctGenericSpecializations) {
     for (const auto &child : definition.templateChildren)
       EXPECT_TRUE(occurrences.insert(child.id).second);
   EXPECT_EQ(occurrences.size(), plan->get().occurrenceAnchors.size());
+}
+
+TEST_F(HardwareEmissionPlanTest, RejectsMutatedGenericTargetInventories) {
+  auto package =
+      parse("tests/compiler/lit/CodeGen/Inputs/generic-forward.mlir");
+  ASSERT_TRUE(package);
+  Builder builder(&context);
+  (*package)->setAttr("ac.stage", builder.getStringAttr("final"));
+
+  auto prepared = compiler::prepareHardwareEmissionPlan(*package);
+  ASSERT_TRUE(succeeded(prepared));
+  const auto &plan = prepared->get();
+  auto identity = llvm::find_if(plan.definitions, [](const auto &item) {
+    return item.symbol == "identity";
+  });
+  auto top = llvm::find_if(
+      plan.definitions, [](const auto &item) { return item.symbol == "top"; });
+  ASSERT_NE(identity, plan.definitions.end());
+  ASSERT_NE(top, plan.definitions.end());
+  ASSERT_FALSE(top->templateSchedule.empty());
+
+  auto includingUnit = llvm::find_if(plan.sourceUnits, [&](const auto &unit) {
+    return llvm::is_contained(unit.cppIncludes, identity->names.header);
+  });
+  ASSERT_NE(includingUnit, plan.sourceUnits.end());
+  const unsigned unitIndex = includingUnit - plan.sourceUnits.begin();
+  compiler::HardwareEmissionPlan mutated = plan;
+  auto include = llvm::find(mutated.sourceUnits[unitIndex].cppIncludes,
+                            identity->names.header);
+  ASSERT_NE(include, mutated.sourceUnits[unitIndex].cppIncludes.end());
+  mutated.sourceUnits[unitIndex].cppIncludes.erase(include);
+  EXPECT_TRUE(failed(compiler::verifyHardwareEmissionPlan(mutated)));
+
+  mutated = plan;
+  auto mutatedIdentity =
+      llvm::find_if(mutated.definitions,
+                    [](const auto &item) { return item.symbol == "identity"; });
+  ASSERT_NE(mutatedIdentity, mutated.definitions.end());
+  mutatedIdentity->templateSchedule.push_back(top->templateSchedule.front());
+  EXPECT_TRUE(failed(compiler::verifyHardwareEmissionPlan(mutated)));
 }
 
 TEST_F(HardwareEmissionPlanTest, RejectsMutatedFrozenIdentities) {

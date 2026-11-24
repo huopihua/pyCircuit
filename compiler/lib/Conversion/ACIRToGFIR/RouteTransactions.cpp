@@ -2641,8 +2641,31 @@ public:
     }
     for (const auto &proposal : prepared.memoryProposals) {
       types.push_back(predicateType); types.push_back(predicateType);
-      for (auto argument : plan.memoryAccesses[proposal.access].arguments)
-        types.push_back(plan.values[argument].value.getType());
+      const auto &access = plan.memoryAccesses[proposal.access];
+      const auto &owner = plan.memoryOwners[access.owner];
+      auto operands = memoryOperands(access, owner.layout);
+      unsigned argument = 0;
+      for (unsigned operand : operands) {
+        bool enable = operand == owner.layout.writeEnableOperand &&
+                      access.kind == ac::TransactionMemoryAccessKind::Write;
+        enable |= access.kind == ac::TransactionMemoryAccessKind::Request &&
+                  operand == owner.layout.readEnableOperands[access.port];
+        if (enable)
+          continue;
+        if (argument >= access.arguments.size())
+          return transaction.emitOpError()
+                 << "transaction Memory argument/type inventory is inconsistent";
+        auto type = hardware.resolveType(
+            owner.allocation->getOperand(operand).getType(),
+            plan.instances[owner.anchor].bindings, transaction);
+        if (failed(type))
+          return failure();
+        types.push_back(*type);
+        ++argument;
+      }
+      if (argument != access.arguments.size())
+        return transaction.emitOpError()
+               << "transaction Memory argument/type inventory is inconsistent";
     }
     for (const auto &domain : prepared.writeDomains)
       types.push_back(domain.maskType);
@@ -8413,12 +8436,12 @@ public:
       return;
     }
     ac::HardwareSourceCheckLimits limits;
-    limits.maxWorkUnits = 1024 * 1024;
     SourceCheckBudget budget(limits);
     auto prepared = detail::prepareTransactionLowering(input, analysis, budget);
     if (failed(prepared)) { signalPassFailure(); return; }
     auto candidate = detail::materializeTransactionLowering(*prepared, budget);
-    if (failed(candidate) || failed(detail::verifyTransactionMaterialization(
+    if (failed(candidate)) { signalPassFailure(); return; }
+    if (failed(detail::verifyTransactionMaterialization(
                                  *prepared, *candidate, budget))) {
       signalPassFailure();
       return;

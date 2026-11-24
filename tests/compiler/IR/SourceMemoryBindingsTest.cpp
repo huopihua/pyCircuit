@@ -715,7 +715,7 @@ TEST_F(SourceMemoryBindingsTest, SourceWorkCapIsSharedAcrossUnusedModules) {
 TEST_F(SourceMemoryBindingsTest,
        SourceLoweringSharesWideConstantsAcrossModulesUntilLink) {
   for (unsigned width : {8u, 1000000u})
-    for (unsigned modules : {1u, 2u}) {
+    for (unsigned modules : {1u, 16u}) {
       SCOPED_TRACE("width=" + std::to_string(width) +
                    " modules=" + std::to_string(modules));
       std::string text =
@@ -767,8 +767,9 @@ TEST_F(SourceMemoryBindingsTest,
       auto linked =
           compiler::linkSourceUnits({{*unit->body, *unit->interface}},
                                       "memory_cache.padded.Top0", error());
-      EXPECT_EQ(succeeded(linked), width == 8) << diagnostics;
-      if (width != 8)
+      bool expected = width == 8 || modules == 1;
+      EXPECT_EQ(succeeded(linked), expected) << diagnostics;
+      if (!expected)
         EXPECT_NE(
             diagnostics.find("work budget"),
             std::string::npos)

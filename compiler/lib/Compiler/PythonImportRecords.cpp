@@ -3110,6 +3110,22 @@ Importer::bindParameters(DictionaryAttr calleeAttrs, const AstNode &call,
         ordinal = j;
     if (ordinal == formals.size() || values[ordinal])
       return error() << "unknown or repeated instance parameter";
+    // A static actual may reference only a static parameter in the caller's
+    // scope. Reject runtime SSA names here instead of encoding a dangling
+    // StaticExpr reference that may survive when the callee is inlined away.
+    if (kw.child("value").kind() == "Name") {
+      StringRef actualName = kw.child("value").string("id");
+      auto owner = SymbolTable::lookupSymbolIn(body->getOperation(), parent);
+      auto parameters = owner ? owner->getAttrOfType<ArrayAttr>("parameters")
+                              : ArrayAttr();
+      bool declared = parameters && llvm::any_of(parameters, [&](Attribute raw) {
+        return cast<DictionaryAttr>(raw).getAs<StringAttr>("name").getValue() ==
+               actualName;
+      });
+      if (!declared)
+        return error() << "hardware static reference must name an integer "
+                          "formal of its owning module";
+    }
     auto value = staticExpr(kw.child("value"), parent);
     if (failed(value))
       return failure();

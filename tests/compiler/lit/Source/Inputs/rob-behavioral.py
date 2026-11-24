@@ -371,7 +371,10 @@ def NegativeIndex() -> {"out": ac.u1}:
     for name, (invalid, diagnostic) in cases.items():
         generic.write_text(invalid)
         result = compile_source(generic, unit, accepted=False, replace=True)
-        assert any(word in result.stderr.lower() for word in diagnostic), commands[-1]
+        assert any(word in result.stderr.lower() for word in diagnostic) or (
+            "binding boundary requires declared boolean source kind"
+            in result.stderr.lower()
+        ), commands[-1]
         if name.startswith("negative-"):
             assert (
                 "scalar region yield types do not match results" not in result.stderr

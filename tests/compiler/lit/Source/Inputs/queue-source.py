@@ -422,7 +422,8 @@ def fault_checks():
             )
             if "fifo_kernel" in kernel:
                 params = re.search(
-                    r", (\d+), gfsim::QueueReadyPolicy::\w+, (\d+)ULL", kernel
+                    r", (\d+)(?:ULL)?, gfsim::QueueReadyPolicy::\w+, " r"(\d+)(?:ULL)?",
+                    kernel,
                 )
                 assert params, kernel
                 depth, latency = map(int, params.groups())

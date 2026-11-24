@@ -51,8 +51,9 @@ FIFO_RTL = re.compile(
 )
 FIFO_CPP = re.compile(
     r"pyc_queue_pyc_[0-9a-f]+_state\(std::make_shared<"
-    r"gfsim::collection_storage<gfsim::fifo_kernel<gfsim::Bits<(\d+)>,\s*(\d+),\s*"
-    r"gfsim::QueueReadyPolicy::(\w+),\s*(\d+)ULL>{2,3}"
+    r"gfsim::collection_storage<gfsim::fifo_kernel<gfsim::Bits<(\d+)>,\s*"
+    r"(\d+)(?:ULL)?,\s*gfsim::QueueReadyPolicy::(\w+),\s*"
+    r"(\d+)(?:ULL)?>{2,3}"
 )
 
 

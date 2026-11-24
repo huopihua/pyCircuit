@@ -518,6 +518,11 @@ LogicalResult HardwareAnalysis::verifyModuleDeclaration(
     // keep that shape regardless of the caller's bindings.
     HardwareBindings parent = bindings;
     parent.owner = instance->getParentOp();
+    if (!requireResolved) {
+      if (failed(bindOccurrence(instance, parent)))
+        return failure();
+      return success();
+    }
     return verifyInstance(instance, parent);
   }
   if (auto expect = dyn_cast<SourceExpectOp>(operation)) {

@@ -684,9 +684,10 @@ for owners in (31, 32):
     budget_cases.append(
         (f"queries-{owners}", candidate, None if owners == 31 else "query")
     )
-for modules in (1, 2):
+for modules in (1, 16):
     candidate = proof_source("p == 0", "p == 1").replace(
-        "p: ac.u1, q: ac.u1, r: ac.u1", "p: ac.bits[1000000]"
+        "p: ac.u1, q: ac.u1, r: ac.u1",
+        "p: ac.bits[1000000]",
     )
     begin = candidate.index("    value: ac.u8 = 7")
     header = candidate[:begin].replace(proof_rules(2), proof_rules(64))
@@ -696,9 +697,9 @@ for modules in (1, 2):
         for i in range(32 if modules == 1 else 20)
     )
     candidate = header + setup + "    return Out(value=v0)\n"
-    if modules == 2:
+    for index in range(1, modules):
         module_header = header[header.index("@ac.module") :].replace(
-            "def Top(", "def Unused("
+            "def Top(", f"def Unused{index}("
         )
         candidate += module_header + setup + "    return Out(value=v0)\n"
     budget_cases.append(
@@ -872,8 +873,8 @@ for count in (120, 130):
 # Large private mask result types must be charged before their construction.
 address_rejects["domain-storage-budget"] = (
     address_program(
-        depth=1 << 19,
-        inputs="data: ac.bits[19], other: ac.bits[19]",
+        depth=1 << 30,
+        inputs="data: ac.bits[30], other: ac.bits[30]",
         body_a="if enable:\n        entries[i].a = value\n        entries[i].b = value",
         body_b="if enable:\n        entries[i].a = value\n        entries[i].b = value",
     )

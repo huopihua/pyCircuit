@@ -70,9 +70,18 @@ public:
   mlir::FailureOr<llvm::SmallVector<uint64_t>>
   occurrenceShape(mlir::Operation *occurrence,
                   const ac::HardwareBindings &parent) const;
+  mlir::FailureOr<std::string>
+  occurrenceName(mlir::Operation *occurrence,
+                 const ac::HardwareBindings &parent) const;
+  bool occurrenceIsCollection(mlir::Operation *occurrence) const;
   const HardwareEmissionQueuePlan *
   queuePlan(mlir::Operation *occurrence,
             const ac::HardwareBindings &parent) const;
+  mlir::FailureOr<llvm::SmallVector<mlir::Value>>
+  outputValues(mlir::Operation *definition) const;
+  const HardwareEmissionModulePlan *
+  modulePlan(mlir::Operation *definition,
+             const ac::HardwareBindings &bindings = {}) const;
   mlir::FailureOr<llvm::SmallVector<ac::WireEndpoint>>
   dependencies(mlir::Value value, llvm::ArrayRef<mlir::StringAttr> path,
                const ac::HardwareBindings &bindings) const;
@@ -180,6 +189,12 @@ struct ObservationEmissionSite {
   bool carriesValue = false;
   bool gauge = false;
   uint64_t registrationKey = 0, siteKey = 0;
+  std::string kind;
+  std::string registrationJson;
+  std::string siteJson;
+  std::string specJson;
+  std::string reportName;
+  uint64_t valueCount = 0;
 };
 struct ObservationEmissionChild {
   HardwareEmissionOccurrenceId id = 0;
@@ -191,6 +206,8 @@ struct ObservationEmissionPathEntry {
   HardwareEmissionOccurrenceId id = 0;
   mlir::Operation *diagnosticAnchor = nullptr;
   uint64_t lane = 0;
+  std::string instanceName;
+  bool collection = false;
   bool operator==(const ObservationEmissionPathEntry &) const = default;
 };
 struct ObservationEmissionOccurrence {
@@ -207,7 +224,7 @@ struct ObservationEmissionPlan {
   llvm::DenseMap<mlir::Operation *, uint64_t> subtreeWidth;
   llvm::DenseMap<HardwareEmissionOccurrenceId, uint64_t> childBaseUnits;
   llvm::SmallVector<std::array<uint64_t, 5>> table;
-  llvm::SmallVector<ObservationEmissionOccurrence> occurrences;
+  llvm::SmallVector<ObservationEmissionOccurrence, 0> occurrences;
   uint64_t events = 0;
 };
 mlir::FailureOr<ObservationEmissionPlan>

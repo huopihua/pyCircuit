@@ -250,10 +250,18 @@ HardwareAnalysis::verifyOccurrence(Operation *instance,
         return failure();
       e = *table;
     }
-    if (!areEquivalentHardwareTypes(*a, *e))
-      return LogicalResult(
-          instance->emitOpError()
-          << "instance wire type does not match bound callee signature");
+    if (!areEquivalentHardwareTypes(*a, *e)) {
+      bool actualConcrete = true, expectedConcrete = true;
+      if (failed(detail::verifySourceTemplateType(
+              *this, *a, parent, instance, &actualConcrete)) ||
+          failed(detail::verifySourceTemplateType(
+              *this, *e, *bindings, instance, &expectedConcrete)))
+        return failure();
+      if (actualConcrete && expectedConcrete)
+        return LogicalResult(
+            instance->emitOpError()
+            << "instance wire type does not match bound callee signature");
+    }
     return success();
   };
   for (auto [a, e] : llvm::zip(instance->getOperandTypes(), sig.getInputs()))
@@ -718,8 +726,11 @@ LogicalResult HardwareAnalysis::verifyResolvedOperation(
       return op->emitOpError() << "bound extract slice exceeds input width";
   }
   if (auto resize = dyn_cast<BitsResizeOp>(op)) {
-    if ((resize.getMode() == "trunc" && outputs[0] >= inputs[0]) ||
-        (resize.getMode() != "trunc" && outputs[0] <= inputs[0]))
+    // Symbolic source templates may retain a resize whose widths become equal
+    // for a concrete occurrence.  Equality is an identity conversion for both
+    // modes; only a genuinely reversed direction is invalid.
+    if ((resize.getMode() == "trunc" && outputs[0] > inputs[0]) ||
+        (resize.getMode() != "trunc" && outputs[0] < inputs[0]))
       return op->emitOpError() << "bound resize direction disagrees with mode";
   }
   if (isa<InstanceOp, CollectionOp>(op)) {

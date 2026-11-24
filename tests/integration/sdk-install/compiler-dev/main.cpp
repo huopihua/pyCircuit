@@ -1,5 +1,4 @@
 #include "Compiler/BackendRenderPlan.h"
-#include "Compiler/FinalCppSourceParts.h"
 #include "Compiler/HardwareEmissionPlan.h"
 #include "Compiler/SourceUnit.h"
 #include "mlir/IR/Diagnostics.h"
@@ -33,14 +32,12 @@ int main() {
       &context, headers, diagnostic);
 
   acir::compiler::SourceUnitArtifacts unitArtifacts;
-  acir::compiler::FinalCppSourceParts cppParts;
   acir::compiler::CppRenderPlan cppRenderPlan;
   acir::compiler::VerilogRenderPlan verilogRenderPlan;
   acir::compiler::HardwareEmissionPlan hardwarePlan;
   return dialect == nullptr || mlir::failed(sourceHeaders) ||
                  mlir::succeeded(acir::compiler::verifyHardwareEmissionPlan(
                      hardwarePlan)) ||
-                 !cppParts.sourceGroups.empty() ||
                  !cppRenderPlan.parts.sourceGroups.empty() ||
                  !verilogRenderPlan.parts.sourceGroups.empty() ||
                  unitArtifacts.body

@@ -166,8 +166,8 @@ LogicalResult BitsResizeOp::verify() {
   auto resultWidth = literalInteger(getResult().getType().getWidth());
   if (!inputWidth || !resultWidth)
     return success();
-  if ((getMode() == "trunc" && *resultWidth >= *inputWidth) ||
-      (getMode() != "trunc" && *resultWidth <= *inputWidth))
+  if ((getMode() == "trunc" && *resultWidth > *inputWidth) ||
+      (getMode() != "trunc" && *resultWidth < *inputWidth))
     return emitOpError() << "trunc must narrow and extension modes must widen";
   return success();
 }

@@ -74,6 +74,10 @@ pyc_dut::Inputs inputs(Pattern pattern,unsigned row,bool highZ,bool latent) {
   drivePort<127>(ports.w127,pattern,row,highZ,latent);
   drivePort<128>(ports.w128,pattern,row,highZ,latent);
   drivePort<129>(ports.w129,pattern,row,highZ,latent);
+  ports.pyc_7079635f636c6b = gfsim::wire<gfsim::Bits<1>>::known(
+      gfsim::Bits<1>{1});
+  ports.pyc_7079635f727374 = gfsim::wire<gfsim::Bits<1>>::known(
+      gfsim::Bits<1>{0});
   return ports;
 }
 using Symbols = std::vector<char>;
@@ -383,7 +387,18 @@ int main(int argc,char **argv) {
   auto run=[&](Pattern pattern,unsigned row=0,bool highZ=false,bool latent=false) {
     auto ports=inputs(pattern,row,highZ,latent); auto expected=golden(ports); dut.drive(ports);
     PycircuitModelStepResultV1 status{sizeof(status)};
-    require(executor.Step(&status)==PYCIRCUIT_MODEL_STATUS_V1_OK); require(status.state==PYCIRCUIT_MODEL_STEP_V1_RUNNING);
+    auto step_status = executor.Step(&status);
+    if (step_status != PYCIRCUIT_MODEL_STATUS_V1_OK) {
+      PycircuitModelBufferV1 error{};
+      executor.LastError(&error);
+      std::cerr << "step status " << step_status << ", state " << status.state
+                << ", epoch " << status.epoch_time << ", delta "
+                << status.epoch_delta << ", error "
+                << std::string_view(reinterpret_cast<const char *>(error.data),
+                                    error.size)
+                << '\n';
+    }
+    require(step_status==PYCIRCUIT_MODEL_STATUS_V1_OK); require(status.state==PYCIRCUIT_MODEL_STEP_V1_RUNNING);
     auto output=dut.sample().result; auto trace=check(output,expected);
     if(pattern==Pattern::Literal) tableCheck(output,row);
     bool isMasked=pattern>=Pattern::FourSmall;

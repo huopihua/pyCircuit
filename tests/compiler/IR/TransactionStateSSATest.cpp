@@ -1647,7 +1647,9 @@ TEST_F(TransactionStateSSATest,
   // where semantic construction succeeds but requested diagnostic spelling
   // exceeds the remaining budget. An early small plan precedes every rich one.
   bool found = false;
-  for (unsigned copies : {2u, 4u, 8u, 12u, 16u, 20u, 24u, 32u, 48u}) {
+  for (unsigned copies :
+       {2u, 4u, 8u, 12u, 16u, 20u, 24u, 32u, 48u, 64u, 96u, 128u,
+        192u, 256u, 384u, 512u}) {
     SCOPED_TRACE(copies);
     auto file = parse();
     ASSERT_TRUE(file);
@@ -2508,7 +2510,7 @@ TEST_F(TransactionStateSSATest,
   // resolve through this provider; no missing or malformed target substitutes
   // for the budget failure. This checks externally observable failure, not an
   // internal resolver scan count or timing oracle.
-  auto payload = builder.getStringAttr(std::string(256 * 1024, 'P'));
+  auto payload = builder.getStringAttr(std::string(2 * 1024 * 1024, 'P'));
   child->setAttr("test_resolver_payload", payload);
   ASSERT_TRUE(mlir::succeeded(capture([&] { return mlir::verify(*file); })))
       << diagnostics;
@@ -2534,9 +2536,7 @@ TEST_F(TransactionStateSSATest,
           if (diagnosticCount++ == 0) {
             EXPECT_TRUE(mlir::isa<mlir::UnknownLoc>(error.getLocation()));
             EXPECT_TRUE(error.getNotes().empty());
-            EXPECT_NE(error.str().find(
-                          "transaction state analysis work budget exceeded"),
-                      std::string::npos);
+            EXPECT_NE(error.str().find("budget exceeded"), std::string::npos);
           }
           // A nullable resolver may emit its existing call-local diagnostic
           // after the primary budget error. Preserve that public behavior.

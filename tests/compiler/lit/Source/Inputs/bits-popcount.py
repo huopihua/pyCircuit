@@ -259,7 +259,7 @@ cases = {
     "unresolved-marker": (scalar("popcount(value)"), "unsupported"),
     "zero-width": (
         scalar("ac.popcount(value)", base="ac.bits[0]"),
-        "hardware static value must be positive and fit u64",
+        "bits width must be positive",
     ),
     "negative-width": (
         scalar("ac.popcount(value)", base="ac.bits[0 - 1]"),

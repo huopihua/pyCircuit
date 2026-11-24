@@ -29,22 +29,31 @@ StringRef ownerPrefix(Operation *op) {
 FailureOr<std::string> queueKernelType(HardwareEmitContext &ctx,
                                        ac::InstanceOp queue,
                                        const ac::HardwareBindings &bindings) {
-  auto config = ac::getQueueConfiguration(queue);
-  if (failed(config))
-    return failure();
+  const auto *config = ctx.queuePlan(queue, bindings);
+  if (!config)
+    return queue.emitOpError()
+           << "queue is absent from the frozen emission plan";
   auto payload = ctx.cppType(queue.getInputs()[3].getType(), bindings, queue);
-  auto depth = ctx.staticValue(config->getAs<ac::StaticExprAttr>("depth"),
-                               bindings, queue);
-  auto latency = ctx.unsignedStaticValue(
-      config->getAs<ac::StaticExprAttr>("availability_latency"), queue,
-      false, bindings);
-  if (failed(payload) || failed(depth) || failed(latency))
+  if (failed(payload))
     return failure();
-  StringRef policy = config->getAs<StringAttr>("ready_policy").getValue() == "local_occupancy"
-                         ? "LocalOccupancy"
-                         : "DownstreamPop";
-  return "gfsim::fifo_kernel<" + *payload + ", " + *depth +
-         ", gfsim::QueueReadyPolicy::" + policy.str() + ", " + *latency + ">";
+  auto depth = config->depth
+                   ? FailureOr<std::string>(std::to_string(config->depth) + "ULL")
+                   : ctx.staticValue(config->depthExpression, bindings, queue);
+  auto latency = config->availabilityLatency
+                     ? FailureOr<std::string>(
+                           std::to_string(config->availabilityLatency) + "ULL")
+                     : ctx.staticValue(config->availabilityLatencyExpression,
+                                       bindings, queue);
+  if (failed(depth) || failed(latency))
+    return failure();
+  StringRef policy =
+      config->readyPolicy == HardwareEmissionQueueReadyPolicy::LocalOccupancy
+          ? "LocalOccupancy"
+          : "DownstreamPop";
+  return "gfsim::fifo_kernel<" + *payload + ", " +
+         *depth + ", gfsim::QueueReadyPolicy::" +
+         policy.str() + ", " +
+         *latency + ">";
 }
 struct Scope {
   ac::ModuleOp definition;
@@ -562,10 +571,6 @@ private:
     memo.push_back({&s, v, p, std::move(text)});
   }
   FailureOr<std::string> emit(Scope &s, Value v, Path path = {}) {
-    if (probeSize && out.tell() > CppWorkOutlining::outlineTriggerBytes) {
-      exceededSize = true;
-      return failure();
-    }
     // Callers finish their generated C++ block before requesting another
     // value. Capture that code even when this request hits the memo.
     statement();
@@ -788,8 +793,10 @@ private:
         return en;
       }
       auto baseType = type(merge.getBase().getType(), s, op);
-      if (failed(baseType))
+      if (failed(baseType)) {
+        op->emitOpError() << "C++ merge base type resolution failed";
         return failure();
+      }
       if (merge.getValues().empty())
         return operand(merge.getBase(), path);
       // Whole-Table merges use the same leaf planes as Tables elsewhere.
@@ -798,8 +805,10 @@ private:
           isa<ac::BitsType, ac::EnumType, ac::TypeParamType,
               ac::TableType>(*baseType)) {
         auto base = operand(merge.getBase(), path);
-        if (failed(base))
+        if (failed(base)) {
+          op->emitOpError() << "C++ merge base operand emission failed";
           return failure();
+        }
         for (auto [i, raw] : llvm::enumerate(merge.getPaths())) {
           Path selected;
           for (auto n : cast<ArrayAttr>(raw))
@@ -810,8 +819,15 @@ private:
                  candidate =
                      operand(merge.getValues()[i],
                              Path(path.begin() + selected.size(), path.end()));
-            if (failed(g) || failed(candidate))
+            if (failed(g) || failed(candidate)) {
+              auto diagnostic = op->emitOpError();
+              diagnostic << "C++ merge guarded candidate emission failed (guard="
+                         << (failed(g) ? "failed" : "ok") << ", candidate="
+                         << (failed(candidate) ? "failed" : "ok")
+                         << ", requested path depth=" << path.size()
+                         << ", selected path depth=" << selected.size() << ")";
               return failure();
+            }
             return "gfsim::select(" + *g + ", " + *candidate + ", " + *base +
                    ")";
           }
@@ -819,13 +835,17 @@ private:
         return *base;
       }
       auto leaves = ctx.fieldPaths(value.getType(), s.bindings);
-      if (failed(leaves))
+      if (failed(leaves)) {
+        op->emitOpError() << "C++ merge leaf discovery failed";
         return failure();
+      }
       std::string text;
       for (auto p : *leaves) {
         auto e = scalarExpression(s, value, p, operand);
-        if (failed(e))
+        if (failed(e)) {
+          op->emitOpError() << "C++ merge leaf emission failed";
           return failure();
+        }
         text = text.empty() ? *e : "gfsim::concat(" + text + ", " + *e + ")";
       }
       return text;
@@ -1155,8 +1175,10 @@ private:
     SmallVector<std::tuple<Value, Path, std::string>> inputs;
     auto gather = [&](Value input, Path p) -> FailureOr<std::string> {
       auto inputPlan = fieldPlane(input.getType(), p, s, op);
-      if (failed(inputPlan))
+      if (failed(inputPlan)) {
+        op->emitOpError() << "C++ scalar input plane planning failed";
         return failure();
+      }
       auto lane = "((pyc_lane / (" + resultPlan->count + ")) * (" +
                   inputPlan->count + ") + pyc_lane % (" +
                   inputPlan->count + "))";
@@ -1164,8 +1186,10 @@ private:
         if (std::get<0>(entry) == input && std::get<1>(entry) == p)
           return std::get<2>(entry) + ".element(" + lane + ").packed()";
       auto text = emit(s, input, p);
-      if (failed(text))
+      if (failed(text)) {
+        op->emitOpError() << "C++ scalar input emission failed";
         return failure();
+      }
       inputs.push_back({input, p, *text});
       return *text + ".element(" + lane + ").packed()";
     };
@@ -1201,8 +1225,10 @@ private:
         }
         unsigned operand = arg.getArgNumber() - 1;
         auto source = emit(*s.regionParent, map->getOperand(operand), path);
-        if (failed(source))
+        if (failed(source)) {
+          map->emitOpError() << "C++ Table.map argument source emission failed";
           return failure();
+        }
         if (operand < map.getTables().size())
           return *source;
         auto result = declarePlane(s, v, path);
@@ -1249,11 +1275,13 @@ private:
         if (leaf.scope != &s || leaf.op != op)
           continue;
         if (!leaf.queueRead[port]) {
-          auto config = ac::getQueueConfiguration(queue);
-          if (failed(config))
-            return failure();
+          const auto *config = ctx.queuePlan(queue, s.bindings);
+          if (!config)
+            return queue.emitOpError()
+                   << "queue is absent from the frozen emission plan";
           if (port == 0 &&
-              config->getAs<StringAttr>("ready_policy").getValue() == "downstream_pop") {
+              config->readyPolicy ==
+                  HardwareEmissionQueueReadyPolicy::DownstreamPop) {
             auto ready = emit(s, queue->getOperand(4));
             if (failed(ready) || failed(setPort(s, op, 4, {}, *ready)))
               return failure();
@@ -1962,17 +1990,15 @@ LogicalResult emitHardwareCppDefinition(HardwareEmitContext &ctx,
             << "> " << child.name << "_" << direction << "_tokens;\n";
       continue;
     }
-    auto sig = cast<FunctionType>(
-        child.bindings.owner->getAttrOfType<TypeAttr>("function_type")
-            .getValue());
+    auto occurrence = cast<ac::InstanceOp>(child.op);
     if (failed(familyPorts(
-            sig.getInputs(),
+            occurrence->getOperandTypes(),
             child.bindings.owner->getAttrOfType<ArrayAttr>("input_names"),
-            child.name + "_", child.count, child.bindings, child.op)) ||
+            child.name + "_", child.count, parent, child.op)) ||
         failed(familyPorts(
-            sig.getResults(),
+            occurrence->getResultTypes(),
             child.bindings.owner->getAttrOfType<ArrayAttr>("output_names"),
-            child.name + "_", child.count, child.bindings, child.op)))
+            child.name + "_", child.count, parent, child.op)))
       return failure();
   }
   emitCppCheckStorage(ctx, definition, out);

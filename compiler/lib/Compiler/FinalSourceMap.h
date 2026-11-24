@@ -9,10 +9,25 @@
 
 namespace acir::compiler {
 
+/// Context-free SourceOwner identity used by frozen render plans.  Unlike the
+/// planning-time DictionaryAttr, this value remains valid after the private
+/// final-ACIR snapshot and its MLIRContext are destroyed.
+struct FinalSourceOwner {
+  std::string package;
+  std::string path;
+
+  bool operator==(const FinalSourceOwner &) const = default;
+  bool empty() const { return path.empty(); }
+};
+
+mlir::FailureOr<FinalSourceOwner>
+freezeFinalSourceOwner(mlir::DictionaryAttr owner,
+                       ac::detail::EmitError emitError);
+
 // Native files emitted for one final SourceOwner. Empty generatedFiles is
 // valid for a final declaration unit with no RTL source file.
 struct FinalSourceMembership {
-  mlir::DictionaryAttr sourceOwner;
+  FinalSourceOwner sourceOwner;
   llvm::SmallVector<std::string> generatedFiles;
 };
 
@@ -31,7 +46,7 @@ struct FinalSourceMapPlan {
 };
 
 struct FinalSourceMap {
-  mlir::DictionaryAttr sourceOwner;
+  FinalSourceOwner sourceOwner;
   std::string path;
   std::string text;
   llvm::SmallVector<std::string> generatedFiles;

@@ -873,11 +873,19 @@ FailureOr<ResolvedSourceMethod> resolve(Operation *caller, SymbolRefAttr symbol,
         auto formalType = hardware.resolveType(f, *bound, site);
         if (failed(actualType) || failed(formalType))
           return failure();
-        if (!areEquivalentHardwareTypes(*actualType, *formalType))
-          return site->emitOpError()
-                 << "Method receiver instance payload type mismatch: actual "
-                 << *actualType << " does not match bound formal "
-                 << *formalType;
+        if (!areEquivalentHardwareTypes(*actualType, *formalType)) {
+          bool actualConcrete = true, formalConcrete = true;
+          if (failed(detail::verifySourceTemplateType(
+                  hardware, *actualType, bindings, site, &actualConcrete)) ||
+              failed(detail::verifySourceTemplateType(
+                  hardware, *formalType, *bound, site, &formalConcrete)))
+            return failure();
+          if (actualConcrete && formalConcrete)
+            return site->emitOpError()
+                   << "Method receiver instance payload type mismatch: actual "
+                   << *actualType << " does not match bound formal "
+                   << *formalType;
+        }
       }
       return success();
     };
@@ -943,8 +951,14 @@ FailureOr<ResolvedSourceMethod> resolve(Operation *caller, SymbolRefAttr symbol,
         : cast<TypeAttr>(ownerRow.getAs<ArrayAttr>("result_types")[0]).getValue();
     Attribute constraint = terminalInstance ? terminalInstance->getAttr("ac.payload_constraint")
                                            : ownerRow.get("payload_constraint");
+    Operation *constraintOwner = terminalInstance
+                                     ? terminalInstance->getParentOfType<ModuleOp>()
+                                           .getOperation()
+                                     : caller;
     if (!constraint || failed(detail::verifySourceCallHardwareConstraint(
-            constraint, payload, hardware, caller, site, "native Memory payload")))
+            constraint, payload, hardware, constraintOwner, site,
+            "native Memory payload",
+            detail::SourceCallWidthMode::SymbolicFixedBits)))
       return site->emitOpError() << "native Memory requires its checked logical payload constraint";
     method.module = owner;
     method.nativeMemoryAction = action;

@@ -161,6 +161,26 @@ public:
     if (failed(rootIndex))
       return failure();
     plan.rootModule = *rootIndex;
+    const HardwareEmissionModulePlan &rootPlan = plan.modules[*rootIndex];
+    plan.rootInterface.publicInputCount = rootPlan.publicInputCount;
+    plan.rootInterface.publicOutputCount = rootPlan.publicOutputCount;
+    plan.rootInterface.defaultInputs = rootPlan.rootInputDefaults;
+    plan.rootInterface.clockInput = rootPlan.clockInput;
+    plan.rootInterface.resetInput = rootPlan.resetInput;
+    plan.rootInterface.closedSystem = rootPlan.closedSystem;
+    for (const HardwareEmissionPortPlan &port : rootPlan.inputs)
+      plan.rootInterface.inputNames.push_back(port.name);
+    for (const HardwareEmissionPortPlan &port : rootPlan.outputs)
+      plan.rootInterface.outputNames.push_back(port.name);
+    for (unsigned index = 0; index < rootPlan.publicOutputCount; ++index)
+      if (rootPlan.outputs[index].availabilityOutput)
+        plan.rootInterface.availabilityOutputs.push_back(
+            *rootPlan.outputs[index].availabilityOutput);
+    llvm::sort(plan.rootInterface.availabilityOutputs);
+    plan.rootInterface.availabilityOutputs.erase(
+        std::unique(plan.rootInterface.availabilityOutputs.begin(),
+                    plan.rootInterface.availabilityOutputs.end()),
+        plan.rootInterface.availabilityOutputs.end());
     rootReachableModuleCount = plan.modules.size();
 
     // Every non-generic definition emits a concrete scalar wrapper even when
@@ -744,8 +764,9 @@ private:
       child.concreteBindings = std::move(*frozenChildBindings);
       if (auto queue = dyn_cast<ac::InstanceOp>(operation);
           queue && ac::isQueueInstance(queue)) {
+        auto rawConfig = ac::getQueueConfiguration(queue);
         auto config = analysis.resolveQueue(queue, bindings);
-        if (failed(config))
+        if (failed(rawConfig) || failed(config))
           return failure();
         if (!config->tokenCardinality ||
             config->packedWidth % config->tokenCardinality)
@@ -754,7 +775,12 @@ private:
         child.queue = HardwareEmissionQueuePlan{
             config->depth, config->tokenCardinality,
             config->packedWidth / config->tokenCardinality,
-            config->availabilityLatency};
+            config->availabilityLatency,
+            config->readyPolicy == ac::QueueReadyPolicy::LocalOccupancy
+                ? HardwareEmissionQueueReadyPolicy::LocalOccupancy
+                : HardwareEmissionQueueReadyPolicy::DownstreamPop,
+            rawConfig->getAs<ac::StaticExprAttr>("depth"),
+            rawConfig->getAs<ac::StaticExprAttr>("availability_latency")};
       }
       child.primitiveKind = analysis.getPrimitiveKind(callee).str();
       auto childDefinition = dyn_cast<ac::ModuleOp>(callee);
@@ -953,6 +979,24 @@ private:
       for (unsigned definitionIndex : sourceUnit.definitionIndices)
         if (failed(schedule(definitionIndex)))
           return failure();
+      llvm::StringSet<> includes;
+      for (unsigned definitionIndex : sourceUnit.definitionIndices) {
+        const auto &definition = plan.definitions[definitionIndex];
+        for (const HardwareEmissionOccurrenceBinding &child :
+             definition.templateChildren) {
+          auto found = definitionIndices.find(
+              plan.definitionAnchors[child.bindings.owner]);
+          if (found == definitionIndices.end())
+            continue;
+          const std::string &header =
+              plan.definitions[found->second].names.header;
+          if (header != sourceUnit.cppHeaderPath)
+            includes.insert(header);
+        }
+      }
+      for (const auto &include : includes)
+        sourceUnit.cppIncludes.push_back(include.getKey().str());
+      llvm::sort(sourceUnit.cppIncludes);
       plan.sourceUnits.push_back(std::move(sourceUnit));
     }
     for (auto [index, module] : llvm::enumerate(plan.modules)) {
@@ -1020,6 +1064,13 @@ private:
         return failure();
       item.templateSchedule.assign(templateSchedule->schedule.begin(),
                                    templateSchedule->schedule.end());
+      auto yield =
+          dyn_cast<ac::YieldOp>(definition.getBody().front().getTerminator());
+      if (!yield)
+        return definition.emitOpError()
+               << "hardware emission definition requires a complete yield";
+      item.outputValues.assign(yield.getValues().begin(),
+                               yield.getValues().end());
       for (Operation &operation : definition.getBody().front()) {
         FailureOr<ac::HardwareBindings> child = failure();
         if (auto instance = dyn_cast<ac::InstanceOp>(operation))
@@ -1037,7 +1088,28 @@ private:
             plan.occurrenceAnchors.size();
         plan.occurrenceAnchors.push_back(&operation);
         HardwareEmissionOccurrenceBinding occurrence{
-            occurrenceId, &operation, std::move(*frozenChild), {}};
+            occurrenceId,
+            &operation,
+            operation.getAttrOfType<StringAttr>("instance_name").getValue().str(),
+            isa<ac::CollectionOp>(operation),
+            std::move(*frozenChild),
+            {},
+            std::nullopt};
+        if (auto queue = dyn_cast<ac::InstanceOp>(operation);
+            queue && ac::isQueueInstance(queue)) {
+          auto config = ac::getQueueConfiguration(queue);
+          if (failed(config))
+            return failure();
+          StringRef policy =
+              config->getAs<StringAttr>("ready_policy").getValue();
+          occurrence.queue = HardwareEmissionQueuePlan{
+              0, 0, 0, 0,
+              policy == "local_occupancy"
+                  ? HardwareEmissionQueueReadyPolicy::LocalOccupancy
+                  : HardwareEmissionQueueReadyPolicy::DownstreamPop,
+              config->getAs<ac::StaticExprAttr>("depth"),
+              config->getAs<ac::StaticExprAttr>("availability_latency")};
+        }
         if (auto collection = dyn_cast<ac::CollectionOp>(operation);
             collection && definition.getParameters().empty() &&
             definition.getTypeParameters().empty()) {
@@ -1216,11 +1288,14 @@ private:
 
 namespace {
 LogicalResult freezeObservationPlan(
-    const HardwareEmissionPlan &plan,
+    HardwareEmissionPlan &plan,
     const ac::HardwareSourceCheckPlan &sourceChecks,
     std::shared_ptr<const ObservationEmissionPlan> &observationPlan) {
   HardwareEmitContext context(plan, sourceChecks, observationPlan, nullptr);
-  return context.prepareNativeChecks();
+  if (failed(context.prepareNativeChecks()))
+    return failure();
+  plan.targetCapabilitiesValidated = true;
+  return success();
 }
 } // namespace
 
@@ -1290,6 +1365,8 @@ prepareHardwareEmissionPlan(ModuleOp package) {
   if (failed(freezeObservationPlan(*plan, backendState->sourceChecks,
                                    backendState->observationPlan)))
     return failure();
+  if (failed(verifyHardwareEmissionPlan(*plan)))
+    return failure();
   return VerifiedHardwareEmissionPlan(std::move(context), std::move(snapshot),
                                       std::move(*plan),
                                       std::move(backendState));
@@ -1301,6 +1378,34 @@ LogicalResult verifyHardwareEmissionPlan(const HardwareEmissionPlan &plan) {
     return failure();
   auto error = [&]() -> InFlightDiagnostic {
     return plan.package->emitOpError();
+  };
+  const HardwareEmissionModulePlan &root = plan.modules[plan.rootModule];
+  if (plan.rootInterface.inputNames.size() != root.inputs.size() ||
+      plan.rootInterface.outputNames.size() != root.outputs.size() ||
+      plan.rootInterface.publicInputCount != root.publicInputCount ||
+      plan.rootInterface.publicOutputCount != root.publicOutputCount ||
+      plan.rootInterface.defaultInputs != root.rootInputDefaults ||
+      plan.rootInterface.clockInput != root.clockInput ||
+      plan.rootInterface.resetInput != root.resetInput ||
+      plan.rootInterface.closedSystem != root.closedSystem ||
+      !llvm::is_sorted(plan.rootInterface.availabilityOutputs) ||
+      llvm::adjacent_find(plan.rootInterface.availabilityOutputs) !=
+          plan.rootInterface.availabilityOutputs.end())
+    return error() << "hardware emission root interface is inconsistent";
+  for (auto [index, port] : llvm::enumerate(root.inputs))
+    if (plan.rootInterface.inputNames[index] != port.name)
+      return error() << "hardware emission root input inventory is invalid";
+  for (auto [index, port] : llvm::enumerate(root.outputs))
+    if (plan.rootInterface.outputNames[index] != port.name)
+      return error() << "hardware emission root output inventory is invalid";
+  auto validQueue = [](const HardwareEmissionQueuePlan &queue,
+                       bool concrete) {
+    if (!queue.depthExpression || !queue.availabilityLatencyExpression)
+      return false;
+    if (!concrete)
+      return true;
+    return queue.depth != 0 && queue.tokenCardinality != 0 &&
+           queue.tokenElementWidth != 0;
   };
   llvm::DenseSet<Operation *> definitionAnchorSet;
   for (Operation *anchor : plan.definitionAnchors)
@@ -1346,8 +1451,9 @@ LogicalResult verifyHardwareEmissionPlan(const HardwareEmissionPlan &plan) {
          definition.templateChildren)
       if (child.id >= plan.occurrenceAnchors.size() ||
           plan.occurrenceAnchors[child.id] != child.diagnosticAnchor ||
-          !child.diagnosticAnchor ||
+          !child.diagnosticAnchor || child.instanceName.empty() ||
           child.bindings.owner >= plan.definitionAnchors.size() ||
+          (child.queue && !validQueue(*child.queue, false)) ||
           !occurrenceIds.insert(child.id).second)
         return error()
                << "hardware emission plan has an invalid template occurrence";
@@ -1356,6 +1462,14 @@ LogicalResult verifyHardwareEmissionPlan(const HardwareEmissionPlan &plan) {
                             definition.diagnosticAnchor)
         return error()
                << "hardware emission plan has an invalid template schedule";
+    auto module = cast<ac::ModuleOp>(definition.diagnosticAnchor);
+    if (definition.outputValues.size() !=
+            module.getFunctionType().getNumResults() ||
+        llvm::any_of(definition.outputValues, [&](Value value) {
+          return !value || value.getParentRegion() != &module.getBody();
+        }))
+      return error()
+             << "hardware emission plan has an invalid definition output";
     if (!recordQueries(definition.staticValues, definition.types))
       return error() << "hardware emission definition query identity is invalid";
     for (Operation *child : definition.independentWorkChildren)
@@ -1470,7 +1584,8 @@ LogicalResult verifyHardwareEmissionPlan(const HardwareEmissionPlan &plan) {
             !child.primitiveKind.empty() ||
             !(child.bindings == plan.modules[*child.moduleIndex].key))
           return error() << "hardware emission module child is unresolved";
-      } else if (child.primitiveKind.empty() || child.moduleIndex) {
+      } else if (child.primitiveKind.empty() || child.moduleIndex ||
+                 (child.queue && !validQueue(*child.queue, true))) {
         return error() << "hardware emission primitive child is unresolved";
       }
     }
@@ -1507,6 +1622,29 @@ LogicalResult verifyHardwareEmissionPlan(const HardwareEmissionPlan &plan) {
           return !scheduled.contains(definition);
         }))
       return error() << "hardware emission definition order is incomplete";
+    if (!llvm::is_sorted(unit.cppIncludes) ||
+        llvm::adjacent_find(unit.cppIncludes) != unit.cppIncludes.end() ||
+        llvm::is_contained(unit.cppIncludes, unit.cppHeaderPath))
+      return error()
+             << "hardware emission C++ include inventory is inconsistent";
+    llvm::StringSet<> expectedIncludes;
+    for (unsigned definition : unit.definitionIndices)
+      for (const HardwareEmissionOccurrenceBinding &child :
+           plan.definitions[definition].templateChildren) {
+        Operation *anchor = plan.definitionAnchors[child.bindings.owner];
+        auto found = llvm::find_if(plan.definitions, [&](const auto &candidate) {
+          return candidate.diagnosticAnchor == anchor;
+        });
+        if (found != plan.definitions.end() &&
+            found->names.header != unit.cppHeaderPath)
+          expectedIncludes.insert(found->names.header);
+      }
+    if (expectedIncludes.size() != unit.cppIncludes.size() ||
+        llvm::any_of(unit.cppIncludes, [&](StringRef include) {
+          return !expectedIncludes.contains(include);
+        }))
+      return error()
+             << "hardware emission C++ include inventory is incomplete";
     for (unsigned module : unit.moduleIndices)
       if (module >= plan.modules.size() ||
           !ownedModules.insert(module).second ||

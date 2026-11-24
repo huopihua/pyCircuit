@@ -58,6 +58,23 @@ jobs:
             --build-dir "$PWD/.pycircuit_out/toolchain/build" \
             --install-prefix "$PWD/.pycircuit_out/toolchain/install"
 
+      - name: Measure emitter peak RSS
+        id: emitter_rss
+        run: |
+          python tools/check_emitter_rss.py \
+            --tier nightly \
+            --prefix "$PWD/.pycircuit_out/toolchain/install" \
+            --output-dir "$PWD/.pycircuit_out/emitter-rss"
+
+      - name: Upload emitter RSS report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: emitter-rss-${{ env.PYC_GATE_RUN_ID }}
+          path: .pycircuit_out/emitter-rss/
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Run API tests (nightly)
         id: api_nightly
         shell: bash
@@ -91,8 +108,10 @@ jobs:
           }
           api_status="$(map_outcome "${{ steps.api_nightly.outcome }}")"
           examples_status="$(map_outcome "${{ steps.examples_nightly.outcome }}")"
+          emitter_rss_status="$(map_outcome "${{ steps.emitter_rss.outcome }}")"
           python3 tools/summarize_gate_run.py \
             --run-id "${PYC_GATE_RUN_ID}" \
+            --row "emitter-rss:nightly:${emitter_rss_status}" \
             --row "api-nightly:nightly:${api_status}" \
             --row "examples-nightly:nightly:${examples_status}" \
             --append-to "${GITHUB_STEP_SUMMARY}"

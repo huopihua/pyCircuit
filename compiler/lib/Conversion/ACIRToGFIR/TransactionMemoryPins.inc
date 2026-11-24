@@ -136,9 +136,30 @@ private:
       if (!charge(budget, proposal.source, 32)) return failure();
       Value payload = proposal.data;
       if (!payload) payload = bitsLiteral(*type, memory.getOccurrence(), location, true, builder);
+      Operation *payloadAdapter = nullptr;
+      if (!ac::areEquivalentHardwareTypes(payload.getType(), *type)) {
+        auto physicalPayload =
+            hardware.resolveType(payload.getType(), bindings, module);
+        if (failed(physicalPayload) ||
+            !ac::areEquivalentHardwareTypes(*physicalPayload, *type) ||
+            !isa<ac::BitsType>(*type))
+          return memory.emitOpError()
+                 << "Memory route payload does not resolve to its physical pin type";
+        OperationState resize(location, ac::BitsResizeOp::getOperationName());
+        resize.addOperands(payload);
+        resize.addTypes(*type);
+        // Equal-width identity conversion is admitted by the bound verifier;
+        // a genuinely wider symbolic payload cannot reach this branch.
+        resize.addAttribute("mode", builder.getStringAttr("zext"));
+        payloadAdapter = builder.create(resize);
+        payload = payloadAdapter->getResult(0);
+      }
       auto selected = materializeSelection(memory, bindings, proposal.path,
                                             payload, data, *type, builder, budget);
-      if (failed(selected) || !prepayAppend(budget, memory, record.selections)) return failure();
+      if (failed(selected) || !prepayAppend(budget, memory, record.selections))
+        return failure();
+      if (payloadAdapter)
+        selected->generated.insert(selected->generated.begin(), payloadAdapter);
       data = selected->value;
       record.selections.push_back(std::move(*selected));
       OperationState join(location, ac::BitsBinaryOp::getOperationName());

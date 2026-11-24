@@ -11,10 +11,13 @@
 namespace acir::compiler {
 
 /// Target-neutral publication metadata copied from the verified hardware plan.
-/// Target renderers consume this value together with already rendered native
-/// source parts; neither layer can reopen the source IR or HardwareAnalysis.
+/// Pure renderers consume this value together with complete native source
+/// payloads; neither can reopen the source IR or HardwareAnalysis.
 struct HardwareRenderMetadata {
-  HardwareEmissionEntryPlan entry;
+  std::string implementationDefinition;
+  std::string logicalDefinition;
+  FinalSourceOwner entrySource;
+  llvm::SmallVector<HardwareEmissionEntryArgument, 2> logicalArguments;
   ac::HardwareResetSemantics resetSemantics =
       ac::HardwareResetSemantics::Strict;
   std::optional<HardwareEmissionExecutionPlan> execution;
@@ -23,11 +26,17 @@ struct HardwareRenderMetadata {
   llvm::SmallVector<FinalSourceMap, 0> sourceMaps;
 };
 
+/// Complete C++ publication payload. Target lowering and source-text generation
+/// have already finished when this value is frozen; rendering only serializes
+/// these owned values to the requested output format.
 struct CppRenderPlan {
   HardwareRenderMetadata metadata;
   FinalCppSourceParts parts;
 };
 
+/// Complete Verilog publication payload. Target lowering and source-text
+/// generation have already finished when this value is frozen; rendering only
+/// serializes these owned values to the requested output format.
 struct VerilogRenderPlan {
   HardwareRenderMetadata metadata;
   FinalVerilogSourceParts parts;
@@ -81,9 +90,11 @@ private:
                                    ac::detail::EmitError emitError);
 };
 
-/// Target planning consumes only the verified plan API. A private, uninstalled
-/// migration bridge still owns the remaining operation-level source generation;
-/// everything after this boundary is pure rendering from frozen values.
+/// Target lowering consumes the verified hardware plan and constructs the
+/// complete publication payload: target policy, generated source text, paths,
+/// provenance membership, and metadata. A private, uninstalled migration bridge
+/// still owns operation-level source generation. Verification freezes the
+/// result; everything after this boundary is analysis-free serialization.
 mlir::FailureOr<VerifiedCppRenderPlan>
 prepareCppRenderPlan(const VerifiedHardwareEmissionPlan &hardware);
 
@@ -103,8 +114,9 @@ mlir::FailureOr<VerifiedVerilogRenderPlan>
 verifyAndFreezeVerilogRenderPlan(VerilogRenderPlan plan,
                                  ac::detail::EmitError emitError);
 
-/// Pure renderers. Their signatures intentionally expose neither ModuleOp nor
-/// HardwareAnalysis, so rendering cannot silently recover semantic decisions.
+/// Pure serializers. Their signatures intentionally expose neither ModuleOp nor
+/// HardwareAnalysis, so final rendering cannot recover semantic decisions or
+/// generate target source from IR.
 void renderCppSource(const VerifiedCppRenderPlan &plan, llvm::raw_ostream &out);
 void renderVerilogSource(const VerifiedVerilogRenderPlan &plan,
                          llvm::raw_ostream &out);

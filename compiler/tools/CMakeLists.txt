@@ -32,7 +32,6 @@ target_link_libraries(pycircuit-emit PRIVATE
   ACIRDialect
   ACIRAnalysis
   HWIRValidation
-  GFIRDialect
   ACIRCodegen
   MLIRArithDialect
   MLIRFuncDialect

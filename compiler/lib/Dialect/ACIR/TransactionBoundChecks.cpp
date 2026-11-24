@@ -749,9 +749,19 @@ LogicalResult HardwareAnalysis::verifyTransactionSurfaceOperation(
       auto supplied = resolveType(actual, scope, call);
       if (failed(expected) || failed(supplied))
         return failure();
-      if (!areEquivalentHardwareTypes(*expected, *supplied))
-        return call.emitOpError() << "method call payload type must match bound "
-                                    "receiver signature";
+      if (!areEquivalentHardwareTypes(*expected, *supplied)) {
+        bool expectedConcrete = true, suppliedConcrete = true;
+        if (failed(detail::verifySourceTemplateType(
+                *this, *expected, calleeBindings, call,
+                &expectedConcrete)) ||
+            failed(detail::verifySourceTemplateType(
+                *this, *supplied, scope, call, &suppliedConcrete)))
+          return failure();
+        if (requireResolved || (expectedConcrete && suppliedConcrete))
+          return call.emitOpError()
+                 << "method call payload type must match bound receiver "
+                    "signature";
+      }
       return success();
     };
     for (auto [actual, formal] :

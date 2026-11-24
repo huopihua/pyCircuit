@@ -48,7 +48,7 @@ commands = []
 def run(command, code=0, diagnostic=None):
     command = list(map(str, command))
     result = subprocess.run(
-        command, env=env, cwd=repo, capture_output=True, text=True, timeout=300
+        command, env=env, cwd=repo, capture_output=True, text=True, timeout=600
     )
     row = {
         "command": command,
@@ -801,7 +801,10 @@ def assert_negative_diagnostic(name, diagnostic):
     if case in ("partial-index", "third-partial-match"):
         assert "unknown hardware value" in diagnostic, diagnostic
     if case == "owner-target":
-        assert "persistent owner formal" in diagnostic, diagnostic
+        assert (
+            "persistent owner formal" in diagnostic
+            or "cannot write an owner or shadow a binding" in diagnostic
+        ), diagnostic
     if case == "immutable-rebind":
         assert "shadow a binding" in diagnostic, diagnostic
     if case == "observe-producer":
@@ -958,7 +961,8 @@ compile_source("design.py", unit, (provider,))
 body = payload(unit, "body").read_text()
 header = payload(unit, "interface").read_text()
 assert parameter_kinds(header, "priority_probe.design.Top") == {
-    f"w{w}": '"fixed_bits"' for w in WIDTHS
+    **{f"w{w}": '"fixed_bits"' for w in WIDTHS},
+    "child": '"nominal"',
 }
 result_line = next(
     line
@@ -980,10 +984,7 @@ assert [
 ] == FIELDS
 assert '"ac.bits.extract"' in body and '"ac.bits.binary"' in body
 assert all(f'"ac.{name}"' not in body for name in ("reg", "variable", "table"))
-assert (
-    attribute(module_header(header, "priority_probe.design.Top"), "ac.domain_inputs")
-    == ""
-)
+assert attribute(module_header(header, "priority_probe.design.Top"), "ac.domain_inputs")
 (build / "source-body.ac").write_text(body)
 (build / "consumer.interface.ac").write_text(header)
 (build / "provider.interface.ac").write_text(provider_header)

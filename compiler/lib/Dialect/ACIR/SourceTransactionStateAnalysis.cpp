@@ -173,7 +173,7 @@ public:
   }
 
 private:
-  static constexpr uint64_t maxWork = 1024 * 1024;
+  static constexpr uint64_t maxWork = 16 * 1024 * 1024;
   uint64_t work = 0;
   StringRef phase = "raw preflight";
   bool exhausted = false;

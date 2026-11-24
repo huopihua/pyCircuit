@@ -147,7 +147,8 @@ def Top():
 '''
     cases.append(("untrusted-intrinsic-spelling", IMPORT + PEER + shadow, ""))
     cases.append(("top-level-reference", IMPORT + PEER
-                  + 'ref = ac.instance_ref(Peer, "peer")\n' + TOP, "top level"))
+                  + 'ref = ac.instance_ref(Peer, "peer")\n' + TOP,
+                  "source constant requires an Integer or Boolean literal"))
     return cases
 
 

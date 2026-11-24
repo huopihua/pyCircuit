@@ -131,7 +131,7 @@ public:
   bool ok() const { return !exhausted; }
 
 private:
-  static constexpr uint64_t maxWork = 1024 * 1024;
+  static constexpr uint64_t maxWork = 4 * 1024 * 1024;
   static constexpr unsigned maxDepth = 128;
   Operation *site;
   uint64_t work = 0;
@@ -236,7 +236,13 @@ public:
         }
         owners.push_back(row);
       } else if (auto instance = dyn_cast<InstanceOp>(operation)) {
-        if (failed(hardware.verifyInstance(instance)))
+        // Interface publication describes the lexical source template.  A
+        // generic allocation can still contain symbolic widths here; strict
+        // instance agreement belongs to each concrete linked occurrence.
+        HardwareBindings lexical;
+        lexical.owner = definition;
+        if (failed(hardware.verifyModuleDeclaration(instance, lexical,
+                                                    /*requireResolved=*/false)))
           return failure();
         auto arguments = values(instance.getInputs(), nullptr);
         if (failed(arguments))
@@ -1165,7 +1171,9 @@ public:
           auto payload = cast<TypeAttr>(results[0]).getValue();
           if (failed(detail::verifySourceCallHardwareConstraint(
                   payloadConstraint, payload, hardware, declaration, declaration,
-                  "transaction summary Memory payload"))) return failure();
+                  "transaction summary Memory payload",
+                  detail::SourceCallWidthMode::SymbolicFixedBits)))
+            return failure();
           for (unsigned port = 0; port < ports; ++port) {
             if (!areEquivalentHardwareTypes(cast<TypeAttr>(results[port]).getValue(), payload))
               return error("source Memory payload result types disagree");

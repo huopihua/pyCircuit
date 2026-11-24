@@ -20,7 +20,7 @@ struct HardwareBindings {
 };
 
 struct HardwareSourceCheckLimits {
-  uint64_t maxWorkUnits = 4 * 1024 * 1024;
+  uint64_t maxWorkUnits = 32 * 1024 * 1024;
 };
 
 /// Validated reset policy on the single root selection; the analysis-class

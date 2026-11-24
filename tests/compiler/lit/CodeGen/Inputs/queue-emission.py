@@ -77,7 +77,7 @@ initial_hashes = {
 def run(command, code=0):
     command = list(map(str, command))
     r = subprocess.run(
-        command, cwd=repo, env=env, capture_output=True, text=True, timeout=240
+        command, cwd=repo, env=env, capture_output=True, text=True, timeout=600
     )
     commands.append(
         {

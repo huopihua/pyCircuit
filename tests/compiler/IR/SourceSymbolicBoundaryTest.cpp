@@ -3,6 +3,7 @@
 // design with an actual (default-supplied) binding is rejected with the
 // family's pinned diagnostic at the tier that owns resolution.
 #include "pycircuit/Dialect/ACIR/ACIRDialect.h"
+#include "pycircuit/Dialect/ACIR/HardwareAnalysis.h"
 #include "pycircuit/Dialect/ACIR/SourceUnitValidation.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Diagnostics.h"
@@ -178,11 +179,16 @@ TEST_F(SourceSymbolicBoundaryTest,
   auto unit = parse(generic() + top(/*illegalBinding=*/true));
   ASSERT_TRUE(unit) << diagnostics;
   ASSERT_TRUE(succeeded(mlir::verify(*unit))) << diagnostics;
-  auto error = [&] { return unit->emitError(); };
-  // The instance supplies the actual parameter binding and declares a wire
-  // type that disagrees with the bound callee signature, so the binding
-  // tier rejects it with the instance family's pinned diagnostic.
-  EXPECT_TRUE(failed(ac::verifySourceBodyStructure(*unit, error)));
+  auto top = dyn_cast_or_null<ac::ModuleOp>(
+      SymbolTable::lookupSymbolIn(*unit, "unit.Top"));
+  ASSERT_TRUE(top);
+  auto instance = *top.getBody().front().getOps<ac::InstanceOp>().begin();
+  ac::HardwareBindings parent;
+  parent.owner = top;
+  ac::HardwareAnalysis analysis(*unit);
+  // Source structure intentionally defers actual parameter resolution. The
+  // hardware binding tier owns the concrete signature comparison.
+  EXPECT_TRUE(failed(analysis.verifyInstance(instance, parent)));
   EXPECT_NE(diagnostics.find("instance wire type does not match bound "
                              "callee signature"),
             std::string::npos)

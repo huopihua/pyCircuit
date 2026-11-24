@@ -117,49 +117,38 @@ struct SystemControls {
 };
 FailureOr<std::string> managedReset(HardwareEmitContext &context,
                                     ac::ModuleOp root) {
-  auto domain = root->getAttrOfType<DictionaryAttr>("ac.domain_inputs");
-  if (!domain || domain.empty())
+  const HardwareEmissionRootInterfacePlan &interface =
+      context.plan.rootInterface;
+  if (!interface.resetInput)
     return std::string("1'b0");
-  auto reset = domain.getAs<IntegerAttr>("reset");
-  auto layout = ac::getModulePortLayout(root);
-  if (failed(layout))
-    return failure();
-  auto names =
-      root.getInputNames().getValue().take_front(layout->sourceInputCount);
-  if (!reset || reset.getValue().getActiveBits() > 64 ||
-      reset.getValue().getZExtValue() >= names.size())
+  if (*interface.resetInput >= interface.publicInputCount)
     return root.emitOpError()
            << "managed module requires verified reset context";
   auto name = legalizeIdentifier(
-      cast<StringAttr>(names[reset.getValue().getZExtValue()]).getValue(),
+      interface.inputNames[*interface.resetInput],
       [&] { return root.emitOpError(); });
   if (failed(name))
     return failure();
   return context.rtlReset(*name);
 }
-FailureOr<SystemControls> systemControls(ac::ModuleOp root) {
-  auto domain = root->getAttrOfType<DictionaryAttr>("ac.domain_inputs");
-  auto clock = domain ? domain.getAs<IntegerAttr>("clock") : IntegerAttr();
-  auto reset = domain ? domain.getAs<IntegerAttr>("reset") : IntegerAttr();
-  auto layout = ac::getModulePortLayout(root);
-  if (failed(layout))
-    return failure();
-  auto inputs =
-      root.getInputNames().getValue().take_front(layout->sourceInputCount);
-  if (!domain || domain.size() != 2 || !clock || !reset ||
-      clock.getValue().getActiveBits() > 64 ||
-      reset.getValue().getActiveBits() > 64)
+FailureOr<SystemControls> systemControls(HardwareEmitContext &context,
+                                         ac::ModuleOp root) {
+  const HardwareEmissionRootInterfacePlan &interface =
+      context.plan.rootInterface;
+  if (!interface.closedSystem || !interface.clockInput ||
+      !interface.resetInput)
     return root.emitOpError()
            << "system root requires verified clock/reset domains";
-  uint64_t clockIndex = clock.getValue().getZExtValue();
-  uint64_t resetIndex = reset.getValue().getZExtValue();
-  if (clockIndex == resetIndex || inputs.size() != 2 ||
-      clockIndex >= inputs.size() || resetIndex >= inputs.size() ||
-      layout->sourceOutputCount != 0)
+  unsigned clockIndex = *interface.clockInput;
+  unsigned resetIndex = *interface.resetInput;
+  if (clockIndex == resetIndex || interface.publicInputCount != 2 ||
+      clockIndex >= interface.publicInputCount ||
+      resetIndex >= interface.publicInputCount ||
+      interface.publicOutputCount != 0)
     return root.emitOpError()
            << "system root must be closed except for clock/reset";
   auto legal = [&](uint64_t index) {
-    return legalizeIdentifier(cast<StringAttr>(inputs[index]).getValue(),
+    return legalizeIdentifier(interface.inputNames[index],
                               [&] { return root.emitOpError(); });
   };
   auto clockName = legal(clockIndex), resetName = legal(resetIndex);
@@ -175,17 +164,15 @@ FailureOr<ObservationAddress>
 observationHierarchy(const ObservationEmissionPlan &plan,
                      const ObservationEmissionOccurrence &occurrence) {
   std::string result = "dut.dut";
-  for (const auto &[id, operation, lane] : occurrence.path) {
-    (void)id;
-    auto raw = operation->getAttrOfType<StringAttr>("instance_name");
-    if (!raw)
-      return operation->emitOpError() << "instance has no name";
-    auto name = legalizeIdentifier(raw.getValue(),
-                                   [&] { return operation->emitOpError(); });
+  for (const ObservationEmissionPathEntry &path : occurrence.path) {
+    auto name = legalizeIdentifier(path.instanceName, [&] {
+      return path.diagnosticAnchor->emitOpError();
+    });
     if (failed(name))
       return failure();
-    if (isa<ac::CollectionOp>(operation))
-      result += ".pyc_instances_" + *name + "[" + std::to_string(lane) + "]";
+    if (path.collection)
+      result += ".pyc_instances_" + *name + "[" +
+                std::to_string(path.lane) + "]";
     result += ".pyc_instance_" + *name;
   }
   auto owner =
@@ -208,18 +195,16 @@ observationHierarchy(const ObservationEmissionPlan &plan,
 FailureOr<std::string> systemSimulationTop(HardwareEmitContext &context,
                                            ac::ModuleOp root,
                                            StringRef wrapper) {
-  auto controls = systemControls(root);
+  auto controls = systemControls(context, root);
   auto plan = observationEmissionPlan(context);
   if (failed(controls) || failed(plan))
     return failure();
-  auto samples = ac::getSystemSamples(root);
-  if (failed(samples))
-    return failure();
+  ArrayRef<std::string> samples = context.plan.systemSamples;
   std::string scheduleDeclaration, scheduleSteps, cycleGuard;
-  if (!samples->empty()) {
+  if (!samples.empty()) {
     std::string pattern;
-    for (Attribute row : *samples)
-      pattern += cast<StringAttr>(row).getValue().str();
+    for (StringRef row : samples)
+      pattern += row.str();
     scheduleDeclaration =
         "  localparam logic [" + std::to_string(pattern.size() - 1) +
         ":0] pyc_samples = " + std::to_string(pattern.size()) + "'b" + pattern +
@@ -228,10 +213,10 @@ FailureOr<std::string> systemSimulationTop(HardwareEmitContext &context,
         "    if ($test$plusargs(\"cycles\")) $fatal(1, \"pycircuit_sim: "
         "explicit cycles conflicts with samples\");\n";
     scheduleSteps =
-        "    for (pyc_cycle=0; pyc_cycle<" + std::to_string(samples->size()) +
+        "    for (pyc_cycle=0; pyc_cycle<" + std::to_string(samples.size()) +
         "; pyc_cycle=pyc_cycle+1) begin\n      pyc_step(pyc_samples[(" +
-        std::to_string(samples->size()) + "-1-pyc_cycle)*2+1], pyc_samples[(" +
-        std::to_string(samples->size()) + "-1-pyc_cycle)*2]);\n    end\n";
+        std::to_string(samples.size()) + "-1-pyc_cycle)*2+1], pyc_samples[(" +
+        std::to_string(samples.size()) + "-1-pyc_cycle)*2]);\n    end\n";
   } else {
     scheduleSteps =
         "    for (pyc_cycle=0; pyc_cycle<pyc_cycles; pyc_cycle=pyc_cycle+1) "
@@ -246,22 +231,15 @@ FailureOr<std::string> systemSimulationTop(HardwareEmitContext &context,
   for (const auto &occurrence : plan->occurrences) {
     if (!occurrence.site.gauge)
       continue;
-    auto observe = cast<ac::SourceObserveOp>(occurrence.site.diagnosticAnchor);
-    auto name = observe.getSpec().getAs<StringAttr>("name");
-    if (!name)
-      return observe.emitOpError() << "report observation has no name";
     std::string instance = "root";
-    for (const auto &[id, operation, lane] : occurrence.logicalOwnerPath) {
-      (void)id;
-      auto allocation = operation->getAttrOfType<StringAttr>("instance_name");
-      if (!allocation)
-        return operation->emitOpError() << "instance has no name";
-      instance += "/" + allocation.getValue().str();
-      if (isa<ac::CollectionOp>(operation))
-        instance += "[" + std::to_string(lane) + "]";
+    for (const ObservationEmissionPathEntry &path :
+         occurrence.logicalOwnerPath) {
+      instance += "/" + path.instanceName;
+      if (path.collection)
+        instance += "[" + std::to_string(path.lane) + "]";
     }
-    reports.push_back(
-        {occurrence.ordinal, std::move(instance), name.getValue().str()});
+    reports.push_back({occurrence.ordinal, std::move(instance),
+                       occurrence.site.reportName});
   }
   llvm::sort(reports, [](const ReportOutput &left, const ReportOutput &right) {
     return std::tie(left.instance, left.name) <
@@ -442,34 +420,26 @@ FailureOr<std::string> systemSimulationTop(HardwareEmitContext &context,
   out << "  task automatic pyc_publish_observations;\n    begin\n";
   for (const auto &group : groups) {
     const auto &occurrence = plan->occurrences[group.begin];
-    auto observe = cast<ac::SourceObserveOp>(occurrence.site.diagnosticAnchor);
-    auto identity = observe->getAttrOfType<DictionaryAttr>("ac.observation_id");
-    if (!identity)
-      return observe.emitOpError() << "observation identity is missing";
-    auto registration =
-        emissionMetadataJson(identity.get("registration"), observe);
-    auto site = observationSiteMetadataJson(observe);
-    auto spec = emissionMetadataJson(observe.getSpec(), observe);
-    if (failed(registration) || failed(site) || failed(spec))
-      return failure();
     std::string instance = "root";
-    for (const auto &[id, operation, lane] : occurrence.logicalOwnerPath) {
-      (void)id;
-      auto name = operation->getAttrOfType<StringAttr>("instance_name");
-      instance += "/" + name.getValue().str();
-      if (isa<ac::CollectionOp>(operation))
-        instance += "[" + std::to_string(lane) + "]";
+    for (const ObservationEmissionPathEntry &path :
+         occurrence.logicalOwnerPath) {
+      instance += "/" + path.instanceName;
+      if (path.collection)
+        instance += "[" + std::to_string(path.lane) + "]";
     }
     // Escape authored metadata before inserting format slots. No source text
     // is reserved as a placeholder: event names and literals may contain it.
     std::string record =
-        displayLiteral("{\"kind\":" + jsonString(observe.getKind()) +
+        displayLiteral("{\"kind\":" + jsonString(occurrence.site.kind) +
                        ",\"instance\":" + jsonString(instance) +
-                       ",\"registration\":" + jsonString(*registration) +
-                       ",\"site\":" + jsonString(*site) +
+                       ",\"registration\":" +
+                       jsonString(occurrence.site.registrationJson) +
+                       ",\"site\":" +
+                       jsonString(occurrence.site.siteJson) +
                        ",\"evaluation_epoch\":\"") +
         "%0d" + displayLiteral("\",\"commit_epoch\":\"") + "%0d" +
-        displayLiteral("\",\"spec\":" + *spec + ",\"values\":[");
+        displayLiteral("\",\"spec\":" + occurrence.site.specJson +
+                       ",\"values\":[");
     std::string arguments;
     for (size_t index = 0; index < group.size; ++index) {
       if (!occurrence.site.carriesValue)
@@ -591,15 +561,16 @@ FailureOr<std::string> systemSimulationTop(HardwareEmitContext &context,
 }
 LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
                           StringRef wrapper, StringRef callee,
+                          StringRef physicalFaultReporter,
                           raw_ostream &out) {
   out << "module " << wrapper << " (";
   auto bindings = context.rootBindings();
   if (failed(bindings))
     return failure();
-  auto signature = root.getFunctionType();
-  auto layout = ac::getModulePortLayout(root);
-  if (failed(layout))
-    return failure();
+  const HardwareEmissionModulePlan &rootPlan =
+      context.plan.modules[context.plan.rootModule];
+  const HardwareEmissionRootInterfacePlan &interface =
+      context.plan.rootInterface;
   bool first = true;
   auto port = [&](StringRef direction, Type type,
                   StringRef name) -> LogicalResult {
@@ -615,21 +586,17 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
     first = false;
     return success();
   };
-  for (auto [i, type] : llvm::enumerate(
-           signature.getInputs().take_front(layout->sourceInputCount)))
-    if (failed(port("input", type,
-                    cast<StringAttr>(root.getInputNames()[i]).getValue())))
+  for (unsigned i = 0; i < interface.publicInputCount; ++i)
+    if (failed(port("input", rootPlan.inputs[i].type.resolvedType,
+                    interface.inputNames[i])))
       return failure();
-  for (auto [i, type] : llvm::enumerate(
-           signature.getResults().take_front(layout->sourceOutputCount)))
-    if (failed(port("output", type,
-                    cast<StringAttr>(root.getOutputNames()[i]).getValue())))
+  for (unsigned i = 0; i < interface.publicOutputCount; ++i)
+    if (failed(port("output", rootPlan.outputs[i].type.resolvedType,
+                    interface.outputNames[i])))
       return failure();
-  for (int64_t companion : layout->outputValidity)
-    if (companion >= 0 &&
-        failed(port(
-            "output", signature.getResult(companion),
-            cast<StringAttr>(root.getOutputNames()[companion]).getValue())))
+  for (unsigned companion : interface.availabilityOutputs)
+    if (failed(port("output", rootPlan.outputs[companion].type.resolvedType,
+                    interface.outputNames[companion])))
       return failure();
   if (context.managesChecks()) {
     out << (first ? "\n" : ",\n")
@@ -649,12 +616,10 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
   if (context.isPhysical()) {
     const auto &projection = context.physicalProjection();
     auto clock = legalizeIdentifier(
-        cast<StringAttr>(root.getInputNames()[projection.clockInput])
-            .getValue(),
+        interface.inputNames[projection.clockInput],
         [&] { return root.emitOpError(); });
     auto reset = legalizeIdentifier(
-        cast<StringAttr>(root.getInputNames()[projection.resetInput])
-            .getValue(),
+        interface.inputNames[projection.resetInput],
         [&] { return root.emitOpError(); });
     if (failed(clock) || failed(reset))
       return failure();
@@ -685,8 +650,7 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
            "`else\n"
            "  assign pyc_root_commit_ok = 1'b1;\n"
            "`endif\n";
-    if (failed(emitPhysicalFaultReporter(context, *clock, *reset, out)))
-      return failure();
+    out << physicalFaultReporter;
   }
   out << "  " << callee << *parameters << " dut (";
   first = true;
@@ -698,31 +662,28 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
     first = false;
     return success();
   };
-  for (auto [index, raw] : llvm::enumerate(root.getInputNames())) {
-    StringRef name = cast<StringAttr>(raw).getValue();
+  for (auto [index, name] : llvm::enumerate(interface.inputNames)) {
     std::string expression;
-    if (index < layout->sourceInputCount) {
+    if (index < interface.publicInputCount) {
       auto id = legalizeIdentifier(name, [&] { return root.emitOpError(); });
       if (failed(id))
         return failure();
       expression = std::move(*id);
     } else {
-      const auto &rootPlan = context.plan.modules[context.plan.rootModule];
       uint64_t width = rootPlan.inputs[index].type.packedWidth;
-      auto initial = cast<IntegerAttr>(
-          layout->rootInputDefaults[index - layout->sourceInputCount]);
       expression =
-          std::to_string(width) + "'d" + std::to_string(initial.getInt());
+          std::to_string(width) + "'d" +
+          std::to_string(interface.defaultInputs[index -
+                                                 interface.publicInputCount]);
     }
     if (failed(connection(name, expression)))
       return failure();
   }
-  for (auto [index, raw] : llvm::enumerate(root.getOutputNames())) {
-    StringRef name = cast<StringAttr>(raw).getValue();
+  for (auto [index, name] : llvm::enumerate(interface.outputNames)) {
     std::string expression;
-    if (index < layout->sourceOutputCount ||
-        llvm::is_contained(layout->outputValidity,
-                           static_cast<int64_t>(index))) {
+    if (index < interface.publicOutputCount ||
+        llvm::is_contained(interface.availabilityOutputs,
+                           static_cast<unsigned>(index))) {
       auto id = legalizeIdentifier(name, [&] { return root.emitOpError(); });
       if (failed(id))
         return failure();
@@ -762,8 +723,8 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
 }
 } // namespace
 FailureOr<FinalVerilogSourceParts>
-prepareVerilogSourceParts(const VerifiedHardwareEmissionPlan &hardware,
-                          bool physical) {
+lowerVerilogSourceParts(const VerifiedHardwareEmissionPlan &hardware,
+                        bool physical) {
   const ac::HardwarePhysicalProjection *projection = nullptr;
   if (physical) {
     projection = BackendPlanningAccess::physicalProjection(hardware);
@@ -776,7 +737,7 @@ prepareVerilogSourceParts(const VerifiedHardwareEmissionPlan &hardware,
   HardwareEmitContext context(
       hardware.get(), BackendPlanningAccess::sourceChecks(hardware),
       BackendPlanningAccess::observationPlan(hardware), projection, physical);
-  const bool system = context.isSystem();
+  const bool system = context.plan.rootInterface.closedSystem;
   if (failed(context.prepareNativeChecks()))
     return failure();
   auto root = rootModule(context);
@@ -809,14 +770,18 @@ prepareVerilogSourceParts(const VerifiedHardwareEmissionPlan &hardware,
   context.rtlPackage = &dependencies;
   for (const HardwareEmissionSourceUnitPlan &unit : context.plan.sourceUnits) {
     FinalVerilogSourceGroup group;
-    group.sourceOwner = unit.sourceOwner;
+    auto sourceOwner = freezeFinalSourceOwner(unit.sourceOwner, [&]() {
+      return context.plan.package->emitOpError();
+    });
+    if (failed(sourceOwner))
+      return failure();
+    group.sourceOwner = std::move(*sourceOwner);
     group.path = unit.verilogPath;
     llvm::raw_string_ostream out(group.text);
     for (unsigned definitionIndex : unit.emissionOrder) {
       auto module = cast<ac::ModuleOp>(
           context.plan.definitions[definitionIndex].diagnosticAnchor);
-      group.definitions.push_back(
-          FlatSymbolRefAttr::get(module.getContext(), module.getSymName()));
+      group.definitions.push_back(module.getSymName().str());
       if (failed(emitHardwareVerilogDefinition(context, module, out)))
         return failure();
     }
@@ -827,10 +792,26 @@ prepareVerilogSourceParts(const VerifiedHardwareEmissionPlan &hardware,
       continue;
     parts.sourceGroups.push_back(std::move(group));
   }
+  std::string physicalFaultReporter;
+  if (context.isPhysical()) {
+    const auto &interface = context.plan.rootInterface;
+    const auto &projection = context.physicalProjection();
+    auto clock = legalizeIdentifier(interface.inputNames[projection.clockInput],
+                                    [&] { return root->emitOpError(); });
+    auto reset = legalizeIdentifier(interface.inputNames[projection.resetInput],
+                                    [&] { return root->emitOpError(); });
+    if (failed(clock) || failed(reset))
+      return failure();
+    llvm::raw_string_ostream reporter(physicalFaultReporter);
+    if (failed(emitPhysicalFaultReporter(context, *clock, *reset, reporter)))
+      return failure();
+    reporter.flush();
+  }
   {
     llvm::raw_string_ostream out(parts.core);
     if (failed(emitWrapper(context, *root, parts.rootRtlName,
-                           context.names(*root).rtl, out)))
+                           context.names(*root).rtl, physicalFaultReporter,
+                           out)))
       return failure();
     out.flush();
   }
@@ -840,11 +821,11 @@ prepareVerilogSourceParts(const VerifiedHardwareEmissionPlan &hardware,
       return failure();
     parts.simulationTop = std::move(*simulation);
   }
-  std::string typePackage;
-  llvm::raw_string_ostream out(typePackage);
+  llvm::raw_string_ostream out(parts.typePackage);
   if (failed(emitTypePackage(context, dependencies, out)))
     return failure();
-  parts.core.insert(0, typePackage);
+  out.flush();
+  parts.core.insert(0, parts.typePackage);
   return parts;
 }
 } // namespace acir::compiler

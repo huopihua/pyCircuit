@@ -607,11 +607,19 @@ private:
             if (failed(ft))
               return failure();
           }
-          if (!areEquivalentHardwareTypes(*at, *ft))
-            return site->emitOpError()
-                   << "instance payload type mismatch for " << direction << " "
-                   << ordinal << " of " << callee << ": actual " << *at
-                   << ", expected " << *ft;
+          if (!areEquivalentHardwareTypes(*at, *ft)) {
+            bool actualConcrete = true, formalConcrete = true;
+            if (failed(detail::verifySourceTemplateType(
+                    hardware, *at, parent, site, &actualConcrete)) ||
+                failed(detail::verifySourceTemplateType(
+                    hardware, *ft, *bound, site, &formalConcrete)))
+              return failure();
+            if (verifyBodies || (actualConcrete && formalConcrete))
+              return site->emitOpError()
+                     << "instance payload type mismatch for " << direction
+                     << " " << ordinal << " of " << callee << ": actual "
+                     << *at << ", expected " << *ft;
+          }
         }
         return success();
       };
@@ -909,7 +917,7 @@ private:
     };
     return visit(visit, callable.row.getAs<ArrayAttr>("body_effects"), true, 0);
   }
-  static constexpr uint64_t maxWork = 1024 * 1024;
+  static constexpr uint64_t maxWork = 16 * 1024 * 1024;
   static constexpr unsigned maxDepth = 128;
   llvm::DenseMap<Attribute, SourceMethodSummary> &methods;
   llvm::DenseMap<Operation *, bool> &transactions;

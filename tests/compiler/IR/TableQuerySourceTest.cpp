@@ -538,7 +538,7 @@ std::array<uint64_t, 7> counters(const Budget &budget) {
 }
 
 TEST(TableQueryBudget, ExactLimitsAndAtomicExhaustionAtEveryCounter) {
-  const std::array<uint64_t, 7> limits{128, 4096, 1048576, 65536, 262144, 1048576, 1048576};
+  const std::array<uint64_t, 7> limits{128, 4096, 1048576, 65536, 1048576, 1048576, 1048576};
   for (unsigned i = 0; i < limits.size(); ++i) {
     Resource resource = static_cast<Resource>(i);
     EXPECT_EQ(Budget::limit(resource), limits[i]);

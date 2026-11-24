@@ -150,6 +150,7 @@
       for (auto [ordinal, contribution] : llvm::enumerate(contributors)) {
         auto [path, payload] = contribution;
         const auto &selection = actual.selections[ordinal];
+        MaterializedBranchResult physicalSelection = selection;
         if (!payload) {
           auto selected = selection.value ? selection.value.getDefiningOp<ac::BitsSelectOp>() : ac::BitsSelectOp();
           if (!selected || !operations.contains(selected.operator->()) || !isa<ac::BitsType>(*type))
@@ -157,8 +158,32 @@
           payload = selected.getTrueValue();
           if (failed(literalProof(payload, *type, memory.getOccurrence(), location, true, &module.getBody().front()))) return failure();
         }
+        if (!ac::areEquivalentHardwareTypes(payload.getType(), *type)) {
+          auto physicalPayload =
+              hardware.resolveType(payload.getType(), bindings, module);
+          if (failed(physicalPayload) ||
+              !ac::areEquivalentHardwareTypes(*physicalPayload, *type) ||
+              selection.generated.empty())
+            return reject("original Memory routed payload type differs");
+          auto adapter = dyn_cast<ac::BitsResizeOp>(selection.generated.front());
+          Builder adapterBuilder(module.getContext());
+          if (!adapter || adapter.getInput() != payload ||
+              adapter.getResult().getType() != *type ||
+              adapter.getMode() != "zext" ||
+              failed(generatedProof(
+                  adapter, ac::BitsResizeOp::getOperationName(), {payload},
+                  {*type},
+                  adapterBuilder.getDictionaryAttr({adapterBuilder.getNamedAttr(
+                      "mode", adapterBuilder.getStringAttr("zext"))}),
+                  location, &module.getBody().front())))
+            return reject("original Memory routed payload adapter differs");
+          payload = adapter.getResult();
+          physicalSelection.generated.erase(physicalSelection.generated.begin());
+        }
         if (failed(localBranchProof(memory, *type, bindings, path, payload, data,
-                                    selection, &module.getBody().front(), last, &pinTypes))) return failure();
+                                    physicalSelection, &module.getBody().front(),
+                                    last, &pinTypes)))
+          return failure();
         data = selection.value;
       }
       if (data != actual.data) return reject("original Memory typed pin merge result differs");

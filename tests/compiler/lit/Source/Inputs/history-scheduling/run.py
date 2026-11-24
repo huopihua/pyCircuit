@@ -262,7 +262,6 @@ def main():
         PYCIRCUIT_SOURCE_COMPILER=args.source_compiler,
         PYCIRCUIT_LINKER=args.linker,
         PYCIRCUIT_EMITTER=args.emitter,
-        MAKEFLAGS="CFG_CXXFLAGS_PCH_I=-include",
     )
     oracle_path = fixtures.parent / "history-scheduling-oracles.py"
     oracle = load(oracle_path)
@@ -468,7 +467,7 @@ def main():
                 "-std=c++20",
                 "-Wno-fatal",
                 "-j",
-                "2",
+                "1",
                 "--top-module",
                 "scheduling_host",
                 "--Mdir",

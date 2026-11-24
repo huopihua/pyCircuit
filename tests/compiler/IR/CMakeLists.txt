@@ -2,6 +2,13 @@ find_package(GTest CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 find_package(Python3 3.11 REQUIRED COMPONENTS Interpreter)
 
+add_test(NAME ACIRBackendRenderBoundary
+  COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/check_backend_render_boundary.py"
+    --root "${PYCIRCUIT_REPO_ROOT}")
+set_tests_properties(ACIRBackendRenderBoundary PROPERTIES
+  LABELS "api;gate;nightly")
+
 # Text IR and codegen behavior live in lit. C++ tests cover the value APIs,
 # source identifier oracle and runtime state transitions that need direct access.
 function(add_acir_api_test target)

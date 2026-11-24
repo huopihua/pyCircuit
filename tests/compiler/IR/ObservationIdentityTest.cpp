@@ -783,7 +783,7 @@ TEST_F(ObservationIdentityTest,
   beginPackage();
   auto root = module("Root", "root.py");
   ac::SourceObserveOp last;
-  for (unsigned index = 0; index < 2048; ++index)
+  for (unsigned index = 0; index < 4096; ++index)
     last = observe(root, "log", (Twine("event_") + Twine(index)).str(),
                    identity("Root", 1, "Root", 2 + index, index), "root.py");
   downgradeToOldObservationID(last);
@@ -812,7 +812,7 @@ TEST_F(ObservationIdentityTest,
        DefaultBudgetPrepaysLargeMetadataBeforeLateBadID) {
   beginPackage();
   auto root = module("Root", "root.py");
-  std::string event(16 * 1024 * 1024, 'x');
+  std::string event(64 * 1024 * 1024, 'x');
   auto last =
       observe(root, "log", event, identity("Root", 1, "Root", 2, 0), "root.py");
   downgradeToOldObservationID(last);

@@ -439,10 +439,27 @@ buildObservationPlan(HardwareEmitContext &context) {
       // the same placeholder rule the source importer applies to a
       // literal-only `log`.
       bool gauge = observe.getKind() == "report";
-      for (uint64_t index = 0; index < group.valueCount; ++index)
-        sites.push_back({frozen->id, observe, static_cast<unsigned>(index),
-                         index < observe.getValues().size(), gauge,
-                         group.registrationRank, siteKey});
+      auto identity = observe->getAttrOfType<DictionaryAttr>("ac.observation_id");
+      auto registration =
+          emissionMetadataJson(identity.get("registration"), observe);
+      auto site = observationSiteMetadataJson(observe);
+      auto spec = emissionMetadataJson(observe.getSpec(), observe);
+      if (failed(registration) || failed(site) || failed(spec))
+        return failure();
+      auto report = observe.getSpec().getAs<StringAttr>("name");
+      for (uint64_t index = 0; index < group.valueCount; ++index) {
+        ObservationEmissionSite emissionSite{
+            frozen->id, observe, static_cast<unsigned>(index),
+            index < observe.getValues().size(), gauge,
+            group.registrationRank, siteKey};
+        emissionSite.kind = observe.getKind().str();
+        emissionSite.registrationJson = *registration;
+        emissionSite.siteJson = *site;
+        emissionSite.specJson = *spec;
+        emissionSite.reportName = report ? report.getValue().str() : "";
+        emissionSite.valueCount = group.valueCount;
+        sites.push_back(std::move(emissionSite));
+      }
     }
     plan.definitions[definition] = std::move(sites);
     const auto &parent = bindings;
@@ -550,7 +567,8 @@ buildObservationPlan(HardwareEmitContext &context) {
             auto found = context.occurrenceId(instance, logicalBindings);
             if (failed(found))
               return failure();
-            logicalPath.push_back({*found, instance, 0});
+            logicalPath.push_back({*found, instance, 0,
+                                   instance.getInstanceName().str(), false});
             auto child = context.bindOccurrence(instance, logicalBindings);
             if (failed(child))
               return failure();
@@ -597,7 +615,12 @@ buildObservationPlan(HardwareEmitContext &context) {
         for (const auto &path : paths)
           for (uint64_t lane = 0; lane < child.shape; ++lane) {
             childPaths.push_back(path);
-            childPaths.back().push_back({child.id, child.op, lane});
+            auto name = context.occurrenceName(child.op, bindings);
+            if (failed(name))
+              return failure();
+            childPaths.back().push_back(
+                {child.id, child.op, lane, std::move(*name),
+                 context.occurrenceIsCollection(child.op)});
           }
         auto childBindings = context.bindOccurrence(child.op, bindings);
         if (failed(childBindings) ||
@@ -620,6 +643,27 @@ buildObservationPlan(HardwareEmitContext &context) {
     if (previous[0] == current[0])
       return context.emitPlanError()
              << "native observation stable ordinals are not unique";
+  }
+  for (const ObservationEmissionOccurrence &occurrence : plan.occurrences) {
+    const ObservationEmissionSite &site = occurrence.site;
+    auto validJson = [](StringRef text) {
+      auto parsed = llvm::json::parse(text);
+      bool valid = static_cast<bool>(parsed);
+      if (!valid)
+        llvm::consumeError(parsed.takeError());
+      return valid;
+    };
+    if (site.valueCount == 0 || site.kind.empty() ||
+        !validJson(site.registrationJson) || !validJson(site.siteJson) ||
+        !validJson(site.specJson) ||
+        llvm::any_of(occurrence.path, [](const auto &entry) {
+          return entry.instanceName.empty();
+        }) ||
+        llvm::any_of(occurrence.logicalOwnerPath, [](const auto &entry) {
+          return entry.instanceName.empty();
+        }))
+      return context.emitPlanError()
+             << "native observation publication plan is incomplete";
   }
   return plan;
 }
@@ -698,9 +742,6 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
   if (!allowSourceChecks && !plan.checks.empty())
     return emitPlanError()
            << "hardware instrumentation emission is not implemented";
-  auto root = rootBindings();
-  if (failed(root))
-    return failure();
   auto checkInteger = [&](Attribute value, Operation *site) -> LogicalResult {
     auto integer = dyn_cast<ac::MathIntAttr>(value);
     if (!integer)
@@ -1010,21 +1051,25 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
       checkedConcreteDefinitions.insert(module);
     return success();
   };
-  if (failed(capabilities(cast<ac::ModuleOp>(root->owner), *root, 1)))
-    return failure();
-  // Every non-generic definition emits a concrete scalar wrapper, even when the
-  // selected root does not instantiate it. Validate that emitted closure too;
-  // unbound generic definitions must not acquire facts from their defaults.
-  for (const HardwareEmissionDefinitionPlan &planned : plan.definitions) {
-    auto definition = cast<ac::ModuleOp>(planned.diagnosticAnchor);
-    if (!definition.getParameters().empty() ||
-        !definition.getTypeParameters().empty() ||
-        checkedConcreteDefinitions.contains(definition))
-      continue;
-    ac::HardwareBindings bindings;
-    bindings.owner = definition;
-    if (failed(capabilities(definition, bindings, 1)))
+  if (!plan.targetCapabilitiesValidated) {
+    auto root = rootBindings();
+    if (failed(root) ||
+        failed(capabilities(cast<ac::ModuleOp>(root->owner), *root, 1)))
       return failure();
+    // Every non-generic definition emits a concrete scalar wrapper, even when
+    // the selected root does not instantiate it. Validate that emitted closure
+    // too; unbound generic definitions must not acquire facts from defaults.
+    for (const HardwareEmissionDefinitionPlan &planned : plan.definitions) {
+      auto definition = cast<ac::ModuleOp>(planned.diagnosticAnchor);
+      if (!definition.getParameters().empty() ||
+          !definition.getTypeParameters().empty() ||
+          checkedConcreteDefinitions.contains(definition))
+        continue;
+      ac::HardwareBindings bindings;
+      bindings.owner = definition;
+      if (failed(capabilities(definition, bindings, 1)))
+        return failure();
+    }
   }
   llvm::StringSet<> cpp, cppNamespaces, rtl, rtlTypes;
   auto reserveCppName = [&](StringRef name, Operation *site) -> LogicalResult {
@@ -1054,7 +1099,8 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
       type = ac::StructType::get(op.getContext(), record.getSymNameAttr());
     else
       continue;
-    if (failed(checkWidth(type, {}, &op, 1)))
+    if (!plan.targetCapabilitiesValidated &&
+        failed(checkWidth(type, {}, &op, 1)))
       return failure();
     auto cppName = cppType(type, &op), rtlName = rtlType(type, &op);
     if (failed(cppName) || failed(rtlName) ||
@@ -1282,6 +1328,39 @@ HardwareEmitContext::occurrenceShape(Operation *occurrence,
   return occurrence->emitOpError()
          << "hardware emission occurrence shape is absent from the frozen plan";
 }
+FailureOr<std::string>
+HardwareEmitContext::occurrenceName(Operation *occurrence,
+                                    const ac::HardwareBindings &parent) const {
+  for (const HardwareEmissionModulePlan &module : plan.modules) {
+    if (module.diagnosticAnchor != parent.owner ||
+        !sameBindings(plan, module.concreteBindings, parent))
+      continue;
+    for (const HardwareEmissionChildPlan &child : module.children)
+      if (child.diagnosticAnchor == occurrence)
+        return child.instanceName;
+  }
+  if (parent.owner)
+    for (const HardwareEmissionDefinitionPlan &definition : plan.definitions)
+      if (definition.diagnosticAnchor == parent.owner)
+        for (const HardwareEmissionOccurrenceBinding &child :
+             definition.templateChildren)
+          if (child.diagnosticAnchor == occurrence)
+            return child.instanceName;
+  return occurrence->emitOpError()
+         << "hardware emission occurrence name is absent from the frozen plan";
+}
+bool HardwareEmitContext::occurrenceIsCollection(Operation *occurrence) const {
+  for (const HardwareEmissionModulePlan &module : plan.modules)
+    for (const HardwareEmissionChildPlan &child : module.children)
+      if (child.diagnosticAnchor == occurrence)
+        return !child.shape.empty();
+  for (const HardwareEmissionDefinitionPlan &definition : plan.definitions)
+    for (const HardwareEmissionOccurrenceBinding &child :
+         definition.templateChildren)
+      if (child.diagnosticAnchor == occurrence)
+        return child.collection;
+  return false;
+}
 const HardwareEmissionQueuePlan *
 HardwareEmitContext::queuePlan(Operation *occurrence,
                                const ac::HardwareBindings &parent) const {
@@ -1293,6 +1372,45 @@ HardwareEmitContext::queuePlan(Operation *occurrence,
       if (child.diagnosticAnchor == occurrence)
         return child.queue ? &*child.queue : nullptr;
   }
+  if (parent.owner)
+    for (const HardwareEmissionDefinitionPlan &definition : plan.definitions)
+      if (definition.diagnosticAnchor == parent.owner)
+        for (const HardwareEmissionOccurrenceBinding &child :
+             definition.templateChildren)
+          if (child.diagnosticAnchor == occurrence)
+            return child.queue ? &*child.queue : nullptr;
+  return nullptr;
+}
+FailureOr<SmallVector<Value>>
+HardwareEmitContext::outputValues(Operation *definition) const {
+  auto found = llvm::find_if(plan.modules, [&](const auto &module) {
+    return module.diagnosticAnchor == definition;
+  });
+  if (found == plan.modules.end())
+    for (const HardwareEmissionDefinitionPlan &planned : plan.definitions)
+      if (planned.diagnosticAnchor == definition)
+        return SmallVector<Value>(planned.outputValues.begin(),
+                                  planned.outputValues.end());
+  if (found == plan.modules.end())
+    return definition->emitOpError()
+           << "module outputs are absent from the frozen emission plan";
+  SmallVector<Value> result;
+  for (const HardwareEmissionPortPlan &output : found->outputs) {
+    if (output.value >= found->values.size() ||
+        !found->values[output.value].source)
+      return definition->emitOpError()
+             << "module output has no frozen value source";
+    result.push_back(found->values[output.value].source);
+  }
+  return result;
+}
+const HardwareEmissionModulePlan *HardwareEmitContext::modulePlan(
+    Operation *definition, const ac::HardwareBindings &bindings) const {
+  for (const HardwareEmissionModulePlan &module : plan.modules)
+    if (module.diagnosticAnchor == definition &&
+        (!bindings.owner || sameBindings(plan, module.concreteBindings,
+                                         bindings)))
+      return &module;
   return nullptr;
 }
 const HardwareEmissionTypePlan *HardwareEmitContext::concreteValueType(
@@ -2251,32 +2369,23 @@ FailureOr<std::string> HardwareEmitContext::cppBoundFamilyType(
 FailureOr<uint64_t>
 observationPayloadWidth(HardwareEmitContext &context,
                         const ObservationEmissionOccurrence &occurrence) {
-  auto rootBindings = context.rootBindings();
-  if (failed(rootBindings))
-    return failure();
-  ac::HardwareBindings bindings = std::move(*rootBindings);
-  for (const auto &[id, operation, lane] : occurrence.path) {
-    (void)id;
-    (void)lane;
-    auto child = context.bindOccurrence(operation, bindings);
-    if (failed(child))
-      return failure();
-    bindings = std::move(*child);
+  if (occurrence.site.id >= context.plan.observations.size())
+    return context.emitPlanError()
+           << "observation payload is absent from the frozen plan";
+  const auto &frozen = context.plan.observations[occurrence.site.id];
+  uint64_t width = 1;
+  if (occurrence.site.carriesValue) {
+    if (occurrence.site.valueIndex >= frozen.payloadWidths.size())
+      return context.emitPlanError()
+             << "observation payload width is absent from the frozen plan";
+    width = frozen.payloadWidths[occurrence.site.valueIndex];
   }
-  auto observe = cast<ac::SourceObserveOp>(occurrence.site.diagnosticAnchor);
-  Value observed = occurrence.site.carriesValue
-                       ? observe.getValues()[occurrence.site.valueIndex]
-                       : observe.getPath();
-  const auto *type = context.concreteValueType(observed, bindings);
-  if (!type)
-    return observe.emitOpError()
-           << "observation payload is absent from the frozen type plan";
-  uint64_t width = type->packedWidth;
   if (width == 0 || width > std::numeric_limits<std::uint32_t>::max())
-    return observe.emitOpError()
+    return occurrence.site.diagnosticAnchor->emitOpError()
            << "observation payload width exceeds Runtime capacity";
   if (occurrence.site.gauge && width > 64)
-    return observe.emitOpError() << "numeric report requires at most 64 bits";
+    return occurrence.site.diagnosticAnchor->emitOpError()
+           << "numeric report requires at most 64 bits";
   return width;
 }
 FailureOr<std::string>
@@ -2293,7 +2402,6 @@ cppObservationDescriptorTable(HardwareEmitContext &context) {
       << plan.table.size() << "] = {";
   for (auto [index, entry] : llvm::enumerate(plan.table)) {
     const auto &occurrence = plan.occurrences[index];
-    auto observe = cast<ac::SourceObserveOp>(occurrence.site.diagnosticAnchor);
     auto width = observationPayloadWidth(context, occurrence);
     if (failed(width))
       return failure();
@@ -2301,7 +2409,7 @@ cppObservationDescriptorTable(HardwareEmitContext &context) {
         << entry[3]
         << ", gfsim::ObservationKind::" << (entry[4] ? "Gauge" : "Event")
         << ", " << occurrence.site.valueIndex << ", "
-        << std::max<std::size_t>(1, observe.getValues().size()) << ", "
+        << occurrence.site.valueCount << ", "
         << *width << "},";
   }
   out << "\n};\n";
@@ -2403,12 +2511,7 @@ cppObservationStaging(HardwareEmitContext &context, ac::ModuleOp definition,
 
 namespace acir::compiler {
 bool HardwareEmitContext::isSystem() {
-  if (plan.rootModule >= plan.modules.size())
-    return false;
-  auto *root = plan.modules[plan.rootModule].diagnosticAnchor;
-  auto kind =
-      root ? root->getAttrOfType<StringAttr>("ac.root_kind") : StringAttr();
-  return kind && kind.getValue() == "system";
+  return plan.rootInterface.closedSystem;
 }
 FailureOr<ObservationEmissionPlan>
 observationEmissionPlan(HardwareEmitContext &context) {
@@ -2499,36 +2602,22 @@ cppObservationRunnerMetadata(HardwareEmitContext &context) {
   }
   out << "  static const gfsim::RunnerObservation entries[] = {\n";
   for (const auto &entry : plan.occurrences) {
-    auto observe = cast<ac::SourceObserveOp>(entry.site.diagnosticAnchor);
-    auto identity = observe->getAttrOfType<DictionaryAttr>("ac.observation_id");
-    if (!identity)
-      return observe.emitOpError() << "observation identity is missing";
-    auto registration =
-        emissionMetadataJson(identity.get("registration"), observe);
-    auto site = observationSiteMetadataJson(observe);
-    auto spec = emissionMetadataJson(observe.getSpec(), observe);
-    if (failed(registration) || failed(site) || failed(spec))
-      return failure();
     std::string instance = "root";
-    for (const auto &[id, operation, lane] : entry.logicalOwnerPath) {
-      (void)id;
-      auto name = operation->getAttrOfType<StringAttr>("instance_name");
-      if (!name)
-        return operation->emitOpError() << "instance has no name";
-      instance += "/" + name.getValue().str();
-      if (isa<ac::CollectionOp>(operation))
-        instance += "[" + std::to_string(lane) + "]";
+    for (const ObservationEmissionPathEntry &path : entry.logicalOwnerPath) {
+      instance += "/" + path.instanceName;
+      if (path.collection)
+        instance += "[" + std::to_string(path.lane) + "]";
     }
-    auto report = observe.getSpec().getAs<StringAttr>("name");
     out << "    {" << entry.ordinal << ", "
-        << cppMetadataString(observe.getKind()) << ", "
+        << cppMetadataString(entry.site.kind) << ", "
         << cppMetadataString(instance) << ", "
-        << cppMetadataString(*registration) << ", " << cppMetadataString(*site)
-        << ", " << cppMetadataString(*spec) << ", "
+        << cppMetadataString(entry.site.registrationJson) << ", "
+        << cppMetadataString(entry.site.siteJson) << ", "
+        << cppMetadataString(entry.site.specJson) << ", "
         << (entry.site.carriesValue ? "true" : "false") << ", "
-        << cppMetadataString(report ? report.getValue() : StringRef()) << ", "
+        << cppMetadataString(entry.site.reportName) << ", "
         << entry.site.valueIndex << ", "
-        << std::max<std::size_t>(1, observe.getValues().size()) << "},\n";
+        << entry.site.valueCount << "},\n";
   }
   out << "  };\n  return entries;\n}\n";
   return text;

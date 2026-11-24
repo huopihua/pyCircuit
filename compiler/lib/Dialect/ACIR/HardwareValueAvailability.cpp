@@ -400,7 +400,26 @@ class AvailabilityProof {
   }
   FailureOr<Uniform> uniformAvailability(Value value,
                                          ArrayRef<StringAttr> path = {}) {
+    // Match materialization: an empty merge is an SSA alias, not another
+    // level of structural uniformity proof.
+    DenseSet<Value> aliases;
+    while (auto merge = value.getDefiningOp<ValueMergeOp>()) {
+      if (!merge.getGuards().empty() || !merge.getPaths().empty() ||
+          !merge.getValues().empty() || value != merge.getNext())
+        break;
+      if (!aliases.insert(value).second) {
+        reject(merge, "cycle in empty value.merge aliases");
+        return failure();
+      }
+      if (!charge(4, merge))
+        return failure();
+      value = merge.getBase();
+    }
     Operation *site = value.getParentBlock()->getParentOp();
+    // A scalar is already one uniform leaf. Permit an aggregate chain at the
+    // recursion boundary to terminate in that leaf.
+    if (path.empty() && isa<BitsType, EnumType>(value.getType()))
+      return Uniform(availability(value));
     if (uniformDepth >= 128) {
       reject(site, "uniform field availability depth exceeds 128");
       return failure();
@@ -1158,6 +1177,7 @@ class AvailabilityProof {
       return all(fields);
     }
     if (auto splat = dyn_cast<TableSplatOp>(op)) return availability(splat.getInput(), path);
+    if (isa<TableMatchOp>(op)) return 1;
     if (auto create = dyn_cast<TableCreateOp>(op)) {
       SmallVector<Expr> inputs;
       for (Value input : create.getInputs()) inputs.push_back(availability(input, path));
@@ -1188,9 +1208,14 @@ class AvailabilityProof {
       bool total = llvm::all_of(op->getOperands(), [&](Value input) {
         return availability(input) == 1;
       });
-      if (total && isa<TableMapOp, TableMatchOp>(op))
+      // Region-bearing normalized operations with wholly available operands
+      // cannot introduce an unavailable payload. Conditional availability is
+      // represented explicitly by value.merge/value.require before this pass.
+      if (total)
         return 1;
-      return reject(op, "availability requires normalized region provenance");
+      return reject(op, ("availability requires normalized region provenance for " +
+                         op->getName().getStringRef())
+                            .str());
     }
     SmallVector<Expr> operands;
     for (Value operand : op->getOperands())

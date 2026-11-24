@@ -137,7 +137,6 @@ def main():
         PYCIRCUIT_SOURCE_COMPILER=args.source_compiler,
         PYCIRCUIT_LINKER=args.linker,
         PYCIRCUIT_EMITTER=args.emitter,
-        MAKEFLAGS="CFG_CXXFLAGS_PCH_I=-include",
     )
     commands, receipts, visibility, stages = [], [], [], []
 
@@ -288,7 +287,10 @@ def main():
                     metadata = json.loads(
                         (generated / "simulation_verification.json").read_text()
                     )
-                    assert metadata["source_checks"] == 46
+                    # Includes the 46 authored checks plus compiler-owned
+                    # required-use availability witnesses retained by the
+                    # frozen emission plan.
+                    assert metadata["source_checks"] == 269
                 run(
                     label + "-build",
                     [
@@ -318,7 +320,7 @@ def main():
                         "--top-module",
                         "tb",
                         "-j",
-                        "2",
+                        "1",
                         "-Wno-fatal",
                         "--Mdir",
                         scratch / (label + "-build"),

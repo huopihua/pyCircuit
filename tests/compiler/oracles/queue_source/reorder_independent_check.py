@@ -565,7 +565,8 @@ FIFO_DEPTH = re.compile(r"\.DEPTH\((\d+)\)")
 FIFO_POLICY = re.compile(r"\.READY_POLICY\((\d+)\)")
 FIFO_LATENCY = re.compile(r"\.AVAILABILITY_LATENCY\(64'd(\d+)\)")
 CPP_KERNEL = re.compile(
-    r"fifo_kernel<([^,]+),\s*(\d+),\s*gfsim::QueueReadyPolicy::(\w+),\s*(\d+)ULL>"
+    r"fifo_kernel<([^,]+),\s*(\d+)(?:ULL)?,\s*"
+    r"gfsim::QueueReadyPolicy::(\w+),\s*(\d+)(?:ULL)?>"
 )
 
 

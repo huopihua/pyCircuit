@@ -99,39 +99,27 @@ FailureOr<ac::ModuleOp> rootModule(HardwareEmitContext &context) {
     return context.emitPlanError() << "root module is unresolved";
   return root;
 }
-bool isSystemRoot(ac::ModuleOp root) {
-  auto kind = root->getAttrOfType<StringAttr>("ac.root_kind");
-  return kind && kind.getValue() == "system";
-}
 struct SystemControls {
   std::string clock, reset;
 };
-FailureOr<SystemControls> systemControls(ac::ModuleOp root) {
-  auto fail = [&] { return root.emitOpError(); };
-  auto kind = root->getAttrOfType<StringAttr>("ac.root_kind");
-  if (!kind || kind.getValue() != "system")
+FailureOr<SystemControls> systemControls(HardwareEmitContext &context) {
+  auto root = context.plan.modules[context.plan.rootModule].diagnosticAnchor;
+  auto fail = [&] { return root->emitOpError(); };
+  const HardwareEmissionRootInterfacePlan &interface =
+      context.plan.rootInterface;
+  if (!interface.closedSystem)
     return fail() << "generated simulation requires a verified system root";
-  auto domain = root->getAttrOfType<DictionaryAttr>("ac.domain_inputs");
-  auto clock = domain ? domain.getAs<IntegerAttr>("clock") : IntegerAttr();
-  auto reset = domain ? domain.getAs<IntegerAttr>("reset") : IntegerAttr();
-  if (!domain || domain.size() != 2 || !clock || !reset ||
-      clock.getValue().getActiveBits() > 64 ||
-      reset.getValue().getActiveBits() > 64)
+  if (!interface.clockInput || !interface.resetInput)
     return fail() << "system root requires verified clock/reset domains";
-  uint64_t clockOrdinal = clock.getValue().getZExtValue();
-  uint64_t resetOrdinal = reset.getValue().getZExtValue();
-  auto layout = ac::getModulePortLayout(root);
-  if (failed(layout))
-    return failure();
-  auto inputs =
-      root.getInputNames().getValue().take_front(layout->sourceInputCount);
-  if (clockOrdinal == resetOrdinal || inputs.size() != 2 ||
-      clockOrdinal >= inputs.size() || resetOrdinal >= inputs.size() ||
-      layout->sourceOutputCount != 0)
+  unsigned clockOrdinal = *interface.clockInput;
+  unsigned resetOrdinal = *interface.resetInput;
+  if (clockOrdinal == resetOrdinal || interface.publicInputCount != 2 ||
+      clockOrdinal >= interface.publicInputCount ||
+      resetOrdinal >= interface.publicInputCount ||
+      interface.publicOutputCount != 0)
     return fail() << "system root must be closed except for clock/reset";
   auto legal = [&](uint64_t ordinal) {
-    return legalizeIdentifier(cast<StringAttr>(inputs[ordinal]).getValue(),
-                              fail);
+    return legalizeIdentifier(interface.inputNames[ordinal], fail);
   };
   auto clockName = legal(clockOrdinal), resetName = legal(resetOrdinal);
   if (failed(clockName) || failed(resetName))
@@ -139,15 +127,15 @@ FailureOr<SystemControls> systemControls(ac::ModuleOp root) {
   return SystemControls{std::move(*clockName), std::move(*resetName)};
 }
 std::string systemSimulationMain(const SystemControls &controls,
-                                 StringRef config, ArrayAttr samples,
+                                 StringRef config, ArrayRef<std::string> samples,
                                  bool resetIfOne) {
   std::string text;
   llvm::raw_string_ostream out(text);
   std::string declarations, drive, cycleGuard;
   if (!samples.empty()) {
     declarations = "constexpr std::string_view pyc_samples[] = {";
-    for (Attribute raw : samples)
-      declarations += "\"" + cast<StringAttr>(raw).getValue().str() + "\",";
+    for (StringRef row : samples)
+      declarations += "\"" + row.str() + "\",";
     declarations +=
         "};\n"
         "auto pyc_symbol(char symbol) {\n"
@@ -250,7 +238,7 @@ std::string systemSimulationMain(const SystemControls &controls,
 }
 } // namespace
 FailureOr<FinalCppSourceParts>
-prepareCppSourceParts(const VerifiedHardwareEmissionPlan &hardware) {
+lowerCppSourceParts(const VerifiedHardwareEmissionPlan &hardware) {
   HardwareEmitContext context(
       hardware.get(), BackendPlanningAccess::sourceChecks(hardware),
       BackendPlanningAccess::observationPlan(hardware), nullptr);
@@ -277,9 +265,8 @@ emitPreparedCppSourceParts(HardwareEmitContext &context) {
   auto root = rootModule(context);
   if (failed(root))
     return failure();
-  auto rootLayout = ac::getModulePortLayout(*root);
-  if (failed(rootLayout))
-    return failure();
+  const HardwareEmissionRootInterfacePlan &rootInterface =
+      context.plan.rootInterface;
   FinalCppSourceParts parts;
   auto rootType = context.rootCppType();
   if (failed(rootType))
@@ -293,7 +280,7 @@ emitPreparedCppSourceParts(HardwareEmitContext &context) {
   if (failed(descriptorTable))
     return failure();
   std::string observationMetadata;
-  if (isSystemRoot(*root)) {
+  if (rootInterface.closedSystem) {
     auto generated = cppObservationRunnerMetadata(context);
     if (failed(generated))
       return failure();
@@ -344,7 +331,7 @@ emitPreparedCppSourceParts(HardwareEmitContext &context) {
       "{ return gfsim::Bits<W>{static_cast<std::uint64_t>(value)}; }\n"
       "\n";
   {
-    llvm::raw_string_ostream out(parts.supportHeader);
+    llvm::raw_string_ostream out(parts.nominalDeclarations);
     for (Operation *declaration : context.plan.nominalDeclarations)
       if (auto enumeration = dyn_cast<ac::EnumOp>(declaration);
           enumeration && failed(emitEnum(context, enumeration, out)))
@@ -356,31 +343,20 @@ emitPreparedCppSourceParts(HardwareEmitContext &context) {
           return failure();
     out.flush();
   }
+  parts.supportHeader += parts.nominalDeclarations;
   for (const HardwareEmissionSourceUnitPlan &unit : context.plan.sourceUnits) {
     FinalCppSourceGroup group;
-    group.sourceOwner = unit.sourceOwner;
+    auto sourceOwner = freezeFinalSourceOwner(unit.sourceOwner, [&]() {
+      return context.plan.package->emitOpError();
+    });
+    if (failed(sourceOwner))
+      return failure();
+    group.sourceOwner = std::move(*sourceOwner);
     group.headerPath = unit.cppHeaderPath;
     group.sourcePath = unit.cppSourcePath;
     group.header = "#pragma once\n#include \"pycircuit_support.hpp\"\n";
-    llvm::StringSet<> includes;
-    for (unsigned definitionIndex : unit.definitionIndices) {
-      auto module = cast<ac::ModuleOp>(
-          context.plan.definitions[definitionIndex].diagnosticAnchor);
-      for (auto &op : module.getBody().front())
-        if (isa<ac::InstanceOp, ac::CollectionOp>(op)) {
-          auto *callee =
-              isa<ac::InstanceOp>(op)
-                  ? context.resolveCallee(cast<ac::InstanceOp>(op))
-                  : context.resolveCallee(cast<ac::CollectionOp>(op));
-          if (auto nested = dyn_cast_or_null<ac::ModuleOp>(callee)) {
-            auto childHeader = context.names(nested).header;
-            if (childHeader != group.headerPath)
-              includes.insert(childHeader);
-          }
-        }
-    }
-    for (auto &item : includes)
-      group.header += "#include \"" + item.getKey().str() + "\"\n";
+    for (const std::string &include : unit.cppIncludes)
+      group.header += "#include \"" + include + "\"\n";
     {
       llvm::raw_string_ostream out(group.header);
       for (unsigned definitionIndex : unit.emissionOrder) {
@@ -399,7 +375,7 @@ emitPreparedCppSourceParts(HardwareEmitContext &context) {
                        "\"\n"
                        "using pyc_root = " +
                        parts.rootCppName + ";\n";
-  if (isSystemRoot(*root))
+  if (rootInterface.closedSystem)
     parts.systemHeader += "#include <gfsim/SystemRunner.h>\n";
   if (observes)
     parts.systemHeader += *descriptorTable;
@@ -409,11 +385,11 @@ emitPreparedCppSourceParts(HardwareEmitContext &context) {
     out << "#include <gfsim/SimSystem.h>\n#include <stdexcept>\n"
            "class pyc_dut final {\npublic:\n";
     SmallVector<std::string> inputs, outputs;
-    auto ports = [&](StringRef typeName, ArrayRef<Attribute> names,
+    auto ports = [&](StringRef typeName, ArrayRef<std::string> names,
                      SmallVectorImpl<std::string> &ports) -> LogicalResult {
       out << "  struct " << typeName << " {\n";
-      for (Attribute raw : names) {
-        auto name = legalizeIdentifier(cast<StringAttr>(raw).getValue(),
+      for (StringRef raw : names) {
+        auto name = legalizeIdentifier(raw,
                                        [&] { return root->emitOpError(); });
         if (failed(name))
           return failure();
@@ -424,14 +400,14 @@ emitPreparedCppSourceParts(HardwareEmitContext &context) {
       out << "  };\n";
       return success();
     };
-    SmallVector<Attribute> exposedOutputs(
-        root->getOutputNames().getValue().take_front(rootLayout->sourceOutputCount));
-    for (int64_t companion : rootLayout->outputValidity)
-      if (companion >= 0)
-        exposedOutputs.push_back(root->getOutputNames()[companion]);
+    SmallVector<std::string> exposedOutputs(
+        rootInterface.outputNames.begin(),
+        rootInterface.outputNames.begin() + rootInterface.publicOutputCount);
+    for (unsigned companion : rootInterface.availabilityOutputs)
+      exposedOutputs.push_back(rootInterface.outputNames[companion]);
     if (failed(ports("Inputs",
-                     root->getInputNames().getValue().take_front(
-                         rootLayout->sourceInputCount),
+                     ArrayRef(rootInterface.inputNames)
+                         .take_front(rootInterface.publicInputCount),
                      inputs)) ||
         failed(ports("Outputs", exposedOutputs, outputs)))
       return failure();
@@ -494,19 +470,17 @@ emitPreparedCppSourceParts(HardwareEmitContext &context) {
     out << "  std::shared_ptr<pyc_root> root_;\n"
            "  gfsim::ObservationSlots observations_;\n  System system_;\n};\n";
   }
-  if (isSystemRoot(*root)) {
-    auto controls = systemControls(*root);
+  if (rootInterface.closedSystem) {
+    auto controls = systemControls(context);
     if (failed(controls))
       return failure();
     parts.simulationConfig =
         "{\"deadlock_window\":null,\"max_domain_cycles\":{},"
         "\"max_ticks\":9223372036854775807,"
         "\"schema\":\"pycircuit-model-config\",\"version\":\"1\"}\n";
-    auto samples = ac::getSystemSamples(*root);
-    if (failed(samples))
-      return failure();
     parts.simulationMain = systemSimulationMain(
-        *controls, StringRef(parts.simulationConfig).trim(), *samples,
+        *controls, StringRef(parts.simulationConfig).trim(),
+        context.plan.systemSamples,
         context.resetIfOne());
   }
   return parts;

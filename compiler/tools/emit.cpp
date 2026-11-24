@@ -7,7 +7,6 @@
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "pycircuit/Dialect/ACIR/ACIRDialect.h"
-#include "pycircuit/Dialect/GFIR/GFIRDialect.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -17,7 +16,7 @@ using namespace mlir;
 
 int main(int argc, char **argv) {
   DialectRegistry dialects;
-  dialects.insert<acir::ac::ACIRDialect, acir::gfir::GFIRDialect>();
+  dialects.insert<acir::ac::ACIRDialect>();
   MLIRContext context(dialects);
   context.loadAllAvailableDialects();
   auto emitError = [&] { return mlir::emitError(UnknownLoc::get(&context)); };

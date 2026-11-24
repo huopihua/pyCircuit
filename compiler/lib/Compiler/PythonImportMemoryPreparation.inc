@@ -143,14 +143,25 @@ LogicalResult Importer::prepareMemoryBindings() {
         if (!isa<ac::BitsType, ac::StructType, ac::EnumType>(*payload))
           return diagnostic()
                  << "memory payload requires a scalar hardware binding";
-        auto width =
-            analysis.getPackedWidth(*payload, {}, body->getOperation());
-        if (failed(width))
-          return failure();
-        if (kind == "byte_mem" && *width % 8)
-          return diagnostic() << "byte_mem payload must be byte aligned";
-        plan.payloadWidth = *width;
-        plan.strobeWidth = *width / 8 + (*width % 8 != 0);
+        // A generic module may allocate a Memory whose payload width refers to
+        // one of that module's static parameters.  Preserve that symbolic type
+        // in the source unit; each concrete occurrence is checked after its
+        // instance bindings are known during link.  Geometry fields are only
+        // diagnostic facts and therefore remain zero for an unbound template.
+        bool payloadWidthEvaluable = true;
+        if (auto bits = dyn_cast<ac::BitsType>(*payload))
+          payloadWidthEvaluable =
+              analysis.isStaticEvaluable(bits.getWidth(), {});
+        if (payloadWidthEvaluable) {
+          auto width =
+              analysis.getPackedWidth(*payload, {}, body->getOperation());
+          if (failed(width))
+            return failure();
+          if (kind == "byte_mem" && *width % 8)
+            return diagnostic() << "byte_mem payload must be byte aligned";
+          plan.payloadWidth = *width;
+          plan.strobeWidth = *width / 8 + (*width % 8 != 0);
+        }
         AstNode depth;
         for (size_t i = 0; i < node.array("keywords").size(); ++i) {
           auto keyword = node.item("keywords", i);
@@ -204,9 +215,24 @@ LogicalResult Importer::prepareMemoryBindings() {
                                            body->getOperation());
           if (failed(type))
             return failure();
+          StringRef inputName = cast<StringAttr>(inputNames[i]).getValue();
+          if (kind == "byte_mem" && inputName == "wstrb" &&
+              !payloadWidthEvaluable) {
+            auto payloadBits = cast<ac::BitsType>(*payload);
+            NamedAttrList quotient(payloadBits.getWidth().getTree());
+            quotient.set("kind", b.getStringAttr("binary"));
+            quotient.erase("ref");
+            quotient.erase("value");
+            quotient.set("operator", b.getStringAttr("floordiv"));
+            quotient.set("lhs", payloadBits.getWidth());
+            quotient.set("rhs", literal(8, node, decl.symbol));
+            *type = ac::BitsType::get(
+                b.getContext(), ac::StaticExprAttr::get(
+                                    b.getContext(), quotient.getDictionary(
+                                                        b.getContext())));
+          }
           plan.inputTypes.push_back(*type);
-          plan.inputNames.push_back(
-              cast<StringAttr>(inputNames[i]).getValue().str());
+          plan.inputNames.push_back(inputName.str());
         }
         // All canonical results belong to the physical instance. Raw source
         // calls retain their one/two authored payload results; response-live

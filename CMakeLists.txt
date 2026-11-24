@@ -34,7 +34,7 @@ if(PYC_BUILD_COMPILER_DEV)
   find_package(MLIR 22.1.8 EXACT CONFIG REQUIRED)
   set(PYCIRCUIT_BUILD_TESTING "${PYC_BUILD_TESTING}" CACHE BOOL "Build native tests" FORCE)
   add_subdirectory(compiler)
-  install(TARGETS ACIRDialect GFIRDialect ACIRCore ACIRAnalysis GFIRValidation HWIRValidation ACIRConversionCommon ACIRToGFIR GFIRToHWIR PycircuitStateInterfaces ACIRSourceCompiler ACIRCodegen ACIRTransforms pycircuit_project_options
+  install(TARGETS ACIRDialect GFIRDialect ACIRCore ACIRAnalysis GFIRValidation HWIRValidation ACIRConversionCommon ACIRToGFIR GFIRToHWIR PycircuitStateInterfaces ACIRSourceCompiler ACIRBackendRender ACIRCodegen ACIRTransforms pycircuit_project_options
     EXPORT pycircuitCompilerTargets
     ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
     LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}")
@@ -51,13 +51,9 @@ if(PYC_BUILD_COMPILER_DEV)
   # kept for future semantic migration. An unbuilt header is not an SDK API.
   set(_pyc_compiler_headers
     BackendRenderPlan.h
-    FinalCppNames.h
     FinalCppSourceParts.h
-    FinalEmitCpp.h
-    FinalEmitVerilog.h
     FinalSourceMap.h
     FinalVerilogSourceParts.h
-    HardwareEmitCommon.h
     HardwareEmissionPlan.h
     PythonImportAST.h
     PythonImportContext.h

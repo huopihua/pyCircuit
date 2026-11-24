@@ -54,7 +54,7 @@
             while (!pending.empty()) {
               auto [value, depth] = pending.pop_back_val();
               if (depth > 128) return module->emitOpError() << "Memory incoming route exceeds depth bound";
-              auto selected = memorySelection(value, true);
+              auto selected = memorySelection(value);
               if (failed(selected)) return failure();
               if (!*selected) continue;
               const auto &entry = **selected;
@@ -94,7 +94,8 @@
     // check; returning zero cannot make its declared input inventory complete.
     for (uint64_t ordinal = start; ordinal < end; ordinal += 2) {
       if (failed(step(module))) return failure();
-      if (!used.contains(ordinal)) return uint64_t(0);
+      if (!used.contains(ordinal))
+        return uint64_t(0);
     }
     auto internal = module->getAttrOfType<DictionaryAttr>("ac.internal_ports");
     auto defaults = internal ? internal.getAs<ArrayAttr>("root_inputs") : ArrayAttr();

@@ -19,16 +19,10 @@ std::string viewLiteral(StringRef value) {
   return "std::string_view{" + literal(value) + ", " +
          std::to_string(value.size()) + "}";
 }
-FailureOr<std::string> jsonLiteral(Attribute value, Operation *site) {
-  auto converted = emissionMetadataJson(value, site);
-  if (failed(converted))
-    return failure();
-  return viewLiteral(*converted);
-}
 bool resetSnapshot(const HardwareEmitContext &context,
                    ac::ModuleOp definition) {
-  auto domain = definition->getAttrOfType<DictionaryAttr>("ac.domain_inputs");
-  return context.sourceChecks().hasChecks() && domain && !domain.empty();
+  const auto *module = context.modulePlan(definition);
+  return context.sourceChecks().hasChecks() && module && module->resetInput;
 }
 struct Address {
   std::string object = "pyc_implementation", suffix;
@@ -41,18 +35,20 @@ FailureOr<Address> address(HardwareEmitContext &context, uint64_t ownerIndex) {
   Address result;
   auto scope = plan.owners.front().bindings;
   for (const auto &step : plan.owners[ownerIndex].path) {
-    auto raw = step.allocation->getAttrOfType<StringAttr>("instance_name");
+    auto raw = context.occurrenceName(step.allocation, scope);
+    if (failed(raw))
+      return failure();
     auto name = legalizeIdentifier(
-        raw.getValue(), [&] { return step.allocation->emitOpError(); });
+        *raw, [&] { return step.allocation->emitOpError(); });
     if (failed(name))
       return failure();
     result.object += "->pyc_instance_" + *name;
-    result.suffix += "." + raw.getValue().str();
+    result.suffix += "." + *raw;
     auto child = context.bindOccurrence(step.allocation, scope);
     if (failed(child))
       return failure();
-    if (auto collection = dyn_cast<ac::CollectionOp>(step.allocation)) {
-      auto shape = context.occurrenceShape(collection, scope);
+    if (context.occurrenceIsCollection(step.allocation)) {
+      auto shape = context.occurrenceShape(step.allocation, scope);
       if (failed(shape) || shape->size() != step.coordinates.size())
         return failure();
       uint64_t count = 1, coordinate = 0;
@@ -61,14 +57,16 @@ FailureOr<Address> address(HardwareEmitContext &context, uint64_t ownerIndex) {
             count > std::numeric_limits<uint64_t>::max() / extent ||
             coordinate >
                 (std::numeric_limits<uint64_t>::max() - index) / extent)
-          return collection.emitOpError() << "native check lane index overflow";
+          return step.allocation->emitOpError()
+                 << "native check lane index overflow";
         count *= extent;
         coordinate = coordinate * extent + index;
         result.suffix += "[" + std::to_string(index) + "]";
       }
       if (result.lane >
           (std::numeric_limits<uint64_t>::max() - coordinate) / count)
-        return collection.emitOpError() << "native check lane index overflow";
+        return step.allocation->emitOpError()
+               << "native check lane index overflow";
       result.lane = result.lane * count + coordinate;
     }
     scope = std::move(*child);
@@ -244,8 +242,8 @@ emitCppCheckCapture(HardwareEmitContext &context, ac::ModuleOp definition,
         << ".element(pyc_lane), " << *reset << ".element(pyc_lane));\n";
   }
   if (resetSnapshot(context, definition)) {
-    auto domain = definition->getAttrOfType<DictionaryAttr>("ac.domain_inputs");
-    auto ordinal = domain.getAs<IntegerAttr>("reset").getValue().getZExtValue();
+    const auto *module = context.modulePlan(definition);
+    unsigned ordinal = *module->resetInput;
     auto reset = value(definition.getBody().front().getArgument(ordinal));
     if (failed(reset))
       return failure();
@@ -350,20 +348,18 @@ LogicalResult emitCppRootCheckValidator(HardwareEmitContext &context,
   for (bool guardPhase : {true, false}) {
     for (const auto &check : plan.checks) {
       const auto &binding = plan.bindings[check.bindingIndex];
+      const HardwareEmissionCheckPlan &frozen =
+          context.plan.checks[check.ordinal];
       if ((binding.kind.getValue() == "guard_known") != guardPhase)
         continue;
       auto owner = address(context, check.ownerOccurrence);
       auto local = localIndex(context, check.bindingIndex);
       if (failed(owner) || failed(local))
         return failure();
-      auto location = jsonLiteral(binding.location, binding.expect);
-      auto id = jsonLiteral(binding.checkID, binding.expect);
-      if (failed(location) || failed(id))
-        return failure();
       std::string message =
-          binding.message
-              ? binding.message.getValue().str()
-              : "source " + binding.kind.getValue().str() + " check failed";
+          frozen.message.empty()
+              ? "source " + frozen.kind + " check failed"
+              : frozen.message;
       auto lane = std::to_string(owner->lane);
       auto site = std::to_string(*local);
       if (binding.kind.getValue() == "guard_known") {
@@ -395,8 +391,10 @@ LogicalResult emitCppRootCheckValidator(HardwareEmitContext &context,
             << ").isFullyKnown()) {\n"
             << "        failure = {gfsim::SimFailurePhase::Check, "
             << viewLiteral("source_check_failed") << ", " << viewLiteral(message)
-            << ", pyc_check_instances_[" << check.ordinal << "], " << *location
-            << ", " << *id << "};\n        return false;\n      }\n    }\n";
+            << ", pyc_check_instances_[" << check.ordinal << "], "
+            << viewLiteral(frozen.location) << ", "
+            << viewLiteral(frozen.identity)
+            << "};\n        return false;\n      }\n    }\n";
         continue;
       }
       std::string reset = "gfsim::FourState<1>::known(gfsim::Bits<1>{0})";
@@ -419,8 +417,10 @@ LogicalResult emitCppRootCheckValidator(HardwareEmitContext &context,
              "pyc_error.value() != gfsim::Bits<1>{0}) {\n"
           << "        failure = {gfsim::SimFailurePhase::Check, "
           << viewLiteral("source_check_failed") << ", " << viewLiteral(message)
-          << ", pyc_check_instances_[" << check.ordinal << "], " << *location
-          << ", " << *id << "};\n        return false;\n      }\n    }\n";
+          << ", pyc_check_instances_[" << check.ordinal << "], "
+          << viewLiteral(frozen.location) << ", "
+          << viewLiteral(frozen.identity)
+          << "};\n        return false;\n      }\n    }\n";
     }
   }
   out << "    return true;\n  }\n";

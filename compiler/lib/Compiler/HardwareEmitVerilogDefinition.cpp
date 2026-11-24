@@ -945,22 +945,29 @@ public:
             return failure();
           pins.push_back(*value);
         }
-        auto config = ac::getQueueConfiguration(queue);
-        if (failed(config))
-          return failure();
+        const auto *config = context.queuePlan(queue, parent);
+        if (!config)
+          return queue.emitOpError()
+                 << "queue is absent from the frozen emission plan";
         auto payload = context.rtlType(queue.getInputs()[3].getType(), queue);
-        auto depth = context.staticRtlValue(
-            config->getAs<ac::StaticExprAttr>("depth"), queue);
-        auto latency = context.unsignedStaticValue(
-            config->getAs<ac::StaticExprAttr>("availability_latency"), queue,
-            true);
+        auto depth = config->depth
+                         ? FailureOr<std::string>(std::to_string(config->depth))
+                         : context.unsignedStaticValue(config->depthExpression,
+                                                       queue, true, parent);
+        auto latency = config->depth
+                           ? FailureOr<std::string>(
+                                 "64'd" +
+                                 std::to_string(config->availabilityLatency))
+                           : context.unsignedStaticValue(
+                                 config->availabilityLatencyExpression, queue,
+                                 true, parent);
         auto name = legalizeIdentifier(queue.getInstanceName(),
                                        [&] { return queue.emitOpError(); });
         if (failed(payload) || failed(depth) || failed(latency) || failed(name))
           return failure();
         unsigned policy =
-            config->getAs<StringAttr>("ready_policy").getValue() ==
-                    "local_occupancy"
+            config->readyPolicy ==
+                    HardwareEmissionQueueReadyPolicy::LocalOccupancy
                 ? 0
                 : 1;
         std::string error;
@@ -1301,8 +1308,10 @@ LogicalResult emitHardwareVerilogDefinition(HardwareEmitContext &context,
   }
   out << (first ? ");\n" : "\n);\n");
   NetEmitter nets(context, definition, out);
-  auto yield = cast<ac::YieldOp>(definition.getBody().front().back());
-  for (auto [i, value] : llvm::enumerate(yield.getValues())) {
+  auto outputs = context.outputValues(definition);
+  if (failed(outputs))
+    return failure();
+  for (auto [i, value] : llvm::enumerate(*outputs)) {
     auto wire = nets.net(value);
     if (failed(wire))
       return failure();

@@ -157,15 +157,31 @@ LogicalResult ModuleOp::verifyRegions() {
     return success();
   };
   auto result = walk([&](Operation *op) {
-    for (Type type : op->getOperandTypes())
-      if (failed(typeScope(type)))
-        return WalkResult::interrupt();
-    for (Type type : op->getResultTypes())
-      if (failed(typeScope(type)))
-        return WalkResult::interrupt();
-    for (auto attr : op->getAttrs())
-      if (failed(detail::verifyHardwareAttributeScope(attr.getValue(), *this)))
-        return WalkResult::interrupt();
+    auto foreignType = [&](Type type) {
+      bool foreign = false;
+      type.walk([&](Type nested) {
+        if (auto formal = dyn_cast<TypeParamType>(nested))
+          foreign |= formal.getOwner().getValue() != getSymName();
+      });
+      return foreign;
+    };
+    // Instance port types are spelled in the callee's lexical scope.  Their
+    // complete binding, arity and resolved type agreement are authenticated by
+    // the instance verifier; applying the caller's scope to those types would
+    // reject legal generic primitive occurrences.
+    if (!isa<InstanceOp, CollectionOp>(op)) {
+      for (Type type : op->getOperandTypes())
+        if (!foreignType(type) && failed(typeScope(type)))
+          return WalkResult::interrupt();
+      for (Type type : op->getResultTypes())
+        if (!foreignType(type) && failed(typeScope(type)))
+          return WalkResult::interrupt();
+    }
+    if (!isa<InstanceOp, CollectionOp>(op))
+      for (auto attr : op->getAttrs())
+        if (failed(
+                detail::verifyHardwareAttributeScope(attr.getValue(), *this)))
+          return WalkResult::interrupt();
     return WalkResult::advance();
   });
   if (result.wasInterrupted())

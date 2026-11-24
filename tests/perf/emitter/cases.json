@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "cases": {
+    "medium": {
+      "axis": "shared",
+      "size": 16,
+      "tiers": ["gate", "nightly"],
+      "repeats": 3,
+      "final_ac_min_bytes": 180000,
+      "final_ac_max_bytes": 260000
+    },
+    "stress": {
+      "axis": "distinct",
+      "size": 32,
+      "tiers": ["nightly"],
+      "repeats": 1,
+      "final_ac_min_bytes": 1300000,
+      "final_ac_max_bytes": 1800000
+    }
+  }
+}

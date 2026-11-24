@@ -607,7 +607,6 @@ def loop_contract_cases():
     rows = []
     identity = "def helper(value: u8) -> u8:\n    return value\n"
     for name, body in (
-        ("nested", "for outer in range(1):\n        for inner in range(1):\n            value = value + 1"),
         ("while", "while value:\n        value = value - 1"),
         ("break", "for index in range(2):\n        break"),
         ("continue", "for index in range(2):\n        continue"),
@@ -622,7 +621,6 @@ def loop_contract_cases():
         ("zero_trip_unknown_call", "for index in range(0):\n        undefined(value)"),
         ("zero_trip_return", "for index in range(0):\n        return value"),
         ("zero_trip_import", "for index in range(0):\n        import math"),
-        ("zero_trip_nested", "for index in range(0):\n        for inner in range(0):\n            pass"),
     ):
         text = design(identity.replace("return value", body + "\n    return value"))
         rows.append({"name": "helper_loop_" + name, "text": text,

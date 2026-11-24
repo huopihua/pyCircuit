@@ -100,3 +100,53 @@ jobs:
           tests/unit/test_publication_fs.py
           tests/unit/test_driver_commands.py
           tests/unit/test_anchor_files.py
+
+  emitter-rss-gate:
+    name: "G1: Emitter Peak RSS"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      LLVM_VERSION: "22"
+      CMAKE_BUILD_TYPE: Release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.14.6"
+
+      - name: Install LLVM 22 and build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg software-properties-common cmake ninja-build clang libgtest-dev
+          wget --https-only https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh ${LLVM_VERSION}
+          sudo apt-get install -y llvm-${LLVM_VERSION}-dev mlir-${LLVM_VERSION}-tools libmlir-${LLVM_VERSION}-dev
+          echo "/usr/lib/llvm-${LLVM_VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: Build staged toolchain
+        run: |
+          LLVM_CONFIG=/usr/lib/llvm-${LLVM_VERSION}/bin/llvm-config \
+          bash tools/pyc build \
+            --build-dir "$PWD/.pycircuit_out/toolchain/build" \
+            --install-prefix "$PWD/.pycircuit_out/toolchain/install"
+
+      - name: Measure emitter peak RSS
+        run: |
+          python tools/check_emitter_rss.py \
+            --tier gate \
+            --prefix "$PWD/.pycircuit_out/toolchain/install" \
+            --output-dir "$PWD/.pycircuit_out/emitter-rss"
+
+      - name: Upload emitter RSS report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: emitter-rss-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .pycircuit_out/emitter-rss/
+          if-no-files-found: error
+          retention-days: 14

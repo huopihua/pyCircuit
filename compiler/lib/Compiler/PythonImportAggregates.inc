@@ -1218,8 +1218,31 @@ FailureOr<Value> Importer::unsignedBoundary(Value value, Type target,
              fixedValues.contains(value) && !*equivalent) {
     ac::HardwareAnalysis analysis(*body);
     auto *owner = at.getBlock()->getParentOp();
-    auto sourceWidth = analysis.getPackedWidth(value.getType(), {}, owner);
-    auto targetWidth = analysis.getPackedWidth(target, {}, owner);
+    ac::HardwareBindings lexical;
+    lexical.owner = isa<ac::ModuleOp>(owner)
+                        ? owner
+                        : owner->getParentOfType<ac::ModuleOp>().getOperation();
+    auto sourceBits = cast<ac::BitsType>(value.getType());
+    bool sourceClosed =
+        analysis.isStaticEvaluable(sourceBits.getWidth(), lexical);
+    bool targetClosed =
+        analysis.isStaticEvaluable(targetBits.getWidth(), lexical);
+    // A generic Memory payload can cross a fixed-bits boundary before the
+    // allocating Module's Integer parameters are bound.  Keep the resize in
+    // symbolic form; the bound-operation verifier proves its direction and
+    // exact widths for every concrete occurrence during link.
+    if (!sourceClosed || !targetClosed) {
+      auto result = createOp(
+                        at, node.location(b.getContext(), source.path),
+                        ac::BitsResizeOp::getOperationName(), {value},
+                        TypeRange{target},
+                        {at.getNamedAttr("mode", at.getStringAttr("zext"))})
+                        ->getResult(0);
+      return fixedResult(result);
+    }
+    auto sourceWidth =
+        analysis.getPackedWidth(value.getType(), lexical, owner);
+    auto targetWidth = analysis.getPackedWidth(target, lexical, owner);
     if (failed(sourceWidth) || failed(targetWidth))
       return failure();
     if (*sourceWidth > *targetWidth)

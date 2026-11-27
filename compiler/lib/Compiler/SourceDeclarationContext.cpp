@@ -13,6 +13,10 @@ llvm::ArrayRef<MemoryCallPlan> SourceDeclarationContext::memoryCalls() const {
 llvm::ArrayRef<ModuleDomainPlan> SourceDeclarationContext::moduleDomains() const {
   return implementation->moduleDomains();
 }
+void SourceDeclarationContext::collectMetrics(
+    acir::metrics::CompilerPhaseMetrics &metrics) const {
+  implementation->collectMetrics(metrics);
+}
 mlir::FailureOr<mlir::OwningOpRef<mlir::ModuleOp>>
 SourceDeclarationContext::consume() { return implementation->lower(); }
 } // namespace acir::compiler::detail

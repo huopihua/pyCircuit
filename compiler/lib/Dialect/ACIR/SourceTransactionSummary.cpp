@@ -99,13 +99,16 @@ namespace {
 // unrepresentable domain changes successful source Method totality facts.
 class PublicationBudget {
 public:
-  explicit PublicationBudget(Operation *site) : site(site) {}
+  PublicationBudget(Operation *site, StringRef phase)
+      : site(site), phase(phase) {}
   bool charge(uint64_t units = 1) {
     if (exhausted)
       return false;
     if (units > maxWork - work) {
       site->emitOpError()
-          << "transaction publication summary work budget exceeded";
+          << "transaction publication summary work budget exceeded "
+          << "(requested " << units << ", used " << work << ", limit "
+          << maxWork << ", phase " << phase << ")";
       exhausted = true;
       return false;
     }
@@ -129,47 +132,16 @@ public:
     return charge();
   }
   bool ok() const { return !exhausted; }
+  void setPhase(StringRef value) { phase = value; }
 
 private:
   static constexpr uint64_t maxWork = 1024 * 1024;
   static constexpr unsigned maxDepth = 128;
   Operation *site;
+  StringRef phase;
   uint64_t work = 0;
   bool exhausted = false;
 };
-
-// Old readers require exactly the three legacy top-level fields. Version only
-// summaries that use newer semantics, including relative calls nested in arms.
-FailureOr<unsigned> requiredTransactionSchema(Operation *module, Attribute value,
-                                          PublicationBudget &budget,
-                                          unsigned depth = 0) {
-  if (!budget.depth(depth)) return failure();
-  unsigned needed = module->hasAttr("ac.reference_parameters") ? 2 : 0;
-  if (auto row = dyn_cast_or_null<DictionaryAttr>(value)) {
-    auto kind = row.getAs<StringAttr>("kind");
-    auto receiver = row.getAs<DictionaryAttr>("receiver");
-    if (kind && kind.getValue() == "call" && receiver &&
-        (receiver.get("receiver_kind") || receiver.get("ancestor_depth")))
-      needed = 3;
-  }
-  if (auto row = dyn_cast_or_null<DictionaryAttr>(value))
-    for (NamedAttribute field : row) {
-      if (!budget.charge()) return failure();
-      StringRef name = field.getName().getValue();
-      if (name == "reference_bindings" || name == "reference")
-        needed = std::max(needed, 2u);
-      auto child = requiredTransactionSchema(module, field.getValue(), budget, depth + 1);
-      if (failed(child)) return failure();
-      needed = std::max(needed, *child);
-    }
-  if (auto values = dyn_cast_or_null<ArrayAttr>(value))
-    for (Attribute childValue : values) {
-      auto child = requiredTransactionSchema(module, childValue, budget, depth + 1);
-      if (failed(child)) return failure();
-      needed = std::max(needed, *child);
-    }
-  return needed;
-}
 
 LogicalResult chargeAttributeSpelling(PublicationBudget &budget,
                                       Attribute attribute) {
@@ -209,11 +181,22 @@ public:
   explicit PublicationBuilder(ModuleOp definition)
       : definition(definition),
         hardware(definition->getParentOfType<mlir::ModuleOp>()),
-        builder(definition.getContext()), budget(definition) {}
+        builder(definition.getContext()), budget(definition, "derivation"),
+        requiredSchema(definition->hasAttr("ac.reference_parameters") ? 2 : 0) {}
   FailureOr<DictionaryAttr> run() {
     if (failed(checkInstances(definition, 0)))
       return failure();
     SmallVector<Attribute> owners, methods, autonomous;
+    // Freeze definition-owned state lookup once. Effect rows refer to the
+    // state by name; replaying a full definition scan for every read/write is
+    // quadratic in large generated systems.
+    for (Operation &operation : definition.getBody().front())
+      if (auto state = dyn_cast<SourceStateOp>(operation)) {
+        if (!budget.charge() ||
+            !states.try_emplace(state.getInstanceNameAttr(), state).second)
+          return state.emitOpError()
+                 << "transaction publication requires unique local state names";
+      }
     for (Operation &operation : definition.getBody().front()) {
       if (!budget.charge(1 + operation.getNumOperands() +
                          operation.getNumResults()))
@@ -258,8 +241,10 @@ public:
           return failure();
         NamedAttrList fields(*row);
         fields.append("arguments", *arguments);
-        if (auto references = instance->getAttr("ac.reference_bindings"))
+        if (auto references = instance->getAttr("ac.reference_bindings")) {
+          requiredSchema = std::max(requiredSchema, 2u);
           fields.append("reference_bindings", references);
+        }
         owners.push_back(fields.getDictionary(builder.getContext()));
       } else if (auto method = dyn_cast<SourceMethodOp>(operation)) {
         auto row = callable(method);
@@ -305,11 +290,9 @@ public:
                          {"methods", array(methods)},
                          {"autonomous", array(autonomous)}});
     if (!summary || invalid || !budget.ok()) return failure();
-    auto newSemantics = requiredTransactionSchema(definition, summary, budget);
-    if (failed(newSemantics)) return failure();
-    if (*newSemantics) {
+    if (requiredSchema) {
       NamedAttrList versioned(summary);
-      versioned.append("schema", builder.getI64IntegerAttr(*newSemantics));
+      versioned.append("schema", builder.getI64IntegerAttr(requiredSchema));
       summary = versioned.getDictionary(builder.getContext());
     }
     if (!summary || invalid || !budget.ok() ||
@@ -332,9 +315,18 @@ private:
         return {};
       }
     NamedAttrList result;
-    for (auto field : fields)
+    for (auto field : fields) {
+      if (field.first == "reference_bindings" || field.first == "reference")
+        requiredSchema = std::max(requiredSchema, 2u);
       result.append(field.first, field.second);
-    return result.getDictionary(builder.getContext());
+    }
+    auto row = result.getDictionary(builder.getContext());
+    auto kind = row.getAs<StringAttr>("kind");
+    auto receiver = row.getAs<DictionaryAttr>("receiver");
+    if (kind && kind.getValue() == "call" && receiver &&
+        (receiver.get("receiver_kind") || receiver.get("ancestor_depth")))
+      requiredSchema = 3;
+    return row;
   }
   ArrayAttr array(ArrayRef<Attribute> attributes) {
     if (!budget.charge(1 + attributes.size()))
@@ -887,14 +879,7 @@ private:
         result.push_back(row);
       } else if (isa<SourceStateReadOp, SourceStateWriteOp>(operation)) {
         auto stateName = operation.getAttrOfType<StringAttr>("state");
-        SourceStateOp state;
-        for (Operation &operation : definition.getBody().front()) {
-          if (!budget.charge())
-            return failure();
-          auto candidate = dyn_cast<SourceStateOp>(operation);
-          if (candidate && candidate.getInstanceNameAttr() == stateName)
-            state = candidate;
-        }
+        SourceStateOp state = states.lookup(stateName);
         if (!state)
           return operation.emitOpError()
                  << "publication requires an actual local state";
@@ -1017,8 +1002,10 @@ private:
   Builder builder;
   PublicationBudget budget;
   llvm::DenseSet<Operation *> visiting, visited;
+  llvm::DenseMap<StringAttr, SourceStateOp> states;
   llvm::DenseMap<std::pair<Value, Operation *>, DictionaryAttr> dependencyCache;
   llvm::DenseSet<Type> admittedBranchTypes;
+  unsigned requiredSchema;
   bool invalid = false;
 };
 
@@ -1027,9 +1014,12 @@ public:
   explicit SummaryStructureVerifier(Operation *declaration)
       : declaration(declaration),
         hardware(declaration->getParentOfType<mlir::ModuleOp>()),
-        budget(declaration) {}
+        budget(declaration, "verification"),
+        requiredSchema(declaration->hasAttr("ac.reference_parameters") ? 2
+                                                                        : 0) {}
   LogicalResult run(DictionaryAttr summary) {
     // Header validation deliberately never walks or verifies provider bodies.
+    budget.setPhase("verification preflight");
     if (failed(preflight(summary, 0)))
       return failure();
     if (auto module = dyn_cast<ModuleOp>(declaration)) {
@@ -1051,14 +1041,12 @@ public:
     if (failed(exact(legacy.getDictionary(declaration->getContext()),
                      {"owners", "methods", "autonomous"})))
       return failure();
-    auto newSemantics = requiredTransactionSchema(declaration, summary, budget);
-    if (failed(newSemantics)) return failure();
     auto schema = summary.getAs<IntegerAttr>("schema");
-    if ((*newSemantics && !schema) ||
+    if ((requiredSchema && !schema) ||
         (summary.get("schema") &&
          (!schema || !schema.getType().isSignlessInteger(64) ||
-          schema.getInt() != (*newSemantics == 3 ? 3 : 2))))
-      return error(*newSemantics == 3
+          schema.getInt() != (requiredSchema == 3 ? 3 : 2))))
+      return error(requiredSchema == 3
           ? "relative receiver calls require schema = 3 : i64"
           : "reference semantics require schema = 2 : i64");
     auto owners = summary.getAs<ArrayAttr>("owners");
@@ -1066,6 +1054,7 @@ public:
     auto autonomous = summary.getAs<ArrayAttr>("autonomous");
     if (!owners || !methods || !autonomous)
       return error("top rows must be arrays");
+    budget.setPhase("verification rows");
     DictionaryAttr previousOwner;
     llvm::StringSet<> ownerNames;
     for (Attribute raw : owners) {
@@ -1165,7 +1154,9 @@ public:
           auto payload = cast<TypeAttr>(results[0]).getValue();
           if (failed(detail::verifySourceCallHardwareConstraint(
                   payloadConstraint, payload, hardware, declaration, declaration,
-                  "transaction summary Memory payload"))) return failure();
+                  "transaction summary Memory payload",
+                  detail::SourceCallWidthMode::SymbolicFixedBits)))
+            return failure();
           for (unsigned port = 0; port < ports; ++port) {
             if (!areEquivalentHardwareTypes(cast<TypeAttr>(results[port]).getValue(), payload))
               return error("source Memory payload result types disagree");
@@ -1202,7 +1193,8 @@ public:
           if (payloadConstraint &&
               failed(detail::verifySourceCallHardwareConstraint(
                   payloadConstraint, payload, hardware, declaration,
-                  declaration, "transaction summary queue payload")))
+                  declaration, "transaction summary queue payload",
+                  detail::SourceCallWidthMode::SymbolicFixedBits)))
             return failure();
           if ((unboundPush || unboundPop) && !payloadConstraint)
             return error("source Queue methods require a checked payload constraint");
@@ -1321,7 +1313,15 @@ private:
     if (failed(chargeAttributeSpelling(budget, attr)))
       return failure();
     if (auto dict = dyn_cast<DictionaryAttr>(attr)) {
+      auto kind = dict.getAs<StringAttr>("kind");
+      auto receiver = dict.getAs<DictionaryAttr>("receiver");
+      if (kind && kind.getValue() == "call" && receiver &&
+          (receiver.get("receiver_kind") || receiver.get("ancestor_depth")))
+        requiredSchema = 3;
       for (auto field : dict) {
+        StringRef name = field.getName().getValue();
+        if (name == "reference_bindings" || name == "reference")
+          requiredSchema = std::max(requiredSchema, 2u);
         if (!budget.charge(field.getName().getValue().size()))
           return failure();
         if (failed(preflight(field.getValue(), depth + 1)))
@@ -2132,6 +2132,7 @@ private:
   llvm::StringSet<> stateNames;
   llvm::DenseMap<DictionaryAttr, DictionaryAttr> instanceRows;
   llvm::DenseMap<StringAttr, DictionaryAttr> methodRows;
+  unsigned requiredSchema;
 };
 } // namespace
 

@@ -143,14 +143,23 @@ LogicalResult Importer::prepareMemoryBindings() {
         if (!isa<ac::BitsType, ac::StructType, ac::EnumType>(*payload))
           return diagnostic()
                  << "memory payload requires a scalar hardware binding";
-        auto width =
-            analysis.getPackedWidth(*payload, {}, body->getOperation());
-        if (failed(width))
-          return failure();
-        if (kind == "byte_mem" && *width % 8)
-          return diagnostic() << "byte_mem payload must be byte aligned";
-        plan.payloadWidth = *width;
-        plan.strobeWidth = *width / 8 + (*width % 8 != 0);
+        // A generic Module owns the symbolic Memory payload declaration; its
+        // concrete width belongs to each bound instance occurrence. Keep the
+        // definition-level plan symbolic and let bound hardware verification
+        // check width and byte alignment with the actual parameter binding.
+        bool concretePayload = true;
+        if (auto bits = dyn_cast<ac::BitsType>(*payload))
+          concretePayload = analysis.isStaticEvaluable(bits.getWidth(), {});
+        if (concretePayload) {
+          auto width =
+              analysis.getPackedWidth(*payload, {}, body->getOperation());
+          if (failed(width))
+            return failure();
+          if (kind == "byte_mem" && *width % 8)
+            return diagnostic() << "byte_mem payload must be byte aligned";
+          plan.payloadWidth = *width;
+          plan.strobeWidth = *width / 8 + (*width % 8 != 0);
+        }
         AstNode depth;
         for (size_t i = 0; i < node.array("keywords").size(); ++i) {
           auto keyword = node.item("keywords", i);

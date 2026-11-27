@@ -9,10 +9,71 @@
           llvm::APSInt::compareValues(llvm::APSInt(lhs->fullyKnown->value.getCanonicalValue()),
                                       llvm::APSInt(rhs->fullyKnown->value.getCanonicalValue())) == 0;
     };
+    std::function<FailureOr<bool>(const HardwareIdentityEndpoint &,
+                                  const HardwareIdentityEndpoint &, unsigned)>
+        structurallySame = [&](const HardwareIdentityEndpoint &left,
+                               const HardwareIdentityEndpoint &right,
+                               unsigned depth) -> FailureOr<bool> {
+      if (same(left, right))
+        return true;
+      if (depth > 128 || failed(step(module, 4)))
+        return failure();
+      if (!areEquivalentHardwareTypes(left.resolvedType,
+                                      right.resolvedType))
+        return false;
+      auto leftResult = dyn_cast<OpResult>(left.value),
+           rightResult = dyn_cast<OpResult>(right.value);
+      if (!leftResult || !rightResult ||
+          leftResult.getResultNumber() != rightResult.getResultNumber())
+        return false;
+      Operation *leftOp = leftResult.getOwner(),
+                *rightOp = rightResult.getOwner();
+      if (!isCombinationalHardwareOperation(leftOp) ||
+          !isCombinationalHardwareOperation(rightOp) ||
+          leftOp->getName() != rightOp->getName() ||
+          leftOp->getNumRegions() || rightOp->getNumRegions() ||
+          leftOp->getNumOperands() != rightOp->getNumOperands() ||
+          leftOp->getNumResults() != rightOp->getNumResults() ||
+          leftOp->getAttrDictionary() != rightOp->getAttrDictionary() ||
+          leftOp->getPropertiesAsAttribute() !=
+              rightOp->getPropertiesAsAttribute())
+        return false;
+      for (auto [leftOperand, rightOperand] :
+           llvm::zip_equal(leftOp->getOperands(), rightOp->getOperands())) {
+        auto leftChild = normal(leftOperand, left.scope),
+             rightChild = normal(rightOperand, right.scope);
+        if (failed(leftChild) || failed(rightChild))
+          return failure();
+        auto equal = structurallySame(*leftChild, *rightChild, depth + 1);
+        if (failed(equal) || !*equal)
+          return equal;
+      }
+      return true;
+    };
     auto sameDemandAtom = [&](const HardwareIdentityEndpoint &left,
                               const HardwareIdentityEndpoint &right) -> FailureOr<bool> {
       if (same(left, right)) return true;
       if (failed(step(module, 4))) return failure();
+      auto leftCompare = left.value.getDefiningOp<BitsCompareOp>(),
+           rightCompare = right.value.getDefiningOp<BitsCompareOp>();
+      if (leftCompare && rightCompare &&
+          leftCompare.getPredicate() == "case_eq" &&
+          rightCompare.getPredicate() == "case_eq") {
+        auto leftLhs = normal(leftCompare.getLhs(), left.scope),
+             leftRhs = normal(leftCompare.getRhs(), left.scope),
+             rightLhs = normal(rightCompare.getLhs(), right.scope),
+             rightRhs = normal(rightCompare.getRhs(), right.scope);
+        if (failed(leftLhs) || failed(leftRhs) || failed(rightLhs) ||
+            failed(rightRhs))
+          return failure();
+        // case_eq is four-state exact. Equal normalized operands therefore
+        // prove equal atoms without Boolean expansion or X/Z assumptions.
+        auto lhsSame = structurallySame(*leftLhs, *rightLhs, 0),
+             rhsSame = structurallySame(*leftRhs, *rightRhs, 0);
+        if (failed(lhsSame) || failed(rhsSame))
+          return failure();
+        return *lhsSame && *rhsSame;
+      }
       auto a = left.value.getDefiningOp<BitsUnaryOp>(),
            b = right.value.getDefiningOp<BitsUnaryOp>();
       if (!a || !b || a.getOpcode() != "not" || b.getOpcode() != "not")

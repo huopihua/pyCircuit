@@ -59,6 +59,7 @@
       detail::TransactionMemoryProposal proposal;
       proposal.access = id;
       if (access.kind == ac::TransactionMemoryAccessKind::Read) {
+        const auto &owner = plan.memoryOwners[access.owner];
         proposal.reachedControlEnd = prepared.controls.size();
         ac::detail::SourceFormalProposalProof identity(plan, hardware,
             [&](ac::BoundValueId value, ac::TransactionPoint point) {
@@ -78,6 +79,29 @@
           if (failed(covered)) return failure();
           if (*covered) { proposal.physicalReuse = earlier.access; break; }
         }
+        if (proposal.physicalReuse) {
+          auto earlier = llvm::find_if(
+              prepared.memoryProposals, [&](const auto &candidate) {
+                return candidate.access == *proposal.physicalReuse;
+              });
+          if (earlier == prepared.memoryProposals.end() ||
+              !earlier->readChannel)
+            return failure();
+          proposal.readChannel = earlier->readChannel;
+        } else {
+          proposal.readChannel = memoryReadChannels.size();
+          memoryReadChannels.push_back(
+              {plan.ordinal, id, anchorPath(plan, owner.anchor),
+               owner.allocation, owner.layout.payloadType,
+               owner.layout.addressType, owner.layout.predicateType});
+        }
+        if (!llvm::is_contained(prepared.memoryReadCaptures,
+                                *proposal.readChannel)) {
+          if (!prepayAppend(budget, access.operation,
+                            prepared.memoryReadCaptures))
+            return failure();
+          prepared.memoryReadCaptures.push_back(*proposal.readChannel);
+        }
       }
       prepared.memoryProposals.push_back(std::move(proposal));
     }
@@ -91,6 +115,53 @@
       const auto &owner = plan.memoryOwners[access.owner];
       auto allocation = owner.allocation;
       auto path = anchorPath(plan, owner.anchor);
+      if (access.kind == ac::TransactionMemoryAccessKind::Read &&
+          !proposal.physicalReuse) {
+        if (!proposal.readChannel ||
+            *proposal.readChannel >= memoryReadChannels.size())
+          return failure();
+        for (unsigned offset = 0; offset < path.size(); ++offset) {
+          auto child = dyn_cast_or_null<ac::ModuleOp>(
+              hardware.resolveCallee(path[offset]));
+          if (!child)
+            return failure();
+          auto &definition = routing(child);
+          if (definition.memoryReadOutputIndex.contains(*proposal.readChannel))
+            continue;
+          auto suffix = ArrayRef<ac::InstanceOp>(path).drop_front(offset + 1);
+          ac::HardwareBindings bindings;
+          bindings.owner = child;
+          for (auto edge : suffix) {
+            auto next = hardware.bindInstance(edge, bindings);
+            if (failed(next))
+              return failure();
+            bindings = *next;
+          }
+          auto payloadType = hardware.resolveType(
+              allocation
+                  .getResult(owner.layout.dataResult(access.port))
+                  .getType(),
+              bindings, access.operation);
+          auto addressType = hardware.resolveType(
+              allocation
+                  .getOperand(owner.layout.readAddressOperands[access.port])
+                  .getType(),
+              bindings, access.operation);
+          auto predicateType = hardware.resolveType(
+              allocation.getOperand(0).getType(), bindings,
+              access.operation);
+          if (failed(payloadType) || failed(addressType) ||
+              failed(predicateType) ||
+              !charge(budget, access.operation, 24))
+            return failure();
+          definition.memoryReadOutputIndex.try_emplace(
+              *proposal.readChannel, definition.memoryReadOutputs.size());
+          definition.memoryReadOutputs.push_back(
+              {*proposal.readChannel,
+               SmallVector<ac::InstanceOp>(suffix), *payloadType,
+               *addressType, *predicateType});
+        }
+      }
       for (unsigned offset = 0; offset < path.size(); ++offset) {
         auto child = dyn_cast_or_null<ac::ModuleOp>(hardware.resolveCallee(path[offset]));
         if (!child) return failure();

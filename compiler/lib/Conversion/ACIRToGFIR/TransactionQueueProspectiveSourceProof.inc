@@ -264,7 +264,9 @@
       auto *routes = inventory(module);
       auto *preparedDefinition = definition(module);
       if (!routes || !preparedDefinition) return failure();
-      uint64_t input = preparedDefinition->sourceInputs + 2 * preparedDefinition->downward.size();
+      uint64_t input = preparedDefinition->sourceInputs +
+                       2 * preparedDefinition->downward.size() +
+                       2 * preparedDefinition->memoryReadOutputs.size();
       auto target = cast<ac::ModuleOp>(candidate.packageMap.lookup(module.operator->()));
       for (const auto &route : routes->incoming) {
         if (!charge(budget, queue)) return failure();
@@ -390,7 +392,9 @@
         auto *childDefinition = definition(child);
         if (!childRoutes || !childDefinition) return failure();
         auto actual = cast<ac::InstanceOp>(candidate.packageMap.lookup(allocation.operator->()));
-        uint64_t input = allocation->getNumOperands() + 2 * childDefinition->downward.size();
+        uint64_t input = allocation->getNumOperands() +
+                         2 * childDefinition->downward.size() +
+                         2 * childDefinition->memoryReadOutputs.size();
         for (const auto &route : childRoutes->incoming) {
           if (!route.push) {
             SmallVector<ac::InstanceOp> path{allocation};

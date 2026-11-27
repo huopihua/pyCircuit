@@ -209,8 +209,8 @@ FailureOr<std::string> systemSimulationTop(HardwareEmitContext &context,
                                            ac::ModuleOp root,
                                            StringRef wrapper) {
   auto controls = systemControls(root);
-  auto plan = observationEmissionPlan(context);
-  if (failed(controls) || failed(plan))
+  const auto &plan = context.observationPlan();
+  if (failed(controls))
     return failure();
   auto samples = ac::getSystemSamples(root);
   if (failed(samples))
@@ -243,7 +243,7 @@ FailureOr<std::string> systemSimulationTop(HardwareEmitContext &context,
     std::string instance, name;
   };
   SmallVector<ReportOutput> reports;
-  for (const auto &occurrence : plan->occurrences) {
+  for (const auto &occurrence : plan.occurrences) {
     if (!occurrence.site.gauge)
       continue;
     auto observe = cast<ac::SourceObserveOp>(occurrence.site.op);
@@ -326,23 +326,23 @@ FailureOr<std::string> systemSimulationTop(HardwareEmitContext &context,
     SmallVector<uint64_t> widths;
   };
   SmallVector<ObservationGroup> groups;
-  for (size_t begin = 0; begin < plan->occurrences.size();) {
-    const auto &first = plan->occurrences[begin];
+  for (size_t begin = 0; begin < plan.occurrences.size();) {
+    const auto &first = plan.occurrences[begin];
     auto observe = cast<ac::SourceObserveOp>(first.site.op);
     const size_t size = std::max<size_t>(1, observe.getValues().size());
-    if (first.site.valueIndex != 0 || size > plan->occurrences.size() - begin ||
+    if (first.site.valueIndex != 0 || size > plan.occurrences.size() - begin ||
         (first.site.gauge && size != 1))
       return observe.emitOpError() << "observation group layout is incomplete";
     ObservationGroup group{begin, size, {}, {}};
     for (size_t index = 0; index < size; ++index) {
-      const auto &lane = plan->occurrences[begin + index];
+      const auto &lane = plan.occurrences[begin + index];
       if (lane.site.op != first.site.op || lane.path != first.path ||
           lane.site.valueIndex != index ||
           lane.site.carriesValue != !observe.getValues().empty() ||
           lane.site.gauge != first.site.gauge)
         return observe.emitOpError()
                << "observation group layout is inconsistent";
-      auto hierarchy = observationHierarchy(*plan, lane);
+      auto hierarchy = observationHierarchy(plan, lane);
       auto width = observationPayloadWidth(context, lane);
       if (failed(hierarchy) || failed(width))
         return failure();
@@ -388,7 +388,7 @@ FailureOr<std::string> systemSimulationTop(HardwareEmitContext &context,
     for (size_t index = 1; index < group.size; ++index)
       out << "          if (" << signal(group.addresses[index], "valid")
           << " !== " << signal(first, "valid") << ") accepted = 1'b0;\n";
-    if (plan->occurrences[group.begin].site.gauge)
+    if (plan.occurrences[group.begin].site.gauge)
       out << "          if ($isunknown(" << signal(first, "value")
           << ")) accepted = 1'b0;\n";
     out << "          if (" << signal(first, "valid") << " === 1'b1)\n"
@@ -440,7 +440,7 @@ FailureOr<std::string> systemSimulationTop(HardwareEmitContext &context,
   }
   out << "  task automatic pyc_publish_observations;\n    begin\n";
   for (const auto &group : groups) {
-    const auto &occurrence = plan->occurrences[group.begin];
+    const auto &occurrence = plan.occurrences[group.begin];
     auto observe = cast<ac::SourceObserveOp>(occurrence.site.op);
     auto identity = observe->getAttrOfType<DictionaryAttr>("ac.observation_id");
     if (!identity)
@@ -765,41 +765,28 @@ FailureOr<FinalVerilogSourceParts>
 emitVerilogSourceParts(ModuleOp package, ac::HardwareAnalysis &analysis,
                        bool physical) {
   HardwareEmitContext context(package, analysis, physical);
-  const bool system = context.isSystem();
   if (failed(context.prepareNativeChecks()))
     return failure();
-  if (failed(analysis.verifySourceCheckPlan(context.sourceChecks())))
+  return emitPreparedVerilogSourceParts(context);
+}
+FailureOr<FinalVerilogSourceParts>
+emitPreparedVerilogSourceParts(HardwareEmitContext &context) {
+  auto package = context.package;
+  auto &analysis = context.analysis;
+  const bool system = context.isSystem();
+  if (failed(context.verifyPreparedPackage()))
     return failure();
   auto root = rootModule(context);
   if (failed(root))
     return failure();
-  llvm::DenseSet<Operation *> reachable;
-  SmallVector<ac::ModuleOp> pending{*root};
-  while (!pending.empty()) {
-    auto definition = pending.pop_back_val();
-    if (!reachable.insert(definition).second)
-      continue;
-    for (Operation &operation : definition.getBody().front()) {
-      Operation *callee = nullptr;
-      if (auto instance = dyn_cast<ac::InstanceOp>(operation))
-        callee = analysis.resolveCallee(instance);
-      else if (auto collection = dyn_cast<ac::CollectionOp>(operation))
-        callee = analysis.resolveCallee(collection);
-      if (auto child = dyn_cast_or_null<ac::ModuleOp>(callee))
-        pending.push_back(child);
-    }
-  }
-  auto unsupported = package.walk([&](Operation *op) {
+  for (HardwareDefinitionId id : context.rootReachableDefinitions()) {
+    const auto &definition = context.definitionPlan(id);
     // Reachable assertions already belong to the verified source-check plan;
     // an assertion in an unselected definition does not add a root lifecycle.
-    if (!isa<ac::SourceObserveOp>(op) || system ||
-        !reachable.contains(op->getParentOfType<ac::ModuleOp>()))
-      return WalkResult::advance();
-    op->emitOpError() << "hardware instrumentation emission is not implemented";
-    return WalkResult::interrupt();
-  });
-  if (unsupported.wasInterrupted())
-    return failure();
+    if (!system && !definition.observations.empty())
+      return definition.observations.front()->emitOpError()
+             << "hardware instrumentation emission is not implemented";
+  }
   FinalVerilogSourceParts parts;
   auto portMap = context.rootPortMap();
   if (failed(portMap))
@@ -807,25 +794,7 @@ emitVerilogSourceParts(ModuleOp package, ac::HardwareAnalysis &analysis,
   parts.portMap = std::move(*portMap);
   parts.sourceCheckCount = context.sourceChecks().checks.size();
   parts.rootRtlName = "pyc_root";
-  llvm::StringSet<> standard;
-  package.walk([&](ac::InstanceOp instance) {
-    if (!ac::isQueueInstance(instance))
-      return;
-    const std::string path = "include/verilog/fifo.v";
-    if (standard.insert(path).second)
-      parts.standardSources.push_back(path);
-  });
-  for (auto imported : package.getOps<ac::ModuleImportOp>()) {
-    auto kind = analysis.getPrimitiveKind(imported);
-    if (kind.empty())
-      return imported.emitOpError()
-             << "unresolved module import in RTL emitter";
-    if (kind == "fifo_local" || kind == "fifo_downstream_pop")
-      continue;
-    std::string path = "include/verilog/" + kind.str() + ".v";
-    if (standard.insert(path).second)
-      parts.standardSources.push_back(path);
-  }
+  llvm::append_range(parts.standardSources, context.standardRtlSources());
   RtlPackageDependencies dependencies;
   context.rtlPackage = &dependencies;
   auto emitError = [&] { return package.emitOpError(); };
@@ -879,11 +848,14 @@ LogicalResult emitVerilog(ModuleOp package, ac::HardwareAnalysis &analysis,
   auto parts = emitVerilogSourceParts(package, analysis, physical);
   if (failed(parts))
     return failure();
-  out << parts->core;
-  for (auto &group : parts->sourceGroups)
-    out << group.text;
-  out << parts->runtimeGlue;
-  out << parts->simulationTop;
+  renderVerilogSourceParts(*parts, out);
   return success();
+}
+void renderVerilogSourceParts(const FinalVerilogSourceParts &parts,
+                              raw_ostream &out) {
+  out << parts.core;
+  for (const auto &group : parts.sourceGroups)
+    out << group.text;
+  out << parts.runtimeGlue << parts.simulationTop;
 }
 } // namespace acir::compiler

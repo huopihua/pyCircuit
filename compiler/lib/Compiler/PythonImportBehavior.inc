@@ -295,7 +295,8 @@ LogicalResult Importer::matchStatement(const AstNode &statement, OpBuilder &at,
       BranchEnvironment yes = environment, no = environment;
       if (failed(emitArm(arm.originalSite, thenAt, yes)) ||
           failed(lower(index + 1, elseAt, no))) return failure();
-      auto joined = joinBranches(*predicate, environment, yes, no, arm.originalSite,
+      auto joined = joinBranches(*predicate, std::move(environment), yes, &no,
+                                  arm.originalSite,
                                   at, ownerSymbol, branch);
       if (failed(joined)) return failure();
       environment = std::move(*joined);
@@ -365,7 +366,7 @@ LogicalResult Importer::matchStatement(const AstNode &statement, OpBuilder &at,
     if (failed(condition))
       return failure();
     auto joined =
-        joinBranches(*condition, joinIncoming, environments[i], fallback,
+        joinBranches(*condition, joinIncoming, environments[i], &fallback,
                      (*syntax)[i].originalSite, at, ownerSymbol);
     if (failed(joined))
       return failure();
@@ -1122,11 +1123,9 @@ LogicalResult Importer::reserveSourceEnvironmentCopies(
             TableQueryBudget::add(charge, TableQueryResource::Work,
                                   2 * branchCopies);
   } else {
-    for (const auto &entry : incoming.boundaries) {
-      if (failed(chargeLoopDescriptorWork(site, "join boundary measurement")) ||
-          failed(binding(entry.first(), entry.second, 1)))
-        return failure();
-    }
+    // joinBranches takes ownership of the incoming inventory. Existing values,
+    // writes and boundaries are overwritten in place; only genuinely new
+    // declaration and result keys retain storage beyond the arm snapshots.
     for (const auto *branch : {yes, no})
       for (const auto &entry : branch->boundaries) {
         if (failed(
@@ -1154,24 +1153,20 @@ LogicalResult Importer::reserveSourceEnvironmentCopies(
         return failure();
       if (!no->values.contains(entry.first()))
         continue;
-      key(entry.first(), 1);
       auto yesBoundary = yes->boundaries.find(entry.first());
       auto noBoundary = no->boundaries.find(entry.first());
       bool declared =
           (yesBoundary != yes->boundaries.end() &&
            yesBoundary->second.declared) ||
           (noBoundary != no->boundaries.end() && noBoundary->second.declared);
+      if (hasUnchangedIncomingBinding(entry.first(), incoming, *yes, *no) ||
+          incoming.values.contains(entry.first()))
+        continue;
+      key(entry.first(), 1);
       if (!incoming.boundaries.contains(entry.first()) && !declared &&
           failed(freshBinding(entry.first(), entry.first(), site, 1)))
         return failure();
     }
-    for (const auto &entry : incoming.writes) {
-      if (failed(chargeLoopDescriptorWork(site, "join write measurement")))
-        return failure();
-      key(entry.first(), 1);
-    }
-    fits &= TableQueryBudget::add(charge, TableQueryResource::Slots, 2) &&
-            TableQueryBudget::add(charge, TableQueryResource::Work, 2);
   }
   std::string reason;
   if (!fits || !queryBudget.reserve(charge, reason)) {
@@ -1603,7 +1598,8 @@ LogicalResult Importer::loopStatements(const AstNode &parent, StringRef field,
         return failure();
       start = previous();
       auto joined =
-          joinBranches(*predicate, environment, yes, no, statement, at, symbol);
+          joinBranches(*predicate, std::move(environment), yes, &no, statement,
+                       at, symbol);
       if (failed(joined) ||
           failed(auditLoopStatement(*at.getInsertionBlock(), start,
                                     *joinEnvelope, statement, "join")))
@@ -2267,6 +2263,114 @@ Importer::validateModuleStatement(const AstNode &statement,
   return visit(visit, statement, false);
 }
 
+FailureOr<llvm::ArrayRef<StringRef>>
+Importer::assignedRoots(const AstNode &node) {
+  std::string reason;
+  TableQueryCharge lookupCharge;
+  if (!TableQueryBudget::add(lookupCharge, TableQueryResource::Work, 1) ||
+      !queryBudget.reserve(lookupCharge, reason))
+    return mlir::emitError(node.location(b.getContext(), source.path))
+           << "source branch write-set: "
+           << (reason.empty() ? "descriptor work budget exhausted" : reason);
+  if (auto found = branchAssignedRoots.find(node.value);
+      found != branchAssignedRoots.end())
+    return llvm::ArrayRef<StringRef>(found->second);
+
+  llvm::StringSet<> assigned;
+  auto insert = [&](StringRef name, const AstNode &site) -> LogicalResult {
+    if (name.empty() || assigned.contains(name))
+      return success();
+    TableQueryCharge bindingCharge;
+    bool fits =
+        TableQueryBudget::add(bindingCharge, TableQueryResource::Slots, 8) &&
+        TableQueryBudget::add(bindingCharge, TableQueryResource::Work, 1) &&
+        TableQueryBudget::add(bindingCharge,
+                              TableQueryResource::ConstantBytes, name.size());
+    if (!fits || !queryBudget.reserve(bindingCharge, reason))
+      return mlir::emitError(site.location(b.getContext(), source.path))
+             << "source branch write-set binding: "
+             << (fits ? reason : "binding storage counter exhausted");
+    assigned.insert(name);
+    return success();
+  };
+  std::function<LogicalResult(const AstNode &, bool)> visit =
+      [&](const AstNode &current, bool root) -> LogicalResult {
+    if (!current || current.kind() == "FunctionDef" ||
+        current.kind() == "Lambda" || current.kind() == "ClassDef")
+      return success();
+    bool branch = current.kind() == "If" || current.kind() == "Match" ||
+                  current.kind() == "For";
+    if (branch && !root) {
+      auto nested = assignedRoots(current);
+      if (failed(nested))
+        return failure();
+      for (StringRef name : *nested)
+        if (failed(insert(name, current)))
+          return failure();
+      return success();
+    }
+    if (!root) {
+      TableQueryCharge visitCharge;
+      if (!TableQueryBudget::add(visitCharge, TableQueryResource::Work, 1) ||
+          !queryBudget.reserve(visitCharge, reason))
+        return mlir::emitError(
+                   current.location(b.getContext(), source.path))
+               << "source branch write-set: "
+               << (reason.empty() ? "descriptor work budget exhausted"
+                                  : reason);
+    }
+    auto mark = [&](const AstNode &target) -> LogicalResult {
+      return forEachAssignmentLeaf(
+          target, [&](const AstNode &leaf) -> LogicalResult {
+            return insert(assignmentRoot(leaf), leaf);
+          });
+    };
+    if (current.kind() == "Assign") {
+      for (size_t i = 0; i < current.array("targets").size(); ++i)
+        if (failed(mark(current.item("targets", i))))
+          return failure();
+    } else if (current.kind() == "AnnAssign" ||
+               current.kind() == "AugAssign" || current.kind() == "For") {
+      if (failed(mark(current.child("target"))))
+        return failure();
+    }
+    for (StringRef field : {"body", "orelse", "cases"}) {
+      auto statements = current.array(field);
+      for (size_t i = 0; statements && i < statements.size(); ++i)
+        if (failed(visit(current.item(field, i), false)))
+          return failure();
+    }
+    return success();
+  };
+  if (failed(visit(node, true)))
+    return failure();
+
+  const uint64_t count = assigned.size();
+  TableQueryCharge cacheCharge;
+  bool fits =
+      TableQueryBudget::add(cacheCharge, TableQueryResource::Slots, 16) &&
+      TableQueryBudget::addProduct(cacheCharge, TableQueryResource::Slots,
+                                   count, 2) &&
+      TableQueryBudget::add(cacheCharge, TableQueryResource::Work, 1);
+  if (count > 1)
+    fits &= TableQueryBudget::addProduct(
+        cacheCharge, TableQueryResource::Work, count,
+        uint64_t(llvm::Log2_64_Ceil(count)));
+  if (!fits || !queryBudget.reserve(cacheCharge, reason))
+    return mlir::emitError(node.location(b.getContext(), source.path))
+           << "source branch write-set cache: "
+           << (fits ? reason : "cache storage counter exhausted");
+  SmallVector<StringRef, 0> ordered;
+  ordered.reserve(count);
+  for (const auto &name : assigned)
+    ordered.push_back(b.getStringAttr(name.getKey()).getValue());
+  llvm::sort(ordered);
+  auto [cached, inserted] =
+      branchAssignedRoots.try_emplace(node.value, std::move(ordered));
+  assert(inserted && "source branch write-set published twice");
+  return llvm::ArrayRef<StringRef>(cached->second);
+}
+
 LogicalResult
 Importer::moduleStatement(const ModuleDecl &decl, size_t ordinal, OpBuilder &at,
                           llvm::StringMap<Value> &values,
@@ -2371,17 +2475,22 @@ LogicalResult Importer::ifStatement(
   if (failed(predicate))
     return failure();
   if (transactional) {
-    // Source captures retain their declaration authority before any arm copies.
-    // Ordinary Module entries seed their boundaries in moduleStatement instead.
-    for (const auto &binding : environment.values) {
-      if (environment.boundaries.contains(binding.first()))
+    // Only bindings that an arm may replace need an entry contract. Read-only
+    // captures keep the same SSA in both copies and pass through the join.
+    auto assigned = assignedRoots(statement);
+    if (failed(assigned))
+      return failure();
+    for (StringRef name : *assigned) {
+      auto binding = environment.values.find(name);
+      if (binding == environment.values.end() ||
+          environment.boundaries.contains(name))
         continue;
       TableQueryCharge charge;
       bool fits = TableQueryBudget::add(charge, TableQueryResource::Slots, 16) &&
                   TableQueryBudget::add(charge, TableQueryResource::Work, 2) &&
                   TableQueryBudget::addProduct(
                       charge, TableQueryResource::ConstantBytes, 2,
-                      binding.first().size());
+                      name.size());
       for (const AstStep &step : statement.path)
         fits &= TableQueryBudget::add(charge, TableQueryResource::Slots, 8) &&
                 TableQueryBudget::add(charge, TableQueryResource::Work, 1) &&
@@ -2391,8 +2500,8 @@ LogicalResult Importer::ifStatement(
         return mlir::emitError(statement.location(b.getContext(), source.path))
                << "source branch capture binding: "
                << (fits ? reason : "binding storage counter exhausted");
-      environment.boundaries[binding.first()] =
-          inferredBoundary(binding.first(), binding.second, statement);
+      environment.boundaries[name] =
+          inferredBoundary(name, binding->second, statement);
     }
   }
   // Keep the existing transaction empty-else optimization and ordinary copy
@@ -2446,8 +2555,10 @@ LogicalResult Importer::ifStatement(
   if (transactional &&
       failed(reserveSourceEnvironmentCopies(statement, environment, &yes, &no)))
     return failure();
-  auto joined = joinBranches(*predicate, environment, yes, no, statement, at,
-                              context.symbol, branch);
+  auto joined = joinBranches(
+      *predicate, std::move(environment), yes,
+      unchangedElse ? nullptr : &*materializedElse, statement, at,
+      context.symbol, branch);
   if (failed(joined))
     return failure();
   environment = std::move(*joined);

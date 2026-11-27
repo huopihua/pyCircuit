@@ -14,6 +14,7 @@ class HardwareAnalysis;
 }
 
 namespace acir::ac::detail {
+class SourceCheckBudget;
 /// Stage policy for the shared bounded package-check pipeline. The policy
 /// changes admission, not the source-check builder's ordering or lifetime.
 struct PackageStagePolicy {
@@ -50,6 +51,6 @@ verifyHardwarePackageStage(const HardwareAnalysis &analysis,
 mlir::LogicalResult
 verifyHardwarePackageEnvelope(
     const HardwareAnalysis &analysis, const PackageStagePolicy &policy,
-    const std::function<mlir::LogicalResult(uint64_t, mlir::Operation *)> &debit);
+    SourceCheckBudget &budget);
 } // namespace acir::ac::detail
 #endif

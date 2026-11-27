@@ -245,7 +245,7 @@ def main():
                     "entry_source": {"package": PACKAGE, "path": source_name + ".py"},
                     "source_checks": 3,
                     "system_samples": [],
-                    "needs_four_state": True,
+                    "needs_four_state": False,
                     "reset_semantics": "strict",
                 }
             else:

@@ -2,17 +2,17 @@
 
 #include "ACIRSourceContracts.h"
 #include "HardwareSourceChecks.h"
-#include "SourceTransactionSummary.h"
 #include "SourceFormalCandidateSelection.h"
 #include "SourceFormalProposalProof.h"
+#include "SourceTransactionSummary.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Verifier.h"
 #include "pycircuit/Dialect/ACIR/SourceMethodAnalysis.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/APSInt.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/STLExtras.h"
 #include <limits>
@@ -46,29 +46,61 @@ InFlightDiagnostic boundedError(Operation *site) {
 
 class StateAnalysisBudget {
 public:
-  explicit StateAnalysisBudget(uint64_t initialWork = 0) : work(initialWork) {}
+  explicit StateAnalysisBudget(uint64_t initialWork = 0)
+      : scopeWork(initialWork), peakWork(initialWork),
+        storageWork(initialWork) {}
 
-  uint64_t usedWork() const { return work; }
-  void setPhase(StringRef name) { phase = name; }
+  class LocalScope {
+  public:
+    explicit LocalScope(StateAnalysisBudget &budget)
+        : budget(budget), parentWork(budget.scopeWork) {
+      budget.scopeWork = 0;
+    }
+    ~LocalScope() { budget.scopeWork = parentWork; }
+    LocalScope(const LocalScope &) = delete;
+    LocalScope &operator=(const LocalScope &) = delete;
+
+  private:
+    StateAnalysisBudget &budget;
+    uint64_t parentWork;
+  };
+
+  uint64_t usedWork() const { return std::max(peakWork, storageWork); }
+  uint64_t currentScopeWork() const { return scopeWork; }
+  bool isExhausted() const { return exhausted; }
+  void setPhase(StringRef name) {
+    phase = name;
+    phaseStorageStart = storageWork;
+  }
 
   bool charge(Operation *site, uint64_t units = 1) {
     if (exhausted)
       return false;
-    if (units > maxWork - work) {
+    if (units > maxWork - scopeWork) {
       boundedError(site) << "transaction state analysis work budget exceeded"
-                         << " (requested " << units << ", used " << work
+                         << " (requested " << units << ", used " << scopeWork
                          << ", limit " << maxWork << ", phase " << phase
                          << ", operation " << site->getName().getStringRef()
                          << ")";
       exhausted = true;
       return false;
     }
-    work += units;
+    scopeWork += units;
+    peakWork = std::max(peakWork, scopeWork);
     return true;
   }
 
   template <typename T> bool chargeStorage(Operation *site, uint64_t count) {
     // A(n,T) = n * (1 + ceil(sizeof(T)/8)), saturating before allocation.
+    constexpr uint64_t units = 1 + (sizeof(T) + 7) / 8;
+    return chargePersistentStorage(site, saturatedMultiply(count, units));
+  }
+
+  template <typename T>
+  bool chargeTemporaryStorage(Operation *site, uint64_t count) {
+    // Builder scratch is bounded by the active transaction/invocation scope,
+    // but it is released before the next occurrence and must not accumulate in
+    // the package-wide frozen-plan storage total.
     constexpr uint64_t units = 1 + (sizeof(T) + 7) / 8;
     return charge(site, saturatedMultiply(count, units));
   }
@@ -90,8 +122,9 @@ public:
     spare = spare > additional ? spare - additional : 0;
     uint64_t bytes =
         saturatedMultiply(spare, sizeof(typename Vector::value_type));
-    uint64_t fee = saturatedAdd(storage.size(), bytes / 8 + (bytes % 8 != 0));
-    if (!charge(site, fee))
+    uint64_t storageFee = bytes / 8 + (bytes % 8 != 0);
+    if (!charge(site, storage.size()) ||
+        !chargePersistentStorage(site, storageFee))
       return false;
     storage.reserve(capacity);
     return true;
@@ -113,6 +146,47 @@ public:
     if (count > std::numeric_limits<unsigned>::max() || !charge(site) ||
         (capacity > oldCapacity &&
          (!chargeStorage<Bucket>(site, capacity - oldCapacity) ||
+          !charge(site, oldCapacity))))
+      return false;
+    storage.reserve(count);
+    return true;
+  }
+
+  template <typename Vector>
+  bool reserveTemporary(Operation *site, Vector &storage,
+                        uint64_t additional) {
+    if (additional > storage.max_size() - storage.size())
+      return charge(site, std::numeric_limits<uint64_t>::max());
+    uint64_t count = storage.size() + additional;
+    if (count <= storage.capacity())
+      return true;
+    uint64_t capacity = std::max(
+        count,
+        std::min(uint64_t(storage.max_size()),
+                 saturatedAdd(saturatedMultiply(storage.capacity(), 2), 1)));
+    uint64_t bytes = saturatedMultiply(
+        capacity - storage.capacity(), sizeof(typename Vector::value_type));
+    uint64_t storageFee = bytes / 8 + (bytes % 8 != 0);
+    if (!charge(site, saturatedAdd(storage.size(), storageFee)))
+      return false;
+    storage.reserve(capacity);
+    return true;
+  }
+
+  template <typename Map>
+  bool reserveTemporaryMapInsert(Operation *site, Map &storage) {
+    using Bucket = typename Map::value_type;
+    uint64_t count = uint64_t(storage.size()) + 1;
+    uint64_t oldCapacity = storage.getMemorySize() / sizeof(Bucket);
+    uint64_t capacity = std::max(uint64_t(64), oldCapacity);
+    while (saturatedMultiply(count, 4) >= saturatedMultiply(capacity, 3)) {
+      if (!charge(site))
+        return false;
+      capacity = saturatedMultiply(capacity, 2);
+    }
+    if (count > std::numeric_limits<unsigned>::max() || !charge(site) ||
+        (capacity > oldCapacity &&
+         (!chargeTemporaryStorage<Bucket>(site, capacity - oldCapacity) ||
           !charge(site, oldCapacity))))
       return false;
     storage.reserve(count);
@@ -173,8 +247,30 @@ public:
   }
 
 private:
+  bool chargePersistentStorage(Operation *site, uint64_t units) {
+    if (exhausted)
+      return false;
+    if (units > maxWork - storageWork) {
+      boundedError(site)
+          << "transaction state analysis persistent storage budget exceeded"
+          << " (requested " << units << ", used " << storageWork << ", limit "
+          << maxWork << ", phase " << phase << ", phase used "
+          << storageWork - phaseStorageStart << ", operation "
+          << site->getName().getStringRef() << ")";
+      exhausted = true;
+      return false;
+    }
+    if (!charge(site, units))
+      return false;
+    storageWork += units;
+    return true;
+  }
+
   static constexpr uint64_t maxWork = 1024 * 1024;
-  uint64_t work = 0;
+  uint64_t scopeWork = 0;
+  uint64_t peakWork = 0;
+  uint64_t storageWork = 0;
+  uint64_t phaseStorageStart = 0;
   StringRef phase = "raw preflight";
   bool exhausted = false;
 };
@@ -243,8 +339,7 @@ private:
       capacity = saturatedMultiply(capacity, 2);
     }
     if (capacity > oldCapacity &&
-        (!budget.chargeStorage<DictionaryAttr>(site,
-                                                capacity - oldCapacity) ||
+        (!budget.chargeStorage<DictionaryAttr>(site, capacity - oldCapacity) ||
          !budget.charge(site, oldCapacity)))
       return false;
     if (!budget.charge(site, 2))
@@ -257,7 +352,7 @@ private:
   bool check(Operation *site, Node root) {
     auto known = summaries.find(root);
     if (known != summaries.end())
-      return budget.charge(site, known->second.nativeWork);
+      return budget.charge(site);
     SmallVector<Frame, 0> stack;
     // The separate native fee adds one word to both memo rows and DFS frames.
     if (!budget.charge(site, 4))
@@ -383,7 +478,11 @@ private:
       summaries.try_emplace(child);
       stack.push_back({child, {}, 0, 1, 1, 0, false});
     }
-    return budget.charge(site, summaries.find(root)->second.nativeWork);
+    // The DFS above pays its actual memo, edge and payload work and computes
+    // expandedWork before native verification. Do not additionally prepay a
+    // predicted second traversal: mlir::verify below is the consumer that
+    // performs it. Hostile shared DAGs still fail addWork before that call.
+    return budget.charge(site);
   }
 
   static constexpr uint64_t maxExpandedWork = 1024 * 1024;
@@ -399,7 +498,126 @@ struct PackageInventory {
   llvm::DenseMap<Operation *, uint64_t> operationCosts;
   llvm::DenseMap<Operation *, uint64_t> moduleCosts;
   llvm::DenseMap<Attribute, uint64_t> methodCosts;
+  /// Definition-owned declaration index. A null value marks an ambiguous
+  /// duplicate name so lookup preserves the old fail-closed diagnostic.
+  llvm::DenseMap<Operation *, llvm::DenseMap<StringAttr, Operation *>>
+      moduleStates;
+  llvm::DenseMap<Operation *, SmallVector<SourceMethodCallOp, 0>>
+      moduleMethodCalls;
 };
+
+LogicalResult buildDefinitionPlans(
+    mlir::ModuleOp package, StateAnalysisBudget &budget,
+    SmallVectorImpl<TransactionDefinitionPlan> &plans,
+    llvm::DenseMap<Operation *, TransactionDefinitionPlanId> &index,
+    llvm::DenseMap<Operation *, TransactionDefinitionPlanId> &operationIndex,
+    uint64_t &summaryBuilds, uint64_t &summaryOperationVisits) {
+  auto append = [&](Operation *callable) -> LogicalResult {
+    if (!budget.chargeStorage<TransactionDefinitionPlan>(callable, 1) ||
+        !budget.reserve(callable, plans, 1) ||
+        !budget.reserveMapInsert(callable, index))
+      return failure();
+    TransactionDefinitionPlan plan;
+    plan.callable = callable;
+    plan.lexicalModule = callable->getParentOfType<ModuleOp>();
+    struct Visit {
+      Operation *operation;
+      unsigned depth;
+    };
+    SmallVector<Visit, 0> pending;
+    if (!budget.chargeStorage<Visit>(callable, 1) ||
+        !budget.reserve(callable, pending, 1))
+      return failure();
+    pending.push_back({callable, 0});
+    while (!pending.empty()) {
+      auto [operation, depth] = pending.pop_back_val();
+      ++summaryOperationVisits;
+      if (depth > maxDepth)
+        return boundedError(operation)
+               << "transaction definition plan depth budget exceeded";
+      if (!budget.charge(operation) ||
+          !budget.chargeStorage<Operation *>(operation, 1) ||
+          !budget.reserve(operation, plan.operations, 1))
+        return failure();
+      plan.operations.push_back(operation);
+      plan.readCount += isa<SourceStateReadOp>(operation);
+      plan.writeCount += isa<SourceStateWriteOp>(operation);
+      plan.formalWriteCount += isa<SourceFormalWriteOp>(operation);
+      plan.callCount += isa<SourceMethodCallOp>(operation);
+      plan.bodyCheckCount += isa<SourceExpectOp>(operation);
+      plan.observationCount += isa<SourceObserveOp>(operation);
+      if (auto branch = dyn_cast<SourceBranchOp>(operation)) {
+        ++plan.branchCount;
+        plan.branchResultCount += branch.getNumResults();
+      }
+      bool effectful =
+          isa<SourceMethodCallOp, SourceExpectOp, SourceObserveOp,
+              SourceQueuePopOp, SourceQueuePeekOp, SourceQueuePushOp>(
+              operation) ||
+          operation->hasAttr("ac.loop_continuation");
+      if (auto branch = dyn_cast<SourceBranchOp>(operation)) {
+        if (!budget.reserveMapInsert(operation, plan.branchSelections))
+          return failure();
+        plan.branchSelections.try_emplace(branch, effectful);
+      }
+      if (effectful) {
+        Operation *ancestor = operation;
+        while ((ancestor = ancestor->getParentOp()) && ancestor != callable) {
+          if (!budget.charge(operation))
+            return failure();
+          if (auto branch = dyn_cast<SourceBranchOp>(ancestor)) {
+            auto found = plan.branchSelections.find(branch);
+            if (found == plan.branchSelections.end()) {
+              if (!budget.reserveMapInsert(operation, plan.branchSelections))
+                return failure();
+              plan.branchSelections.try_emplace(branch, true);
+            } else {
+              found->second = true;
+            }
+          }
+        }
+      }
+      for (Region &region : llvm::reverse(operation->getRegions()))
+        for (Block &block : llvm::reverse(region))
+          for (Operation &child : llvm::reverse(block)) {
+            if (!budget.chargeStorage<Visit>(operation, 1) ||
+                !budget.reserve(operation, pending, 1))
+              return failure();
+            pending.push_back({&child, depth + 1});
+          }
+    }
+    for (const auto &selection : plan.branchSelections)
+      plan.selectionCount += selection.second;
+    TransactionDefinitionPlanId id = plans.size();
+    for (Operation *operation : plan.operations) {
+      // Static definition identity is queried only for semantic records and
+      // branch structure. Pure expression nodes stay in the frozen operation
+      // inventory but need no second package-wide hash entry.
+      if (!isa<SourceTransactionOp, SourceMethodOp, SourceBranchOp,
+               SourceMethodCallOp, SourceStateReadOp, SourceStateWriteOp,
+               SourceFormalWriteOp, SourceExpectOp, SourceObserveOp,
+               SourceQueuePopOp, SourceQueuePeekOp, SourceQueuePushOp>(
+              operation) &&
+          !operation->hasAttr("ac.loop_continuation"))
+        continue;
+      if (!budget.reserveMapInsert(operation, operationIndex))
+        return failure();
+      if (!operationIndex.try_emplace(operation, id).second)
+        return operation->emitOpError()
+               << "transaction operation belongs to multiple definition plans";
+    }
+    plans.push_back(std::move(plan));
+    index.try_emplace(callable, id);
+    ++summaryBuilds;
+    return success();
+  };
+  for (auto module : package.getOps<ModuleOp>())
+    for (Operation &operation : module.getBody().front())
+      if (isa<SourceTransactionOp, SourceMethodOp>(operation) &&
+          failed(append(&operation)))
+        return failure();
+  return success();
+}
 
 LogicalResult preflight(mlir::ModuleOp package, StateAnalysisBudget &budget,
                         PackageInventory &inventory) {
@@ -414,11 +632,23 @@ LogicalResult preflight(mlir::ModuleOp package, StateAnalysisBudget &budget,
   Operation *scopeOwner = nullptr;
   llvm::DenseMap<Type, bool> scopedTypes;
   uint64_t nativeTypeCapacity = 0;
+  // Each package declaration is an independently frozen definition/system
+  // inventory.  Keep shared attribute/type memo storage package-wide, but do
+  // not make an unrelated preceding declaration consume the bounded traversal
+  // allowance of the next definition.  The depth-first pending order keeps a
+  // complete declaration subtree contiguous, so replacing this scope at depth
+  // one cannot hide work within a definition.
+  std::unique_ptr<StateAnalysisBudget::LocalScope> declarationBudget;
   if (!budget.charge(package))
     return failure();
   pending.push_back({package, nullptr, 0});
   while (!pending.empty()) {
     auto [op, module, depth] = pending.pop_back_val();
+    if (depth == 1) {
+      declarationBudget.reset();
+      declarationBudget =
+          std::make_unique<StateAnalysisBudget::LocalScope>(budget);
+    }
     if (depth > maxDepth)
       return boundedError(op)
              << "transaction state analysis structural depth exceeded";
@@ -428,7 +658,7 @@ LogicalResult preflight(mlir::ModuleOp package, StateAnalysisBudget &budget,
       // ModuleOp's native scope verifier owns one immutable root memo per
       // definition. Clearing this pricing memo preserves that authority cut.
       if (!budget.charge(op, scopedTypes.getMemorySize() /
-                                sizeof(decltype(scopedTypes)::value_type)))
+                                 sizeof(decltype(scopedTypes)::value_type)))
         return failure();
       scopedTypes.clear();
       nativeTypeCapacity = 0;
@@ -436,23 +666,30 @@ LogicalResult preflight(mlir::ModuleOp package, StateAnalysisBudget &budget,
     }
     auto checkType = [&](Type type) {
       budget.setPhase("raw type scope");
-      if (!module) return subelements.check(op, type);
-      if (!budget.charge(op)) return false;
-      if (scopedTypes.contains(type)) return true;
-      if (!subelements.check(op, type)) return false;
+      if (!module)
+        return subelements.check(op, type);
+      if (!budget.charge(op))
+        return false;
+      if (scopedTypes.contains(type))
+        return true;
+      if (!subelements.check(op, type))
+        return false;
       // The native DenseSet has its own bucket array for this definition,
       // separate from this retained-capacity pricing map. Pay its complete
       // growth and retained bucket moves before native verification allocates.
       uint64_t capacity = std::max(uint64_t(64), nativeTypeCapacity);
       uint64_t count = uint64_t(scopedTypes.size()) + 1;
       while (saturatedMultiply(count, 4) >= saturatedMultiply(capacity, 3)) {
-        if (!budget.charge(op)) return false;
+        if (!budget.charge(op))
+          return false;
         capacity = saturatedMultiply(capacity, 2);
       }
       if (capacity > nativeTypeCapacity &&
           (!budget.chargeStorage<Type>(op, capacity - nativeTypeCapacity) ||
-           !budget.charge(op, nativeTypeCapacity))) return false;
-      if (!budget.reserveMapInsert(op, scopedTypes)) return false;
+           !budget.charge(op, nativeTypeCapacity)))
+        return false;
+      if (!budget.reserveMapInsert(op, scopedTypes))
+        return false;
       nativeTypeCapacity = capacity;
       scopedTypes.try_emplace(type, true);
       return true;
@@ -461,32 +698,73 @@ LogicalResult preflight(mlir::ModuleOp package, StateAnalysisBudget &budget,
     uint64_t units = 1 + uint64_t(op->getNumOperands()) + op->getNumResults();
     if (!budget.charge(op, units))
       return failure();
-    uint64_t before = budget.usedWork();
-    budget.setPhase("raw attribute dictionaries");
-    if (!subelements.check(op, op->getRawDictionaryAttrs())) return failure();
-    budget.setPhase("raw locations");
-    if (!subelements.check(op, op->getLoc())) return failure();
-    // Property conversion is shallow for the owning operation representation;
-    // prepay its storage before requesting the attribute view. Inherent attrs
-    // stored as properties are absent from the raw discardable dictionary.
-    if (op->getPropertiesStorageSize()) {
-      budget.setPhase("raw property dictionaries");
-      if (!budget.charge(op, op->getPropertiesStorageSize()) ||
-          !subelements.check(op, op->getPropertiesAsAttribute()))
+    uint64_t operationCost = units;
+    {
+      // One operation owns one independently recursive metadata closure.
+      // Structural operation/block inventory remains cumulative, and the
+      // shared memo's storage remains persistent, while an unrelated prior
+      // operation cannot consume this root's recursion allowance.
+      StateAnalysisBudget::LocalScope metadataBudget(budget);
+      budget.setPhase("raw attribute dictionaries");
+      if (!subelements.check(op, op->getRawDictionaryAttrs()))
         return failure();
+      budget.setPhase("raw locations");
+      if (!subelements.check(op, op->getLoc()))
+        return failure();
+      // Property conversion is shallow for the owning operation
+      // representation; prepay its storage before requesting the attribute
+      // view. Inherent attrs stored as properties are absent from the raw
+      // discardable dictionary.
+      if (op->getPropertiesStorageSize()) {
+        budget.setPhase("raw property dictionaries");
+        if (!subelements.check(op, op->getPropertiesAsAttribute()))
+          return failure();
+      }
+      for (Type type : op->getOperandTypes()) {
+        if (!checkType(type))
+          return failure();
+      }
+      for (Type type : op->getResultTypes()) {
+        if (!checkType(type))
+          return failure();
+      }
+      for (Region &region : op->getRegions())
+        for (Block &block : region)
+          for (Type type : block.getArgumentTypes()) {
+            if (!checkType(type))
+              return failure();
+          }
+      operationCost =
+          saturatedAdd(operationCost, budget.currentScopeWork());
     }
-    for (Type type : op->getOperandTypes())
-      if (!checkType(type))
+    inventory.operationCosts[op] = operationCost;
+    if (auto state = dyn_cast<SourceStateOp>(op); state && module) {
+      auto found = inventory.moduleStates.find(module);
+      if (found == inventory.moduleStates.end()) {
+        if (!budget.reserveMapInsert(op, inventory.moduleStates))
+          return failure();
+        found = inventory.moduleStates.try_emplace(module).first;
+      }
+      auto name = state->getAttrOfType<StringAttr>("instance_name");
+      if (!budget.reserveMapInsert(op, found->second))
         return failure();
-    for (Type type : op->getResultTypes())
-      if (!checkType(type))
+      auto [entry, inserted] =
+          found->second.try_emplace(name, state.getOperation());
+      if (!inserted)
+        entry->second = nullptr;
+    }
+    if (auto call = dyn_cast<SourceMethodCallOp>(op); call && module) {
+      auto found = inventory.moduleMethodCalls.find(module);
+      if (found == inventory.moduleMethodCalls.end()) {
+        if (!budget.reserveMapInsert(op, inventory.moduleMethodCalls))
+          return failure();
+        found = inventory.moduleMethodCalls.try_emplace(module).first;
+      }
+      if (!budget.chargeStorage<SourceMethodCallOp>(op, 1) ||
+          !budget.reserve(op, found->second, 1))
         return failure();
-    for (Region &region : op->getRegions())
-      for (Block &block : region)
-        for (Type type : block.getArgumentTypes())
-          if (!checkType(type))
-            return failure();
-    inventory.operationCosts[op] = units + budget.usedWork() - before;
+      found->second.push_back(call);
+    }
     if (auto transaction = dyn_cast<SourceTransactionOp>(op)) {
       if (!module || module->getParentOp() != package)
         return boundedError(transaction)
@@ -568,11 +846,17 @@ struct InvocationResult {
   GuardBoundaryId guard = 0;
 };
 
-// Exact immutable closed type proofs may be shared across occurrence plans of
-// this one unchanged package. Parameter/reference/value/effect facts never are.
-struct ClosedLayoutProofs {
+// Immutable structural facts may be shared across occurrence plans of this one
+// unchanged analysis. Parameter/reference/value/effect facts and proof results
+// never are.
+struct TransactionStructuralFacts {
   llvm::DenseMap<Type, bool> layouts;
   llvm::DenseMap<Type, Type> branches;
+  ArrayRef<TransactionDefinitionPlan> definitions;
+  const llvm::DenseMap<Operation *, TransactionDefinitionPlanId>
+      *definitionIndex = nullptr;
+  const llvm::DenseMap<Operation *, TransactionDefinitionPlanId>
+      *definitionOperationIndex = nullptr;
 };
 
 class TransactionPlanBuilder {
@@ -580,9 +864,12 @@ public:
   TransactionPlanBuilder(mlir::ModuleOp package, StateAnalysisBudget &budget,
                          const PackageInventory &inventory,
                          SourceReceiverProofContext &receiverProof,
-                         ClosedLayoutProofs &closedTypes)
-      : closedLayoutMemo(closedTypes.layouts),
-        closedBranchTypes(closedTypes.branches), package(package),
+                         TransactionStructuralFacts &facts)
+      : closedLayoutMemo(facts.layouts), closedBranchTypes(facts.branches),
+        definitionPlans(facts.definitions),
+        definitionIndex(*facts.definitionIndex),
+        definitionOperationIndex(*facts.definitionOperationIndex),
+        package(package),
         hardware(package), budget(budget), inventory(inventory),
         receiverProof(receiverProof),
         subelements(budget, package.getContext()) {}
@@ -596,8 +883,10 @@ public:
     bindings.owner = logicalRoot.owner = routing;
     if (llvm::hasSingleElement(package.getOps<SystemOp>())) {
       auto selected = detail::resolveHardwareRootBindings(hardware);
-      if (failed(selected)) return failure();
-      if (selected->owner == routing) bindings = *selected;
+      if (failed(selected))
+        return failure();
+      if (selected->owner == routing)
+        bindings = *selected;
     }
     if (!budget.chargeBindings(lexical, bindings) ||
         !budget.chargeBindings(lexical, logicalRoot) ||
@@ -605,41 +894,56 @@ public:
         !budget.reserve(lexical, plan.instances, 1) ||
         !budget.chargeStorage<Attribute>(lexical, registrationPath.size()))
       return failure();
-    plan.instances.push_back({routing, std::nullopt, {},
-                              ArrayAttr::get(package.getContext(), {}), bindings, logicalRoot});
+    plan.instances.push_back({routing,
+                              std::nullopt,
+                              {},
+                              ArrayAttr::get(package.getContext(), {}),
+                              bindings,
+                              logicalRoot});
     SmallVector<Attribute> occurrences;
     if (!budget.reserve(lexical, occurrences, registrationPath.size()))
       return failure();
     for (auto allocation : registrationPath)
       occurrences.push_back(allocation.getOccurrence());
-    auto anchor = descend(0, ArrayAttr::get(package.getContext(), occurrences), lexical);
+    auto anchor =
+        descend(0, ArrayAttr::get(package.getContext(), occurrences), lexical);
     if (failed(anchor) || plan.instances[*anchor].definition != lexical)
       return failure();
-    auto result = lexical.walk([&](SourceMethodCallOp operation) {
+    auto calls = inventory.moduleMethodCalls.find(lexical);
+    if (calls == inventory.moduleMethodCalls.end())
+      return success();
+    for (SourceMethodCallOp operation : calls->second)
       if (!budget.charge(operation) || failed(resolveCall(operation, *anchor)))
-        return WalkResult::interrupt();
-      return WalkResult::advance();
-    });
-    return success(!result.wasInterrupted());
+        return failure();
+    return success();
   }
 
-  FailureOr<TransactionStatePlan> run(SourceTransactionOp transaction,
-      ModuleOp routingModule = {}, ArrayRef<InstanceOp> registrationPath = {}) {
+  FailureOr<TransactionStatePlan>
+  run(SourceTransactionOp transaction, ModuleOp routingModule = {},
+      ArrayRef<InstanceOp> registrationPath = {}) {
     plan.transaction = transaction;
+    auto definition = definitionIndex.find(transaction);
+    if (definition == definitionIndex.end())
+      return transaction.emitOpError()
+             << "transaction has no frozen definition plan";
     plan.lexicalModule = transaction->getParentOfType<ModuleOp>();
     plan.routingModule = routingModule ? routingModule : plan.lexicalModule;
     SmallVector<Attribute> registrationOccurrences;
     for (auto allocation : registrationPath)
       registrationOccurrences.push_back(allocation.getOccurrence());
-    plan.registrationPath = ArrayAttr::get(package.getContext(), registrationOccurrences);
+    plan.registrationPath =
+        ArrayAttr::get(package.getContext(), registrationOccurrences);
     auto registration = getSourceRegistrationEntry(transaction);
-    if (failed(registration)) return failure();
+    if (failed(registration))
+      return failure();
     HardwareBindings rootBindings;
     rootBindings.owner = plan.routingModule;
     if (llvm::hasSingleElement(package.getOps<SystemOp>())) {
       auto selected = detail::resolveHardwareRootBindings(hardware);
-      if (failed(selected)) return failure();
-      if (selected->owner == plan.routingModule) rootBindings = *selected;
+      if (failed(selected))
+        return failure();
+      if (selected->owner == plan.routingModule)
+        rootBindings = *selected;
     }
     HardwareBindings logicalRoot;
     logicalRoot.owner = plan.routingModule;
@@ -654,23 +958,36 @@ public:
                               std::nullopt,
                               {},
                               ArrayAttr::get(package.getContext(), {}),
-                              rootBindings, logicalRoot});
+                              rootBindings,
+                              logicalRoot});
     auto lexicalAnchor = descend(0, plan.registrationPath, transaction);
-    if (failed(lexicalAnchor) || plan.instances[*lexicalAnchor].definition != plan.lexicalModule)
+    if (failed(lexicalAnchor) ||
+        plan.instances[*lexicalAnchor].definition != plan.lexicalModule)
       return failure();
     plan.lexicalAnchor = *lexicalAnchor;
     InvocationFrame root;
     root.transaction = transaction;
+    root.definitionPlan = definition->second;
     root.anchor = *lexicalAnchor;
     root.bindings = plan.instances[*lexicalAnchor].bindings;
     if (*registration) {
-      root.method = (**registration).method;
+      auto method = (**registration).method;
+      auto registeredDefinition = definitionIndex.find(method);
+      if (registeredDefinition == definitionIndex.end())
+        return method.emitOpError()
+               << "registered Method has no frozen definition plan";
+      // The occurrence remains owned by the transaction plan, while its root
+      // invocation executes the registered Method's shared static structure.
+      root.definitionPlan = registeredDefinition->second;
+      root.method = method;
       root.registrationEntry = (**registration).call;
     }
     plan.frames.push_back(std::move(root));
     plan.rootFrame = 0;
-    auto clock = useValue(transaction.getClk(), plan.lexicalAnchor, 0, transaction);
-    auto reset = useValue(transaction.getRst(), plan.lexicalAnchor, 0, transaction);
+    auto clock =
+        useValue(transaction.getClk(), plan.lexicalAnchor, 0, transaction);
+    auto reset =
+        useValue(transaction.getRst(), plan.lexicalAnchor, 0, transaction);
     if (failed(clock) || failed(reset))
       return failure();
     auto domain = getDomain(*clock, *reset, transaction);
@@ -694,38 +1011,50 @@ public:
     SmallVector<BoundValueId> explicitInputs;
     Operation *entry = transaction;
     if (*registration) {
-      if (!budget.chargeStorage<BoundValueId>(transaction,
-              (**registration).argumentCaptureOrdinals.size()) ||
+      if (!budget.chargeStorage<BoundValueId>(
+              transaction, (**registration).argumentCaptureOrdinals.size()) ||
           !budget.reserve(transaction, explicitInputs,
-              (**registration).argumentCaptureOrdinals.size())) return failure();
+                          (**registration).argumentCaptureOrdinals.size()))
+        return failure();
       for (unsigned ordinal : (**registration).argumentCaptureOrdinals)
         explicitInputs.push_back(captures[ordinal]);
       captures.clear();
       auto method = (**registration).method;
       entry = method;
-      if (!budget.chargeStorage<BoundValueId>(transaction, method.getCaptures().size()) ||
+      if (!budget.chargeStorage<BoundValueId>(transaction,
+                                              method.getCaptures().size()) ||
           !budget.reserve(transaction, captures, method.getCaptures().size()) ||
-          !budget.chargeStorage<std::optional<StateOwnerId>>(transaction, explicitInputs.size()) ||
-          !budget.reserve(transaction, plan.frames[0].formalOwners, explicitInputs.size())) return failure();
+          !budget.chargeStorage<std::optional<StateOwnerId>>(
+              transaction, explicitInputs.size()) ||
+          !budget.reserve(transaction, plan.frames[0].formalOwners,
+                          explicitInputs.size()))
+        return failure();
       plan.frames[0].formalOwners.resize(explicitInputs.size());
       for (Value capture : method.getCaptures()) {
-        auto bound = useValue(capture, plan.lexicalAnchor, plan.rootFrame, transaction);
-        if (failed(bound)) return failure();
+        auto bound =
+            useValue(capture, plan.lexicalAnchor, plan.rootFrame, transaction);
+        if (failed(bound))
+          return failure();
         captures.push_back(*bound);
       }
-      if (failed(receiverDomain(plan.lexicalAnchor, transaction))) return failure();
+      if (failed(receiverDomain(plan.lexicalAnchor, transaction)))
+        return failure();
     }
     if (failed(bindArguments(0, entry, explicitInputs, captures)) ||
         failed(event(TransactionStateEventKind::TransactionEnter, 0)))
       return failure();
     auto body = invocation(0, entry, plan.domain, 0);
-    if (failed(body)) return failure();
+    if (failed(body))
+      return failure();
     plan.guard = body->guard;
-    if ((!*registration && body->yielded.size() != transaction.getNumResults()) ||
+    if ((!*registration &&
+         body->yielded.size() != transaction.getNumResults()) ||
         body->yielded.size() < transaction.getNumResults())
-      return transaction.emitOpError() << "registration public result prefix differs";
+      return transaction.emitOpError()
+             << "registration public result prefix differs";
     if (failed(bindResults(transaction->getResults(), plan.lexicalAnchor, 0,
-                           ArrayRef<BoundValueId>(body->yielded).take_front(transaction.getNumResults()),
+                           ArrayRef<BoundValueId>(body->yielded)
+                               .take_front(transaction.getNumResults()),
                            plan.results)) ||
         failed(event(TransactionStateEventKind::TransactionExit, 0)) ||
         !budget.chargeStorage<OwnerVersionBinding>(transaction,
@@ -733,9 +1062,10 @@ public:
         !budget.reserve(transaction, plan.finalVersions, candidates.size()))
       return failure();
     for (auto [owner, version] : llvm::enumerate(candidates))
-      plan.finalVersions.push_back({owner, version});
+      plan.finalVersions.push_back({StateOwnerId(owner), version});
     budget.setPhase("transaction plan validation");
-    if (failed(verifyPlan())) return failure();
+    if (failed(verifyPlan()))
+      return failure();
     return std::move(plan);
   }
 
@@ -749,10 +1079,30 @@ private:
     return method ? method.getOperation() : plan.transaction.getOperation();
   }
 
+  LogicalResult verifyDefinitionIdentity(InvocationFrameId frame,
+                                         Operation *function) {
+    if (frame >= plan.frames.size())
+      return failure();
+    const auto &invocationFrame = plan.frames[frame];
+    if (invocationFrame.definitionPlan >= definitionPlans.size())
+      return failure();
+    const auto &definition = definitionPlans[invocationFrame.definitionPlan];
+    if (definition.callable != function)
+      return function->emitOpError()
+             << "invocation references an invalid frozen definition plan";
+    return success();
+  }
+
   FailureOr<BoundValueId> value(Value original, LexicalInstanceId anchor,
                                 InvocationFrameId frame) {
     if (!budget.charge(plan.transaction))
       return failure();
+    // A published entry has already authenticated this immutable value's
+    // lexical callable and occurrence frame. Most operand uses hit here; do
+    // not rescan the same IR parent chain before consulting the identity map.
+    ValueKey key{original, {anchor, frame}};
+    if (auto found = values.find(key); found != values.end())
+      return found->second;
     Operation *scope = original.getParentBlock()->getParentOp();
     Operation *function = nullptr;
     while (scope && !isa<ModuleOp>(scope)) {
@@ -769,23 +1119,29 @@ private:
                 "invocation";
     if (!function)
       frame = plan.rootFrame;
-    ValueKey key{original, {anchor, frame}};
+    key = ValueKey{original, {anchor, frame}};
     auto found = values.find(key);
     if (found != values.end())
       return found->second;
+    if (function) {
+      if (failed(verifyDefinitionIdentity(frame, function)))
+        return failure();
+    }
     if (!budget.chargeStorage<BoundValueRef>(plan.transaction, 1) ||
         !budget.reserve(plan.transaction, plan.values, 1) ||
-        !budget.chargeStorage<uint8_t>(plan.transaction, 2) ||
-        !budget.reserve(plan.transaction, validityAssigned, 1) ||
-        !budget.reserve(plan.transaction, lexicalValues, 1) ||
-        !budget.reserveMapInsert(plan.transaction, values))
+        !budget.chargeTemporaryStorage<uint8_t>(plan.transaction, 2) ||
+        !budget.reserveTemporary(plan.transaction, validityAssigned, 1) ||
+        !budget.reserveTemporary(plan.transaction, lexicalValues, 1) ||
+        !budget.reserveTemporaryMapInsert(plan.transaction, values))
       return failure();
     BoundValueId id = plan.values.size();
     plan.values.push_back({original, anchor, frame});
     validityAssigned.push_back(false);
     lexicalValues.push_back(!function && original.getDefiningOp() !=
                                              plan.transaction.getOperation());
-    values.try_emplace(key, id);
+    if (!values.try_emplace(key, id).second)
+      return plan.transaction.emitOpError()
+             << "transaction value delta has duplicate identity";
     return id;
   }
 
@@ -803,24 +1159,43 @@ private:
   FailureOr<bool> sourcePathDominates(TransactionSourcePath definition,
                                       TransactionSourcePath use,
                                       Operation *site) {
-    for (unsigned depth = 0; depth <= maxDepth; ++depth) {
-      if (!budget.charge(site))
-        return failure();
-      if ((!definition.branch && definition.whenTrue) ||
-          (!use.branch && use.whenTrue) ||
-          (definition.branch && *definition.branch >= plan.branches.size()) ||
-          (use.branch && *use.branch >= plan.branches.size()))
-        return site->emitOpError() << "invalid transaction source path";
-      if (samePath(definition, use))
-        return true;
-      if (!use.branch)
-        return false;
-      const auto &branch = plan.branches[*use.branch];
-      if (branch.entry.path.branch && *branch.entry.path.branch >= *use.branch)
-        return site->emitOpError() << "cyclic transaction source path";
-      use = branch.entry.path;
+    if (!budget.charge(site, 2))
+      return failure();
+    if ((!definition.branch && definition.whenTrue) ||
+        (!use.branch && use.whenTrue) ||
+        (definition.branch && *definition.branch >= plan.branches.size()) ||
+        (use.branch && *use.branch >= plan.branches.size()))
+      return site->emitOpError() << "invalid transaction source path";
+    if (!definition.branch)
+      return true;
+    BranchId owner = *definition.branch;
+    const auto &branch = plan.branches[owner];
+    if (samePath(definition, use))
+      return true;
+    if (!use.branch)
+      return false;
+    // An enclosing branch receives its final intervals only after both arms
+    // have been built. While it is active, retain the bounded parent-chain
+    // proof used by the original builder.
+    if (!branch.elseEndBranch) {
+      for (unsigned depth = 0; depth <= maxDepth; ++depth) {
+        if (!budget.charge(site))
+          return failure();
+        if (samePath(definition, use))
+          return true;
+        if (!use.branch)
+          return false;
+        const auto &parent = plan.branches[*use.branch].entry.path;
+        if (parent.branch && *parent.branch >= *use.branch)
+          return site->emitOpError() << "cyclic transaction source path";
+        use = parent;
+      }
+      return boundedError(site) << "transaction source path depth exceeded";
     }
-    return boundedError(site) << "transaction source path depth exceeded";
+    BranchId nested = *use.branch;
+    return definition.whenTrue ? nested > owner && nested < branch.thenEndBranch
+                               : nested >= branch.thenEndBranch &&
+                                     nested < branch.elseEndBranch;
   }
 
   // Interning establishes identity. Only the actual definition or an
@@ -941,8 +1316,8 @@ private:
     if (!budget.charge(site))
       return failure();
     const auto &ref = plan.values[id];
-    return hardware.resolveType(ref.value.getType(),
-                                plan.instances[ref.anchor].logicalBindings, site);
+    return hardware.resolveType(
+        ref.value.getType(), plan.instances[ref.anchor].logicalBindings, site);
   }
 
   // A declaration with only literal Bits widths/Table extents and closed
@@ -951,6 +1326,11 @@ private:
   // types. No actual bound/value/effect checks are skipped.
   llvm::DenseMap<Type, bool> &closedLayoutMemo;
   llvm::DenseMap<Type, Type> &closedBranchTypes;
+  ArrayRef<TransactionDefinitionPlan> definitionPlans;
+  const llvm::DenseMap<Operation *, TransactionDefinitionPlanId>
+      &definitionIndex;
+  const llvm::DenseMap<Operation *, TransactionDefinitionPlanId>
+      &definitionOperationIndex;
   FailureOr<bool> closedLayout(Type type, Operation *site, unsigned depth = 0) {
     if (!budget.charge(site) || depth > maxDepth)
       return failure();
@@ -999,10 +1379,12 @@ private:
 
   FailureOr<Type> branchType(Type original, LexicalInstanceId anchor,
                              Operation *site) {
-    if (!budget.charge(site, 2)) return failure();
+    if (!budget.charge(site, 2))
+      return failure();
     auto key = std::make_pair(anchor, original);
     auto found = admittedBranchTypes.find(key);
-    if (found != admittedBranchTypes.end()) return found->second;
+    if (found != admittedBranchTypes.end())
+      return found->second;
     const auto &bindings = plan.instances[anchor].bindings;
     const auto &logicalBindings = plan.instances[anchor].logicalBindings;
     bool share = false;
@@ -1029,8 +1411,10 @@ private:
         });
     if (failed(type) || !budget.reserveMapInsert(site, admittedBranchTypes))
       return failure();
-    auto logical = hardware.resolveType(original, plan.instances[anchor].logicalBindings, site);
-    if (failed(logical)) return failure();
+    auto logical = hardware.resolveType(
+        original, plan.instances[anchor].logicalBindings, site);
+    if (failed(logical))
+      return failure();
     admittedBranchTypes.try_emplace(key, *logical);
     if (share) {
       if (!budget.reserveMapInsert(site, closedBranchTypes))
@@ -1141,23 +1525,31 @@ private:
   LogicalResult bindArguments(InvocationFrameId frame, Operation *function,
                               ArrayRef<BoundValueId> explicitInputs,
                               ArrayRef<BoundValueId> captures) {
-    if (!budget.chargeStorage<SmallVector<BoundValueId, 0>>(function,
-                                                           frame + 1 - formalValues.size()))
+    if (!budget.chargeStorage<SmallVector<BoundValueId, 0>>(
+            function, frame + 1 - formalValues.size()))
       return failure();
-    if (formalValues.size() <= frame) formalValues.resize(frame + 1);
-    if (!budget.chargeStorage<SmallVector<uint64_t, 0>>(function,
-                                                frame + 1 - formalIntents.size())) return failure();
-    if (formalIntents.size() <= frame) formalIntents.resize(frame + 1);
+    if (formalValues.size() <= frame)
+      formalValues.resize(frame + 1);
+    if (!budget.chargeStorage<SmallVector<uint64_t, 0>>(
+            function, frame + 1 - formalIntents.size()))
+      return failure();
+    if (formalIntents.size() <= frame)
+      formalIntents.resize(frame + 1);
     auto proposals = function->getAttrOfType<ArrayAttr>("ac.formal_proposals");
     if (proposals && !proposals.empty()) {
-      if (failed(ensureFormalProof(function))) return failure();
+      if (failed(ensureFormalProof(function)))
+        return failure();
       auto zero = formalProof->zero();
-      if (failed(zero) || !budget.chargeStorage<uint64_t>(function, explicitInputs.size()) ||
-          !budget.reserve(function, formalIntents[frame], explicitInputs.size())) return failure();
+      if (failed(zero) ||
+          !budget.chargeStorage<uint64_t>(function, explicitInputs.size()) ||
+          !budget.reserve(function, formalIntents[frame],
+                          explicitInputs.size()))
+        return failure();
       formalIntents[frame].assign(explicitInputs.size(), *zero);
     }
     if (!budget.chargeStorage<BoundValueId>(function, explicitInputs.size()) ||
-        !budget.reserve(function, formalValues[frame], explicitInputs.size())) return failure();
+        !budget.reserve(function, formalValues[frame], explicitInputs.size()))
+      return failure();
     formalValues[frame].assign(explicitInputs.begin(), explicitInputs.end());
     for (unsigned region : {0u, 1u}) {
       auto arguments = function->getRegion(region).front().getArguments();
@@ -1220,6 +1612,106 @@ private:
     return success();
   }
 
+  FailureOr<TransactionDefinitionPlanId>
+  eventDefinition(TransactionStateEventKind kind, InvocationFrameId frame,
+                  std::optional<uint64_t> record) const {
+    if (frame >= plan.frames.size())
+      return failure();
+    TransactionDefinitionPlanId definition = plan.frames[frame].definitionPlan;
+    Operation *operation = nullptr;
+    if (record) {
+      switch (kind) {
+      case TransactionStateEventKind::Read:
+        if (*record >= plan.reads.size())
+          return failure();
+        operation = plan.reads[*record].operation;
+        break;
+      case TransactionStateEventKind::Write:
+        if (*record >= plan.writes.size())
+          return failure();
+        operation = plan.writes[*record].operation;
+        break;
+      case TransactionStateEventKind::FormalWrite:
+        if (*record >= plan.formalWrites.size())
+          return failure();
+        operation = plan.formalWrites[*record].operation;
+        break;
+      case TransactionStateEventKind::GuardEnter:
+      case TransactionStateEventKind::GuardExit:
+        if (*record >= plan.guards.size())
+          return failure();
+        operation = plan.guards[*record].callable;
+        break;
+      case TransactionStateEventKind::CallEnter:
+      case TransactionStateEventKind::CallExit:
+        if (*record >= plan.calls.size())
+          return failure();
+        operation = plan.calls[*record].operation;
+        break;
+      case TransactionStateEventKind::SelectionEnter:
+      case TransactionStateEventKind::SelectionExit:
+        if (*record >= plan.selections.size() ||
+            plan.selections[*record].branch >= plan.branches.size())
+          return failure();
+        definition =
+            plan.branches[plan.selections[*record].branch].definitionPlan;
+        break;
+      case TransactionStateEventKind::BranchEnter:
+      case TransactionStateEventKind::ThenEnter:
+      case TransactionStateEventKind::ThenExit:
+      case TransactionStateEventKind::ElseEnter:
+      case TransactionStateEventKind::ElseExit:
+      case TransactionStateEventKind::BranchExit:
+        if (*record >= plan.branches.size())
+          return failure();
+        definition = plan.branches[*record].definitionPlan;
+        break;
+      case TransactionStateEventKind::StateJoin:
+        if (*record >= plan.joins.size() ||
+            plan.joins[*record].branch >= plan.branches.size())
+          return failure();
+        definition = plan.branches[plan.joins[*record].branch].definitionPlan;
+        break;
+      case TransactionStateEventKind::BranchResult:
+        if (*record >= plan.branchResults.size() ||
+            plan.branchResults[*record].branch >= plan.branches.size())
+          return failure();
+        definition =
+            plan.branches[plan.branchResults[*record].branch].definitionPlan;
+        break;
+      case TransactionStateEventKind::BodyCheck:
+        if (*record >= plan.bodyChecks.size())
+          return failure();
+        operation = plan.bodyChecks[*record].operation;
+        break;
+      case TransactionStateEventKind::Observe:
+        if (*record >= plan.observations.size())
+          return failure();
+        operation = plan.observations[*record].operation;
+        break;
+      case TransactionStateEventKind::QueueAccess:
+        if (*record >= plan.queueAccesses.size())
+          return failure();
+        operation = plan.queueAccesses[*record].operation;
+        break;
+      case TransactionStateEventKind::MemoryAccess:
+        if (*record >= plan.memoryAccesses.size())
+          return failure();
+        operation = plan.memoryAccesses[*record].operation;
+        break;
+      default:
+        break;
+      }
+    }
+    if (operation) {
+      auto found = definitionOperationIndex.find(operation);
+      if (found == definitionOperationIndex.end())
+        return failure();
+      definition = found->second;
+    }
+    return definition;
+  }
+
   LogicalResult event(TransactionStateEventKind kind, InvocationFrameId frame,
                       std::optional<uint64_t> record = std::nullopt) {
     if (!budget.charge(callable(frame), 2) ||
@@ -1230,84 +1722,41 @@ private:
     next.kind = kind;
     next.frame = frame;
     next.point = point();
-    switch (kind) {
-    case TransactionStateEventKind::Read:
-      next.read = record;
-      break;
-    case TransactionStateEventKind::Write:
-      next.write = record;
-      break;
-    case TransactionStateEventKind::FormalWrite:
-      next.formalWrite = record;
-      break;
-    case TransactionStateEventKind::BodyCheck:
-      next.bodyCheck = record;
-      break;
-    case TransactionStateEventKind::Observe:
-      next.observation = record;
-      break;
-    case TransactionStateEventKind::QueueAccess:
-      next.queueAccess = record;
-      break;
-    case TransactionStateEventKind::MemoryAccess:
-      next.memoryAccess = record;
-      break;
-    case TransactionStateEventKind::GuardEnter:
-    case TransactionStateEventKind::GuardExit:
-      next.guard = record;
-      break;
-    case TransactionStateEventKind::SelectionEnter:
-    case TransactionStateEventKind::SelectionExit:
-      next.selection = record;
-      break;
-    case TransactionStateEventKind::CallEnter:
-    case TransactionStateEventKind::CallExit:
-      next.call = record;
-      break;
-    case TransactionStateEventKind::BranchEnter:
-    case TransactionStateEventKind::ThenEnter:
-    case TransactionStateEventKind::ThenExit:
-    case TransactionStateEventKind::ElseEnter:
-    case TransactionStateEventKind::ElseExit:
-    case TransactionStateEventKind::BranchExit:
-      next.branch = record;
-      break;
-    case TransactionStateEventKind::StateJoin:
-      next.join = record;
-      break;
-    case TransactionStateEventKind::BranchResult:
-      next.branchResult = record;
-      break;
-    case TransactionStateEventKind::TransactionEnter:
-    case TransactionStateEventKind::TransactionExit:
-      break;
-    }
+    bool boundary = kind == TransactionStateEventKind::TransactionEnter ||
+                    kind == TransactionStateEventKind::TransactionExit;
+    if (record.has_value() == boundary)
+      return callable(frame)->emitOpError()
+             << "transaction event has an invalid record payload";
+    auto definition = eventDefinition(kind, frame, record);
+    if (failed(definition))
+      return callable(frame)->emitOpError()
+             << "transaction event has an invalid definition identity";
+    next.definitionPlan = *definition;
+    next.record = record;
     plan.events.push_back(next);
     return success();
   }
 
   FailureOr<StateOwnerId> owner(Operation *effect, LexicalInstanceId anchor,
-                                 StringAttr explicitName = {}) {
+                                StringAttr explicitName = {}) {
     auto module = plan.instances[anchor].definition;
-    auto name = explicitName ? explicitName : effect->getAttrOfType<StringAttr>("state");
-    SourceStateOp declaration;
-    for (Operation &op : module.getBody().front()) {
-      if (!budget.charge(effect))
-        return failure();
-      auto state = dyn_cast<SourceStateOp>(op);
-      if (state && state->getAttrOfType<StringAttr>("instance_name") == name) {
-        if (declaration)
-          return effect->emitOpError()
-                 << "transaction state owner is ambiguous";
-        declaration = state;
-      }
-    }
-    if (!declaration)
+    auto name = explicitName ? explicitName
+                             : effect->getAttrOfType<StringAttr>("state");
+    if (!budget.charge(effect))
+      return failure();
+    auto states = inventory.moduleStates.find(module);
+    if (states == inventory.moduleStates.end())
       return effect->emitOpError() << "transaction state owner is unresolved";
+    auto stateFound = states->second.find(name);
+    if (stateFound == states->second.end())
+      return effect->emitOpError() << "transaction state owner is unresolved";
+    if (!stateFound->second)
+      return effect->emitOpError() << "transaction state owner is ambiguous";
+    auto declaration = cast<SourceStateOp>(stateFound->second);
     auto key = OwnerKey{anchor, declaration};
-    auto found = owners.find(key);
-    if (found != owners.end())
-      return found->second;
+    auto ownerFound = owners.find(key);
+    if (ownerFound != owners.end())
+      return ownerFound->second;
     auto q = useValue(declaration.getQ(), anchor, plan.rootFrame, effect);
     auto clock = useValue(declaration.getClk(), anchor, plan.rootFrame, effect);
     auto reset = useValue(declaration.getRst(), anchor, plan.rootFrame, effect);
@@ -1316,7 +1765,6 @@ private:
     auto domain = getDomain(*clock, *reset, effect);
     auto type = payloadType(*q, effect);
     if (failed(domain) || failed(type) || failed(sameDomain(*domain, effect)) ||
-        !budget.chargeOccurrence(effect, declaration.getOccurrence()) ||
         !budget.chargeStorage<TransactionStateOwner>(effect, 1) ||
         !budget.reserve(effect, plan.owners, 1) ||
         !budget.chargeStorage<StateVersion>(effect, 1) ||
@@ -1350,10 +1798,10 @@ private:
     return id;
   }
 
-#include "SourceTransactionQueueAnalysis.inc"
-#include "SourceTransactionMemoryAnalysis.inc"
-#include "SourceTransactionSelectedWriteAnalysis.inc"
 #include "SourceTransactionFormalAnalysis.inc"
+#include "SourceTransactionMemoryAnalysis.inc"
+#include "SourceTransactionQueueAnalysis.inc"
+#include "SourceTransactionSelectedWriteAnalysis.inc"
 
   LogicalResult wholeOwner(Operation *operation, ArrayAttr selectors,
                            ValueRange indices) {
@@ -1402,8 +1850,7 @@ private:
     if (!areEquivalentHardwareTypes(*type, plan.owners[*state].payloadType))
       return operation.emitOpError()
              << "whole-owner read payload type mismatch";
-    if (!budget.chargeOccurrence(operation, operation.getOccurrence()) ||
-        !budget.chargeStorage<StateReadBinding>(operation, 1) ||
+    if (!budget.chargeStorage<StateReadBinding>(operation, 1) ||
         !budget.reserve(operation, plan.reads, 1))
       return failure();
     StateReadId id = plan.reads.size();
@@ -1438,27 +1885,32 @@ private:
     // Actual-dependent indexed writes are source effects with intrinsic range
     // obligations. Discharge them before constructing a candidate or domain.
     if (!operation.getIndices().empty()) {
-      auto table = dyn_cast<TableType>(plan.owners[*state].declaration.getQ().getType());
+      auto table =
+          dyn_cast<TableType>(plan.owners[*state].declaration.getQ().getType());
       if (table) {
         if (!budget.charge(operation, 32 + operation.getIndices().size()) ||
             operation.getIndices().size() != 1 ||
-            failed(hardware.verifySourceIndex(operation.getIndices().front(), table,
-                                              plan.instances[anchor].bindings, operation)))
+            failed(hardware.verifySourceIndex(
+                operation.getIndices().front(), table,
+                plan.instances[anchor].bindings, operation)))
           return failure();
       }
     }
     auto indices = writeIndices(operation, operation.getIndices(), frame);
     auto type = payloadType(*rhs, operation);
-    auto selected = failed(indices) ? FailureOr<Type>(failure())
-        : selectedWriteType(plan.owners[*state].payloadType, operation.getSelectors(),
-                            *indices, frame, operation);
+    auto selected = failed(indices)
+                        ? FailureOr<Type>(failure())
+                        : selectedWriteType(plan.owners[*state].payloadType,
+                                            operation.getSelectors(), *indices,
+                                            frame, operation);
     auto forwarded = forwardedStateProposal(operation, frame);
-    if (failed(type) || failed(indices) || failed(selected) || failed(forwarded))
+    if (failed(type) || failed(indices) || failed(selected) ||
+        failed(forwarded))
       return failure();
     if (!areEquivalentHardwareTypes(*type, *selected))
-      return operation.emitOpError() << "selected owner write payload type mismatch";
-    if (!budget.chargeOccurrence(operation, operation.getOccurrence()) ||
-        !budget.chargeStorage<StateWriteIntent>(operation, 1) ||
+      return operation.emitOpError()
+             << "selected owner write payload type mismatch";
+    if (!budget.chargeStorage<StateWriteIntent>(operation, 1) ||
         !budget.reserve(operation, plan.writes, 1) ||
         !budget.chargeStorage<StateVersion>(operation, 1) ||
         !budget.reserve(operation, plan.versions, 1))
@@ -1466,17 +1918,10 @@ private:
     StateWriteId id = plan.writes.size();
     StateVersionId version = plan.versions.size();
     StateVersionId predecessor = candidates[*state];
-    plan.writes.push_back({operation,
-                           frame,
-                           *state,
-                           predecessor,
-                           version,
-                           *rhs,
-                           *path,
-                           *pathFact,
-                           operation.getSelectors(),
-                           std::move(*indices),
-                           operation.getOccurrence(), *rhs, *forwarded});
+    plan.writes.push_back({operation, frame, *state, predecessor, version, *rhs,
+                           *path, *pathFact, operation.getSelectors(),
+                           std::move(*indices), operation.getOccurrence(), *rhs,
+                           *forwarded});
     plan.versions.push_back({plan.transaction, *state, ++ownerOrdinals[*state],
                              StateVersionKind::Write, predecessor, id,
                              std::nullopt, *rhs,
@@ -1498,11 +1943,7 @@ private:
         !subelements.check(operation, operation.getPath().getType()))
       return failure();
     auto occurrence = operation->getAttrOfType<DictionaryAttr>("occurrence");
-    if (!budget.charge(operation, 8) ||
-        !budget.chargeOccurrence(operation, occurrence) ||
-        !budget.chargeAttribute(operation, operation.getLocationAttr()) ||
-        (operation->hasAttr("ac.message") &&
-         !budget.chargeAttribute(operation, operation->getAttr("ac.message"))))
+    if (!budget.charge(operation, 8))
       return failure();
     if (!budget.chargeStorage<TransactionBodyCheck>(operation, 1) ||
         !budget.reserve(operation, plan.bodyChecks, 1))
@@ -1535,11 +1976,6 @@ private:
       values.push_back(*bound);
     }
     auto occurrence = operation->getAttrOfType<DictionaryAttr>("occurrence");
-    if (!budget.chargeOccurrence(operation, occurrence) ||
-        !budget.chargeAttribute(operation, operation->getAttr("ac.location")) ||
-        !budget.chargeAttribute(operation, operation.getKindAttr()) ||
-        !budget.chargeAttribute(operation, operation.getSpec()))
-      return failure();
     if (!budget.charge(operation))
       return failure();
     if (!budget.chargeStorage<TransactionObservation>(operation, 1) ||
@@ -1554,8 +1990,9 @@ private:
   }
 
   FailureOr<LexicalInstanceId> descend(LexicalInstanceId anchor,
-      ArrayAttr suffix, Operation *site) {
-    if (!suffix || !budget.charge(site, suffix.size())) return failure();
+                                       ArrayAttr suffix, Operation *site) {
+    if (!suffix || !budget.charge(site, suffix.size()))
+      return failure();
     for (Attribute occurrence : suffix) {
       auto definition = plan.instances[anchor].definition;
       InstanceOp allocation;
@@ -1568,7 +2005,7 @@ private:
       }
       if (!allocation)
         return site->emitOpError() << "transaction receiver requires an actual "
-                                     "static Instance body";
+                                      "static Instance body";
       auto key = OwnerKey{anchor, allocation};
       auto found = instances.find(key);
       if (found != instances.end()) {
@@ -1582,7 +2019,8 @@ private:
                << "transaction receiver requires an executable provider body";
       auto bound =
           hardware.bindInstance(allocation, plan.instances[anchor].bindings);
-      auto logical = hardware.bindInstance(allocation, plan.instances[anchor].logicalBindings);
+      auto logical = hardware.bindInstance(
+          allocation, plan.instances[anchor].logicalBindings);
       if (failed(bound) || failed(logical))
         return failure();
       auto parentPath = plan.instances[anchor].occurrencePath;
@@ -1592,7 +2030,6 @@ private:
       if (!budget.charge(site, parentPath.size() + 3) ||
           !budget.chargeBindings(site, *bound) ||
           !budget.chargeBindings(site, *logical) ||
-          !budget.chargeOccurrence(site, allocation.getOccurrence()) ||
           !budget.chargeStorage<TransactionLexicalInstance>(site, 1) ||
           !budget.reserve(site, plan.instances, 1) ||
           !budget.reserveMapInsert(site, instances))
@@ -1610,35 +2047,50 @@ private:
   }
 
   FailureOr<LexicalInstanceId> actualReceiver(LexicalInstanceId anchor,
-      DictionaryAttr receiver, Operation *site, unsigned depth = 0) {
-    if (depth > maxDepth || !budget.charge(site)) return failure();
+                                              DictionaryAttr receiver,
+                                              Operation *site,
+                                              unsigned depth = 0) {
+    if (depth > maxDepth || !budget.charge(site))
+      return failure();
     if (receiver.get("receiver_kind") || receiver.get("ancestor_depth")) {
       if (!budget.chargeAttribute(site, receiver) ||
-          failed(verifySourceRelativeReceiver(receiver, site))) return failure();
+          failed(verifySourceRelativeReceiver(receiver, site)))
+        return failure();
       auto levels = receiver.getAs<IntegerAttr>("ancestor_depth").getInt();
       for (int64_t level = 0; level < levels; ++level) {
-        if (!budget.charge(site)) return failure();
+        if (!budget.charge(site))
+          return failure();
         auto parent = plan.instances[anchor].parent;
         if (!parent)
-          return site->emitOpError() << "static instance reference escapes the selected root";
+          return site->emitOpError()
+                 << "static instance reference escapes the selected root";
         anchor = *parent;
       }
       for (Attribute name : receiver.getAs<ArrayAttr>("instance_path")) {
         auto definition = plan.instances[anchor].definition;
         InstanceOp selected;
-        for (auto allocation : definition.getBody().front().getOps<InstanceOp>()) {
-          if (!budget.charge(site)) return failure();
-          if (allocation.getInstanceNameAttr() != name) continue;
+        for (auto allocation :
+             definition.getBody().front().getOps<InstanceOp>()) {
+          if (!budget.charge(site))
+            return failure();
+          if (allocation.getInstanceNameAttr() != name)
+            continue;
           if (selected)
-            return site->emitOpError() << "static instance reference child is ambiguous";
+            return site->emitOpError()
+                   << "static instance reference child is ambiguous";
           selected = allocation;
         }
         if (!selected)
-          return site->emitOpError() << "static instance reference child is absent";
-        if (!budget.chargeStorage<Attribute>(site, 1)) return failure();
-        auto child = descend(anchor, ArrayAttr::get(package.getContext(),
-                                                  {selected.getOccurrence()}), site);
-        if (failed(child)) return failure();
+          return site->emitOpError()
+                 << "static instance reference child is absent";
+        if (!budget.chargeStorage<Attribute>(site, 1))
+          return failure();
+        auto child = descend(
+            anchor,
+            ArrayAttr::get(package.getContext(), {selected.getOccurrence()}),
+            site);
+        if (failed(child))
+          return failure();
         anchor = *child;
       }
       return anchor;
@@ -1646,20 +2098,25 @@ private:
     if (auto formal = receiver.getAs<StringAttr>("reference")) {
       const auto &instance = plan.instances[anchor];
       if (!instance.parent || !instance.allocation)
-        return site->emitOpError() << "static instance reference has no enclosing allocation binding";
-      auto bindings = instance.allocation->getAttrOfType<ArrayAttr>("ac.reference_bindings");
+        return site->emitOpError() << "static instance reference has no "
+                                      "enclosing allocation binding";
+      auto bindings = instance.allocation->getAttrOfType<ArrayAttr>(
+          "ac.reference_bindings");
       DictionaryAttr actual;
       if (bindings)
         for (Attribute raw : bindings) {
-          if (!budget.charge(site)) return failure();
+          if (!budget.charge(site))
+            return failure();
           auto binding = dyn_cast<DictionaryAttr>(raw);
           if (binding && binding.getAs<StringAttr>("name") == formal)
             actual = binding.getAs<DictionaryAttr>("receiver");
         }
       if (!actual)
-        return site->emitOpError() << "static instance reference binding is absent";
+        return site->emitOpError()
+               << "static instance reference binding is absent";
       auto target = actualReceiver(*instance.parent, actual, site, depth + 1);
-      if (failed(target)) return failure();
+      if (failed(target))
+        return failure();
       anchor = *target;
     }
     return descend(anchor, receiver.getAs<ArrayAttr>("instance_path"), site);
@@ -1668,8 +2125,10 @@ private:
   FailureOr<LexicalInstanceId> receiver(InvocationFrameId frame,
                                         const ResolvedSourceMethod &resolved,
                                         SourceMethodCallOp call) {
-    auto target = actualReceiver(plan.frames[frame].anchor, resolved.receiver, call);
-    if (failed(target)) return failure();
+    auto target =
+        actualReceiver(plan.frames[frame].anchor, resolved.receiver, call);
+    if (failed(target))
+      return failure();
     auto anchor = *target;
     if (plan.instances[anchor].definition != resolved.method.module)
       return call.emitOpError()
@@ -1712,40 +2171,52 @@ private:
     } else {
       auto payModule = [&](Operation *module, Operation *site) {
         auto found = inventory.moduleCosts.find(module);
-        return success(budget.charge(site, found == inventory.moduleCosts.end()
-                                             ? 1 : found->second));
+        return success(budget.charge(
+            site, found == inventory.moduleCosts.end() ? 1 : found->second));
       };
       auto payMethod = [&](SourceMethodOp method, Operation *site) {
         SourceMethodView view{method->getParentOfType<ModuleOp>(), method, {}};
-        return success(budget.charge(site, inventory.methodCosts.lookup(view.getSymbol())));
+        return success(budget.charge(
+            site, inventory.methodCosts.lookup(view.getSymbol())));
       };
-      auto payWorkStorage = [&](Operation *site, uint64_t work, uint64_t bytes) {
-        return success(budget.charge(site, work) &&
-                       budget.chargeStorage<uint64_t>(site, bytes / 8 + (bytes % 8 != 0)));
+      auto payWorkStorage = [&](Operation *site, uint64_t work,
+                                uint64_t bytes) {
+        return success(
+            budget.charge(site, work) &&
+            budget.chargeStorage<uint64_t>(site, bytes / 8 + (bytes % 8 != 0)));
       };
       auto payInstanceBinding = [&](Operation *owner, Operation *allocation,
                                     Operation *target, Operation *site) {
-        return success(budget.charge(site, inventory.operationCosts.lookup(
-                                                allocation ? allocation : owner)) &&
-                       budget.charge(site, inventory.operationCosts.lookup(target)));
+        return success(
+            budget.charge(site, inventory.operationCosts.lookup(
+                                    allocation ? allocation : owner)) &&
+            budget.charge(site, inventory.operationCosts.lookup(target)));
       };
       SourceReceiverProofFees fees{payModule, payMethod, payWorkStorage,
-                                  payInstanceBinding};
+                                   payInstanceBinding};
       auto lookup = [&](FlatSymbolRefAttr symbol) -> Operation * {
         return hardware.lookupDefinition(symbol.getValue());
       };
-      resolved = resolveSourceMethodCall(operation, plan.instances[callerAnchor].bindings,
+      resolved = resolveSourceMethodCall(operation,
+                                         plan.instances[callerAnchor].bindings,
                                          lookup, &receiverProof, &fees);
-      if (failed(resolved)) return failure();
-      if (operation->hasAttr("receiver_kind") || operation->hasAttr("ancestor_depth")) {
-        auto target = actualReceiver(callerAnchor, resolved->receiver, operation);
-        if (failed(target)) return failure();
+      if (failed(resolved))
+        return failure();
+      if (operation->hasAttr("receiver_kind") ||
+          operation->hasAttr("ancestor_depth")) {
+        auto target =
+            actualReceiver(callerAnchor, resolved->receiver, operation);
+        if (failed(target))
+          return failure();
         auto definition = plan.instances[*target].definition;
-        auto actual = receiverProof.method(definition,
+        auto actual = receiverProof.method(
+            definition,
             operation.getCalleeAttr().getNestedReferences().front().getValue(),
             operation, fees);
-        if (failed(actual) || failed(verifySourceRelativeMethodBinding(
-                *resolved, *actual, plan.instances[*target].bindings, operation, &fees)))
+        if (failed(actual) ||
+            failed(verifySourceRelativeMethodBinding(
+                *resolved, *actual, plan.instances[*target].bindings, operation,
+                &fees)))
           return failure();
         resolved->method = *actual;
         resolved->bindings = plan.instances[*target].bindings;
@@ -1777,9 +2248,12 @@ private:
       actuals.push_back(*actual);
     }
     auto resolved = resolveCall(operation, callerAnchor);
-    if (failed(resolved)) return failure();
+    if (failed(resolved))
+      return failure();
     if (resolved->method.isNativeMemoryTerminal()) {
-      if (guard) return operation.emitOpError() << "Memory terminal calls are not admitted in guards";
+      if (guard)
+        return operation.emitOpError()
+               << "Memory terminal calls are not admitted in guards";
       return memoryAccess(operation, parent, *resolved, *path, actuals);
     }
     if (resolved->method.isNativeQueueTerminal()) {
@@ -1806,10 +2280,9 @@ private:
     SmallVector<StateVersionId> saved;
     if (failed(snapshot(operation, saved)) ||
         !budget.chargeBindings(operation, resolved->bindings) ||
-        !budget.chargeOccurrence(operation, operation.getOccurrence()) ||
         !budget.chargeStorage<InvocationFrame>(operation, 1) ||
         !budget.reserve(operation, plan.frames, 1) ||
-        !budget.chargeStorage<TransactionCallBinding>(operation, 1) ||
+        !budget.chargeStorage<TransactionCallDelta>(operation, 1) ||
         !budget.reserve(operation, plan.calls, 1) ||
         !budget.chargeStorage<BoundValueId>(
             operation, actuals.size() + method.getCaptures().size()))
@@ -1817,6 +2290,10 @@ private:
     InvocationFrameId child = plan.frames.size();
     InvocationFrame next;
     next.transaction = plan.transaction;
+    auto definition = definitionIndex.find(method);
+    if (definition == definitionIndex.end())
+      return method.emitOpError() << "Method has no frozen definition plan";
+    next.definitionPlan = definition->second;
     next.parent = parent;
     next.call = operation;
     next.method = method;
@@ -1829,8 +2306,9 @@ private:
     next.bindings = plan.instances[*anchor].bindings;
     next.entry = point();
     plan.frames.push_back(std::move(next));
-    TransactionCallBinding binding;
+    TransactionCallDelta binding;
     binding.operation = operation;
+    binding.calleeDefinitionPlan = definition->second;
     binding.caller = parent;
     binding.callee = child;
     binding.authoredPath = *path;
@@ -1952,32 +2430,24 @@ private:
     return success();
   }
 
-  FailureOr<bool> needsSelection(SourceBranchOp branch) {
-    SmallVector<Operation *, 0> pending;
-    auto append = [&](Operation *op) {
-      if (!budget.chargeStorage<Operation *>(branch, 1) ||
-          !budget.reserve(branch, pending, 1))
-        return false;
-      pending.push_back(op);
-      return true;
-    };
-    if (!append(branch))
+  FailureOr<bool> needsSelection(SourceBranchOp branch,
+                                 InvocationFrameId frame) {
+    if (!budget.charge(branch) || frame >= plan.frames.size())
       return failure();
-    bool effectful = false;
-    while (!pending.empty()) {
-      Operation *op = pending.pop_back_val();
-      if (!budget.charge(branch))
-        return failure();
-      effectful |= isa<SourceMethodCallOp, SourceExpectOp, SourceObserveOp,
-                       SourceQueuePopOp, SourceQueuePeekOp, SourceQueuePushOp>(op) ||
-                   op->hasAttr("ac.loop_continuation");
-      for (Region &region : op->getRegions())
-        for (Block &block : region)
-          for (Operation &child : block)
-            if (!append(&child))
-              return failure();
-    }
-    return effectful;
+    // Selection is a definition-local structural fact. Source loop lowering
+    // may expose a Method body while retaining the transaction occurrence
+    // frame, so consume the frozen operation index instead of parent chasing.
+    auto indexed = definitionOperationIndex.find(branch);
+    if (indexed == definitionOperationIndex.end() ||
+        indexed->second >= definitionPlans.size())
+      return branch.emitOpError()
+             << "branch references an invalid transaction definition plan";
+    const auto &definition = definitionPlans[indexed->second];
+    auto effectful = definition.needsSelection(branch);
+    if (!effectful)
+      return branch.emitOpError()
+             << "branch is absent from its frozen transaction definition plan";
+    return *effectful;
   }
 
   LogicalResult branch(SourceBranchOp operation, InvocationFrameId frame,
@@ -1995,21 +2465,22 @@ private:
     if (failed(conditionType) || !isa<BitsType>(*conditionType))
       return operation.emitOpError()
              << "branch condition requires width-one Bits";
-    auto width = hardware.getPackedWidth(
-        *conditionType, plan.instances[0].bindings, operation);
+    auto width = hardware.getPackedWidth(*conditionType,
+                                         plan.instances[0].bindings, operation);
     if (failed(width) || *width != 1)
       return operation.emitOpError()
              << "branch condition requires width-one Bits";
-    if (!budget.chargeOccurrence(operation, operation.getOccurrence()) ||
-        !budget.chargeAttribute(operation, operation.getConditionLocation()) ||
-        !budget.chargeStorage<TransactionBranch>(operation, 1) ||
+    if (!budget.chargeStorage<TransactionBranch>(operation, 1) ||
         !budget.reserve(operation, plan.branches, 1))
       return failure();
     SmallVector<StateVersionId, 0> entry, thenEnd;
-    if (!budget.chargeStorage<BoundValueId>(operation, 3 * formalValues[frame].size()))
+    if (!budget.chargeStorage<BoundValueId>(operation,
+                                            3 * formalValues[frame].size()))
       return failure();
     SmallVector<BoundValueId, 0> formalEntry(formalValues[frame]), formalThen;
-    if (!budget.chargeStorage<uint64_t>(operation, 3 * formalIntents[frame].size())) return failure();
+    if (!budget.chargeStorage<uint64_t>(operation,
+                                        3 * formalIntents[frame].size()))
+      return failure();
     SmallVector<uint64_t, 0> intentEntry(formalIntents[frame]), intentThen;
     if (failed(snapshot(operation, entry)))
       return failure();
@@ -2017,13 +2488,19 @@ private:
     BranchId id = plan.branches.size();
     TransactionBranch branchRecord;
     branchRecord.operation = operation;
+    auto definition = definitionOperationIndex.find(operation);
+    if (definition == definitionOperationIndex.end() ||
+        definition->second >= definitionPlans.size())
+      return operation.emitOpError()
+             << "branch has no frozen transaction definition plan";
+    branchRecord.definitionPlan = definition->second;
     branchRecord.frame = frame;
     branchRecord.condition = *condition;
     branchRecord.entry = entryPoint;
     branchRecord.occurrence = operation.getOccurrence();
     branchRecord.conditionLocation = operation.getConditionLocation();
     auto fact = predicate(*condition, operation);
-    auto effectful = needsSelection(operation);
+    auto effectful = needsSelection(operation, frame);
     if (failed(fact) || failed(effectful))
       return failure();
     branchRecord.conditionFact = *fact;
@@ -2062,6 +2539,7 @@ private:
       return failure();
     formalThen.assign(formalValues[frame].begin(), formalValues[frame].end());
     intentThen.assign(formalIntents[frame].begin(), formalIntents[frame].end());
+    plan.branches[id].thenEndBranch = plan.branches.size();
     plan.branches[id].thenExitPrefix = currentPrefix;
     if (failed(event(TransactionStateEventKind::ThenExit, frame, id)) ||
         failed(restore(operation, entry)))
@@ -2076,6 +2554,7 @@ private:
                           whenFalse)))
       return failure();
     plan.branches[id].elseExitPrefix = currentPrefix;
+    plan.branches[id].elseEndBranch = plan.branches.size();
     if (failed(event(TransactionStateEventKind::ElseExit, frame, id)))
       return failure();
     currentPath = entryPoint.path;
@@ -2184,27 +2663,40 @@ private:
         return failure();
     }
     for (unsigned formal = 0; formal < intentEntry.size(); ++formal) {
-      auto joined = formalProof->join(id, intentThen[formal], formalIntents[frame][formal]);
-      if (failed(joined)) return failure();
+      auto joined = formalProof->join(id, intentThen[formal],
+                                      formalIntents[frame][formal]);
+      if (failed(joined))
+        return failure();
       formalIntents[frame][formal] = *joined;
     }
     for (unsigned formal = 0; formal < formalEntry.size(); ++formal) {
-      auto trueValue = formalThen[formal], falseValue = formalValues[frame][formal];
-      if (trueValue == falseValue) { formalValues[frame][formal] = trueValue; continue; }
+      auto trueValue = formalThen[formal],
+           falseValue = formalValues[frame][formal];
+      if (trueValue == falseValue) {
+        formalValues[frame][formal] = trueValue;
+        continue;
+      }
       std::optional<BoundValueId> joined;
       for (auto resultId : record.results) {
-        if (!budget.charge(operation)) return failure();
+        if (!budget.charge(operation))
+          return failure();
         const auto &result = plan.branchResults[resultId];
-        auto sameTrue = sameBoundValueAt(result.whenTrue, trueValue,
-            {record.thenExitPrefix, {id, true}}, operation);
-        auto sameFalse = sameBoundValueAt(result.whenFalse, falseValue,
-            {record.elseExitPrefix, {id, false}}, operation);
-        if (failed(sameTrue) || failed(sameFalse)) return failure();
+        auto sameTrue =
+            sameBoundValueAt(result.whenTrue, trueValue,
+                             {record.thenExitPrefix, {id, true}}, operation);
+        auto sameFalse =
+            sameBoundValueAt(result.whenFalse, falseValue,
+                             {record.elseExitPrefix, {id, false}}, operation);
+        if (failed(sameTrue) || failed(sameFalse))
+          return failure();
         if (*sameTrue && *sameFalse) {
-          if (!joined) joined = result.result;
+          if (!joined)
+            joined = result.result;
         }
       }
-      if (!joined) return operation.emitOpError() << "formal branch candidate lacks its actual yielded join";
+      if (!joined)
+        return operation.emitOpError()
+               << "formal branch candidate lacks its actual yielded join";
       formalValues[frame][formal] = *joined;
     }
     return event(TransactionStateEventKind::BranchExit, frame, id);
@@ -2225,9 +2717,13 @@ private:
         if (failed(write(intent, frame, touched, seen)))
           return failure();
       } else if (auto formal = dyn_cast<SourceFormalWriteOp>(op)) {
-        if (guard) return formal.emitOpError() << "formal writes are not admitted in guards";
-        if (failed(formalWrite(formal, frame, touched, seen))) return failure();
-      } else if (isa<SourceQueuePopOp, SourceQueuePeekOp, SourceQueuePushOp>(op)) {
+        if (guard)
+          return formal.emitOpError()
+                 << "formal writes are not admitted in guards";
+        if (failed(formalWrite(formal, frame, touched, seen)))
+          return failure();
+      } else if (isa<SourceQueuePopOp, SourceQueuePeekOp, SourceQueuePushOp>(
+                     op)) {
         return op.emitOpError()
                << "retired dedicated queue effects are not admitted";
       } else if (auto split = dyn_cast<SourceBranchOp>(op)) {
@@ -2254,7 +2750,39 @@ private:
                                          Operation *function,
                                          const TransactionDomain &domain,
                                          unsigned depth) {
+    // Each frozen callable is one stable semantic stage. Its occurrence is
+    // checked under a fresh bounded work scope; persistent plan storage keeps
+    // a separate package-wide bound, so splitting a hostile graph into many
+    // calls cannot bypass allocation admission.
+    StateAnalysisBudget::LocalScope invocationBudget(budget);
     if (!budget.charge(function) || failed(sameDomain(domain, function)))
+      return failure();
+    const auto &definition = definitionPlans[plan.frames[frame].definitionPlan];
+    if (failed(verifyDefinitionIdentity(frame, function)))
+      return failure();
+    // Every source arm is expanded, so these are exact per-invocation lower
+    // bounds. Reserve them as one page before appending records; dynamic joins,
+    // owner discovery and Method-vs-native call deltas still grow separately.
+    uint64_t baseEvents =
+        2 + definition.readCount + definition.writeCount +
+        definition.formalWriteCount + definition.callCount +
+        definition.bodyCheckCount + definition.observationCount +
+        6 * definition.branchCount + 2 * definition.selectionCount +
+        definition.branchResultCount;
+    if (!budget.reserve(function, plan.reads, definition.readCount) ||
+        !budget.reserve(function, plan.writes, definition.writeCount) ||
+        !budget.reserve(function, plan.formalWrites,
+                        definition.formalWriteCount) ||
+        !budget.reserve(function, plan.bodyChecks, definition.bodyCheckCount) ||
+        !budget.reserve(function, plan.observations,
+                        definition.observationCount) ||
+        !budget.reserve(function, plan.branches, definition.branchCount) ||
+        !budget.reserve(function, plan.branchResults,
+                        definition.branchResultCount) ||
+        !budget.reserve(function, plan.selections, definition.selectionCount) ||
+        !budget.reserve(function, plan.controls,
+                        1 + definition.selectionCount) ||
+        !budget.reserve(function, plan.events, baseEvents))
       return failure();
     SmallVector<StateVersionId> saved;
     if (failed(snapshot(function, saved)) || !budget.charge(function))
@@ -2320,18 +2848,25 @@ private:
       result.yielded.push_back(*bound);
     }
     if (auto method = dyn_cast<SourceMethodOp>(function)) {
-      SourceMethodView view{plan.instances[plan.frames[frame].anchor].definition, method, {}};
+      SourceMethodView view{
+          plan.instances[plan.frames[frame].anchor].definition, method, {}};
       auto proposals = view.getFormalProposals();
-      if (proposals) for (auto [ordinal, raw] : llvm::enumerate(proposals)) {
-        unsigned formal = cast<IntegerAttr>(raw).getInt();
-        unsigned suffix = view.getNumPublicResults() + 2 * ordinal;
-        if (!formalProof || formal >= formalIntents[frame].size() ||
-            suffix + 1 >= result.yielded.size()) return failure();
-        auto same = formalProof->equal(result.yielded[suffix], formalValues[frame][formal], point());
-        if (failed(same) || !*same ||
-            failed(formalProof->check(result.yielded[suffix + 1], formalIntents[frame][formal], point())))
-          return method.emitOpError() << "private formal proposal yield must match its final candidate and raw write intent";
-      }
+      if (proposals)
+        for (auto [ordinal, raw] : llvm::enumerate(proposals)) {
+          unsigned formal = cast<IntegerAttr>(raw).getInt();
+          unsigned suffix = view.getNumPublicResults() + 2 * ordinal;
+          if (!formalProof || formal >= formalIntents[frame].size() ||
+              suffix + 1 >= result.yielded.size())
+            return failure();
+          auto same = formalProof->equal(result.yielded[suffix],
+                                         formalValues[frame][formal], point());
+          if (failed(same) || !*same ||
+              failed(formalProof->check(result.yielded[suffix + 1],
+                                        formalIntents[frame][formal], point())))
+            return method.emitOpError()
+                   << "private formal proposal yield must match its final "
+                      "candidate and raw write intent";
+        }
     }
     plan.frames[frame].exit = point();
     return result;
@@ -2370,6 +2905,8 @@ private:
     }
     for (auto [id, frame] : llvm::enumerate(plan.frames)) {
       if (!budget.charge(site) || frame.guard >= plan.guards.size() ||
+          frame.definitionPlan >= definitionPlans.size() ||
+          definitionPlans[frame.definitionPlan].callable != callable(id) ||
           plan.guards[frame.guard].frame != id ||
           frame.entry.prefix != plan.guards[frame.guard].control ||
           !samePath(frame.entry.path, frame.exit.path) ||
@@ -2379,13 +2916,21 @@ private:
     }
     for (auto [id, branch] : llvm::enumerate(plan.branches)) {
       if (!budget.charge(site) || branch.frame >= plan.frames.size() ||
+          branch.definitionPlan >= definitionPlans.size() ||
           branch.condition >= plan.values.size() ||
+          branch.thenEndBranch <= id ||
+          branch.thenEndBranch > branch.elseEndBranch ||
+          branch.elseEndBranch > plan.branches.size() ||
           (branch.entry.path.branch && *branch.entry.path.branch >= id) ||
           branch.thenExitPrefix <
               branch.entry.prefix + unsigned(branch.selection.has_value()) ||
           branch.elseExitPrefix < branch.thenExitPrefix ||
           branch.elseExitPrefix > currentPrefix ||
           failed(requireAvailable(branch.condition, branch.entry, site)))
+        return invalid();
+      auto branchDefinition = definitionOperationIndex.find(branch.operation);
+      if (branchDefinition == definitionOperationIndex.end() ||
+          branchDefinition->second != branch.definitionPlan)
         return invalid();
       if (branch.selection) {
         if (*branch.selection >= plan.selections.size())
@@ -2405,8 +2950,11 @@ private:
         return invalid();
     }
     for (auto [id, ref] : llvm::enumerate(plan.values)) {
-      if (!budget.charge(site) || !validityAssigned[id] ||
-          ref.anchor >= plan.instances.size() ||
+      if (!budget.charge(site))
+        return failure();
+      if (!validityAssigned[id])
+        return invalid();
+      if (ref.anchor >= plan.instances.size() ||
           ref.frame >= plan.frames.size() ||
           ref.validity.prefix > currentPrefix)
         return invalid();
@@ -2415,6 +2963,9 @@ private:
       if (failed(legal))
         return failure();
     }
+    for (const auto &call : plan.calls)
+      if (!budget.charge(site) || call.callee >= plan.frames.size())
+        return invalid();
     for (auto [id, version] : llvm::enumerate(plan.versions)) {
       if (!budget.charge(site) || version.owner >= plan.owners.size() ||
           version.validity.prefix > currentPrefix)
@@ -2500,7 +3051,14 @@ private:
     }
     for (const auto &call : plan.calls) {
       if (!budget.charge(site) || call.callee >= plan.frames.size() ||
-          call.caller >= plan.frames.size())
+          call.caller >= plan.frames.size() ||
+          call.calleeDefinitionPlan >= definitionPlans.size() ||
+          call.calleeDefinitionPlan !=
+              plan.frames[call.callee].definitionPlan)
+        return invalid();
+      auto callDefinition = definitionOperationIndex.find(call.operation);
+      if (callDefinition == definitionOperationIndex.end() ||
+          callDefinition->second != plan.frames[call.caller].definitionPlan)
         return invalid();
       const auto &frame = plan.frames[call.callee];
       if (frame.parent != call.caller || frame.call != call.operation)
@@ -2517,17 +3075,21 @@ private:
     for (const auto &formal : plan.formalWrites) {
       if (!budget.charge(site, 8) || formal.frame >= plan.frames.size() ||
           formal.formal >= plan.frames[formal.frame].formalOwners.size() ||
-          formal.owner != plan.frames[formal.frame].formalOwners[formal.formal] ||
+          formal.owner !=
+              plan.frames[formal.frame].formalOwners[formal.formal] ||
           bool(formal.owner) != bool(formal.write) ||
-          (formal.write && (*formal.write >= plan.writes.size() ||
+          (formal.write &&
+           (*formal.write >= plan.writes.size() ||
             plan.writes[*formal.write].operation != formal.operation ||
             plan.writes[*formal.write].owner != *formal.owner)) ||
           bool(formal.previous) != bool(formal.snapshot) ||
           failed(requireAvailable(formal.payload, formal.point, site)) ||
           failed(requireAvailable(formal.authoredPath, formal.point, site)) ||
           failed(requireAvailable(formal.candidate, formal.point, site)) ||
-          (formal.previous && failed(requireAvailable(*formal.previous, formal.point, site))) ||
-          (formal.snapshot && !samePoint(plan.values[*formal.snapshot].validity, formal.point)))
+          (formal.previous &&
+           failed(requireAvailable(*formal.previous, formal.point, site))) ||
+          (formal.snapshot &&
+           !samePoint(plan.values[*formal.snapshot].validity, formal.point)))
         return invalid();
     }
     for (const auto &check : plan.bodyChecks)
@@ -2568,25 +3130,16 @@ private:
     std::optional<AdmissionControlId> openControl;
     for (const auto &event : plan.events) {
       if (!budget.charge(site) || frames.empty() ||
-          event.frame >= plan.frames.size())
+          event.frame >= plan.frames.size() ||
+          event.definitionPlan >= definitionPlans.size())
         return invalid();
-      unsigned references = unsigned(event.read.has_value()) +
-                            unsigned(event.write.has_value()) +
-                            unsigned(event.formalWrite.has_value()) +
-                            unsigned(event.guard.has_value()) +
-                            unsigned(event.selection.has_value()) +
-                            unsigned(event.call.has_value()) +
-                            unsigned(event.bodyCheck.has_value()) +
-                            unsigned(event.observation.has_value()) +
-                            unsigned(event.queueAccess.has_value()) +
-                            unsigned(event.memoryAccess.has_value()) +
-                            unsigned(event.branch.has_value()) +
-                            unsigned(event.join.has_value()) +
-                            unsigned(event.branchResult.has_value());
+      auto eventOwner = eventDefinition(event.kind, event.frame, event.record);
+      if (failed(eventOwner) || *eventOwner != event.definitionPlan)
+        return invalid();
       bool boundary =
           event.kind == TransactionStateEventKind::TransactionEnter ||
           event.kind == TransactionStateEventKind::TransactionExit;
-      if (references != (boundary ? 0u : 1u))
+      if (event.record.has_value() == boundary)
         return invalid();
       if (event.kind != TransactionStateEventKind::CallExit &&
           event.frame != frames.back())
@@ -2604,9 +3157,9 @@ private:
         break;
       case TransactionStateEventKind::GuardEnter:
       case TransactionStateEventKind::GuardExit: {
-        if (!event.guard || *event.guard >= plan.guards.size())
+        if (!event.record || *event.record >= plan.guards.size())
           return invalid();
-        const auto &guard = plan.guards[*event.guard];
+        const auto &guard = plan.guards[*event.record];
         if (guard.frame != event.frame ||
             guard.control >= plan.controls.size() ||
             !samePath(plan.controls[guard.control].path, cursor.path))
@@ -2628,9 +3181,9 @@ private:
       }
       case TransactionStateEventKind::SelectionEnter:
       case TransactionStateEventKind::SelectionExit: {
-        if (!event.selection || *event.selection >= plan.selections.size())
+        if (!event.record || *event.record >= plan.selections.size())
           return invalid();
-        const auto &selection = plan.selections[*event.selection];
+        const auto &selection = plan.selections[*event.record];
         if (branches.empty() || branches.back().branch != selection.branch ||
             branches.back().stage != 0 || selection.control != nextControl ||
             cursor.prefix != nextControl)
@@ -2649,9 +3202,9 @@ private:
         break;
       }
       case TransactionStateEventKind::CallEnter: {
-        if (!event.call || *event.call >= plan.calls.size())
+        if (!event.record || *event.record >= plan.calls.size())
           return invalid();
-        const auto &call = plan.calls[*event.call];
+        const auto &call = plan.calls[*event.record];
         if (call.caller != event.frame ||
             !samePoint(plan.frames[call.callee].entry, cursor))
           return invalid();
@@ -2659,10 +3212,10 @@ private:
         break;
       }
       case TransactionStateEventKind::CallExit: {
-        if (!event.call || *event.call >= plan.calls.size() ||
+        if (!event.record || *event.record >= plan.calls.size() ||
             frames.size() < 2)
           return invalid();
-        const auto &call = plan.calls[*event.call];
+        const auto &call = plan.calls[*event.record];
         if (call.callee != frames.back() || call.caller != event.frame ||
             !samePoint(plan.frames[call.callee].exit, cursor))
           return invalid();
@@ -2670,21 +3223,21 @@ private:
         break;
       }
       case TransactionStateEventKind::BranchEnter:
-        if (!event.branch || *event.branch >= plan.branches.size() ||
-            !samePoint(plan.branches[*event.branch].entry, cursor))
+        if (!event.record || *event.record >= plan.branches.size() ||
+            !samePoint(plan.branches[*event.record].entry, cursor))
           return invalid();
-        branches.push_back({*event.branch, 0});
+        branches.push_back({BranchId(*event.record), 0});
         break;
       case TransactionStateEventKind::ThenEnter:
       case TransactionStateEventKind::ThenExit:
       case TransactionStateEventKind::ElseEnter:
       case TransactionStateEventKind::ElseExit:
       case TransactionStateEventKind::BranchExit: {
-        if (!event.branch || branches.empty() ||
-            branches.back().branch != *event.branch)
+        if (!event.record || branches.empty() ||
+            branches.back().branch != *event.record)
           return invalid();
         auto &active = branches.back();
-        const auto &branch = plan.branches[*event.branch];
+        const auto &branch = plan.branches[*event.record];
         if (branch.frame != event.frame)
           return invalid();
         if (event.kind == TransactionStateEventKind::ThenEnter) {
@@ -2693,7 +3246,7 @@ private:
                   branch.entry.prefix + unsigned(branch.selection.has_value()))
             return invalid();
           active.stage = 1;
-          cursor.path = {*event.branch, true};
+          cursor.path = {*event.record, true};
         } else if (event.kind == TransactionStateEventKind::ThenExit) {
           if (active.stage != 1 || cursor.prefix != branch.thenExitPrefix)
             return invalid();
@@ -2702,7 +3255,7 @@ private:
           if (active.stage != 2)
             return invalid();
           active.stage = 3;
-          cursor.path = {*event.branch, false};
+          cursor.path = {*event.record, false};
         } else if (event.kind == TransactionStateEventKind::ElseExit) {
           if (active.stage != 3 || cursor.prefix != branch.elseExitPrefix)
             return invalid();
@@ -2717,44 +3270,44 @@ private:
         break;
       }
       case TransactionStateEventKind::StateJoin:
-        if (!event.join || *event.join >= plan.joins.size())
-          return invalid();
-        cursor.path = plan.branches[plan.joins[*event.join].branch].entry.path;
-        break;
-      case TransactionStateEventKind::BranchResult:
-        if (!event.branchResult ||
-            *event.branchResult >= plan.branchResults.size())
+        if (!event.record || *event.record >= plan.joins.size())
           return invalid();
         cursor.path =
-            plan.branches[plan.branchResults[*event.branchResult].branch]
-                .entry.path;
+            plan.branches[plan.joins[*event.record].branch].entry.path;
+        break;
+      case TransactionStateEventKind::BranchResult:
+        if (!event.record || *event.record >= plan.branchResults.size())
+          return invalid();
+        cursor.path =
+            plan.branches[plan.branchResults[*event.record].branch].entry.path;
         break;
       case TransactionStateEventKind::Read:
-        if (!event.read || *event.read >= plan.reads.size() ||
-            plan.reads[*event.read].frame != event.frame ||
-            failed(requireVersionAvailable(plan.reads[*event.read].version,
+        if (!event.record || *event.record >= plan.reads.size() ||
+            plan.reads[*event.record].frame != event.frame ||
+            failed(requireVersionAvailable(plan.reads[*event.record].version,
                                            cursor, site)) ||
-            !samePoint(plan.values[plan.reads[*event.read].result].validity,
+            !samePoint(plan.values[plan.reads[*event.record].result].validity,
                        cursor))
           return invalid();
         break;
       case TransactionStateEventKind::Write:
-        if (!event.write || *event.write >= plan.writes.size() ||
-            plan.writes[*event.write].frame != event.frame ||
+        if (!event.record || *event.record >= plan.writes.size() ||
+            plan.writes[*event.record].frame != event.frame ||
             !samePoint(
-                plan.versions[plan.writes[*event.write].version].validity,
+                plan.versions[plan.writes[*event.record].version].validity,
                 cursor))
           return invalid();
         break;
       case TransactionStateEventKind::FormalWrite:
-        if (!event.formalWrite || *event.formalWrite != nextFormalWrite ||
+        if (!event.record || *event.record != nextFormalWrite ||
             nextFormalWrite >= plan.formalWrites.size() ||
             plan.formalWrites[nextFormalWrite].frame != event.frame ||
-            !samePoint(plan.formalWrites[nextFormalWrite].point, cursor)) return invalid();
+            !samePoint(plan.formalWrites[nextFormalWrite].point, cursor))
+          return invalid();
         ++nextFormalWrite;
         break;
       case TransactionStateEventKind::QueueAccess:
-        if (!event.queueAccess || *event.queueAccess != nextQueueAccess ||
+        if (!event.record || *event.record != nextQueueAccess ||
             nextQueueAccess >= plan.queueAccesses.size() ||
             plan.queueAccesses[nextQueueAccess].frame != event.frame ||
             !samePoint(plan.queueAccesses[nextQueueAccess].point, cursor))
@@ -2762,7 +3315,7 @@ private:
         ++nextQueueAccess;
         break;
       case TransactionStateEventKind::MemoryAccess:
-        if (!event.memoryAccess || *event.memoryAccess != nextMemoryAccess ||
+        if (!event.record || *event.record != nextMemoryAccess ||
             nextMemoryAccess >= plan.memoryAccesses.size() ||
             plan.memoryAccesses[nextMemoryAccess].frame != event.frame ||
             !samePoint(plan.memoryAccesses[nextMemoryAccess].point, cursor))
@@ -2770,7 +3323,7 @@ private:
         ++nextMemoryAccess;
         break;
       case TransactionStateEventKind::BodyCheck:
-        if (!event.bodyCheck || *event.bodyCheck != nextCheck ||
+        if (!event.record || *event.record != nextCheck ||
             nextCheck >= plan.bodyChecks.size() ||
             plan.bodyChecks[nextCheck].frame != event.frame ||
             !samePoint(plan.bodyChecks[nextCheck].point, cursor))
@@ -2778,7 +3331,7 @@ private:
         ++nextCheck;
         break;
       case TransactionStateEventKind::Observe:
-        if (!event.observation || *event.observation != nextObservation ||
+        if (!event.record || *event.record != nextObservation ||
             nextObservation >= plan.observations.size() ||
             plan.observations[nextObservation].frame != event.frame ||
             !samePoint(plan.observations[nextObservation].point, cursor))
@@ -2845,7 +3398,6 @@ private:
     return success();
   }
 
-
   mlir::ModuleOp package;
   HardwareAnalysis hardware;
   StateAnalysisBudget &budget;
@@ -2860,10 +3412,12 @@ private:
   llvm::DenseMap<BoundValueId, BoundValueId> aliases;
   llvm::DenseMap<OwnerKey, StateOwnerId> owners;
   llvm::DenseMap<OwnerKey, QueueOwnerId> queueOwnerIds;
-  llvm::DenseMap<std::pair<QueueOwnerId, unsigned>, SmallVector<QueueAccessId, 0>>
+  llvm::DenseMap<std::pair<QueueOwnerId, unsigned>,
+                 SmallVector<QueueAccessId, 0>>
       queuePortClaims;
   llvm::DenseMap<OwnerKey, MemoryOwnerId> memoryOwnerIds;
-  llvm::DenseMap<std::pair<MemoryOwnerId, unsigned>, SmallVector<MemoryAccessId, 0>>
+  llvm::DenseMap<std::pair<MemoryOwnerId, unsigned>,
+                 SmallVector<MemoryAccessId, 0>>
       memoryPortClaims;
   llvm::DenseMap<OwnerKey, LexicalInstanceId> instances;
   llvm::DenseMap<OwnerKey, ResolvedSourceMethod> resolutions;
@@ -2879,7 +3433,7 @@ private:
 };
 
 LogicalResult chargePlanDump(const TransactionStatePlan &plan,
-                           StateAnalysisBudget &budget) {
+                             StateAnalysisBudget &budget) {
   // Admit every printable view before any stream output. Semantic-only
   // consumers do not traverse these records for unused dump reservations.
   auto transaction = plan.transaction;
@@ -2888,28 +3442,30 @@ LogicalResult chargePlanDump(const TransactionStatePlan &plan,
   // Prepay the added decimal prefix fields and exact clock/reset identities.
   if (!budget.charge(site, 64))
     return failure();
-  for (uint64_t count :
-       {plan.values.size(), plan.versions.size(), plan.bodyChecks.size(),
-        plan.observations.size(), plan.queueOwners.size(),
-        plan.queueAccesses.size(), plan.memoryOwners.size(), plan.memoryAccesses.size(),
-        plan.formalWrites.size(), plan.events.size()})
+  for (uint64_t count : {plan.values.size(), plan.versions.size(),
+                         plan.bodyChecks.size(), plan.observations.size(),
+                         plan.queueOwners.size(), plan.queueAccesses.size(),
+                         plan.memoryOwners.size(), plan.memoryAccesses.size(),
+                         plan.formalWrites.size(), plan.events.size()})
     if (!budget.charge(site, saturatedMultiply(96, count)))
       return failure();
-  for (uint64_t count :
-       {plan.instances.size(), plan.frames.size(), plan.values.size(),
-        plan.owners.size(), plan.versions.size(), plan.reads.size(),
-        plan.writes.size(), plan.guards.size(), plan.calls.size(),
-        plan.bodyChecks.size(), plan.observations.size(), plan.events.size(),
-        plan.finalVersions.size(), plan.results.size(), plan.branches.size(),
-        plan.joins.size(), plan.branchResults.size(), plan.controls.size(),
-        plan.selections.size(), plan.queueOwners.size(),
-        plan.queueAccesses.size(), plan.memoryOwners.size(), plan.memoryAccesses.size(),
-        plan.formalWrites.size()})
+  for (uint64_t count : {plan.instances.size(),      plan.frames.size(),
+                         plan.values.size(),         plan.owners.size(),
+                         plan.versions.size(),       plan.reads.size(),
+                         plan.writes.size(),         plan.guards.size(),
+                         plan.calls.size(),          plan.bodyChecks.size(),
+                         plan.observations.size(),   plan.events.size(),
+                         plan.finalVersions.size(),  plan.results.size(),
+                         plan.branches.size(),       plan.joins.size(),
+                         plan.branchResults.size(),  plan.controls.size(),
+                         plan.selections.size(),     plan.queueOwners.size(),
+                         plan.queueAccesses.size(),  plan.memoryOwners.size(),
+                         plan.memoryAccesses.size(), plan.formalWrites.size()})
     if (!budget.charge(site, count))
       return failure();
   if (!budget.chargeOccurrence(site, transaction.getOccurrence()) ||
-      !budget.charge(site, module.getSymName().size() +
-                               transaction.getName().size()))
+      !budget.charge(site,
+                     module.getSymName().size() + transaction.getName().size()))
     return failure();
   for (const auto &instance : plan.instances) {
     auto definition = instance.definition;
@@ -2949,9 +3505,8 @@ LogicalResult chargePlanDump(const TransactionStatePlan &plan,
         !budget.chargeAttribute(site, branch.conditionLocation))
       return failure();
   }
-  if (!budget.charge(site,
-                     saturatedMultiply(96, plan.controls.size() +
-                                               plan.selections.size())) ||
+  if (!budget.charge(site, saturatedMultiply(96, plan.controls.size() +
+                                                     plan.selections.size())) ||
       !budget.charge(site, saturatedMultiply(160, plan.joins.size())) ||
       !budget.charge(site, saturatedMultiply(160, plan.branchResults.size())))
     return failure();
@@ -2967,14 +3522,17 @@ LogicalResult chargePlanDump(const TransactionStatePlan &plan,
         !budget.chargeAttribute(site, access.location))
       return failure();
   for (const auto &memory : plan.memoryOwners)
-    if (!budget.charge(site, 256 + memory.inputs.size() + memory.outputs.size()) ||
+    if (!budget.charge(site,
+                       256 + memory.inputs.size() + memory.outputs.size()) ||
         !budget.chargeOccurrence(site, memory.occurrence) ||
         !budget.chargeAttribute(site, TypeAttr::get(memory.payloadType)) ||
-        !budget.chargeAttribute(site, memory.payloadConstraint)) return failure();
+        !budget.chargeAttribute(site, memory.payloadConstraint))
+      return failure();
   for (const auto &access : plan.memoryAccesses)
     if (!budget.charge(site, 160 + access.arguments.size()) ||
         !budget.chargeOccurrence(site, access.occurrence) ||
-        !budget.chargeAttribute(site, access.location)) return failure();
+        !budget.chargeAttribute(site, access.location))
+      return failure();
   for (const auto &check : plan.bodyChecks)
     if (!budget.charge(site, 8) ||
         !budget.chargeOccurrence(site, check.occurrence) ||
@@ -3083,7 +3641,8 @@ void printPlan(llvm::raw_ostream &out, const TransactionStatePlan &plan) {
       << plan.domain.reset.anchor << " clock=v" << plan.clockValue << " reset=v"
       << plan.resetValue << '\n';
   if (!plan.registrationPath.empty())
-    out << "  routing @" << plan.routingModule->getAttrOfType<StringAttr>("sym_name").getValue()
+    out << "  routing @"
+        << plan.routingModule->getAttrOfType<StringAttr>("sym_name").getValue()
         << " lexical-instance=i" << plan.lexicalAnchor
         << " registration-path=" << plan.registrationPath << '\n';
   for (auto [id, instance] : llvm::enumerate(plan.instances)) {
@@ -3187,11 +3746,16 @@ void printPlan(llvm::raw_ostream &out, const TransactionStatePlan &plan) {
         << write.version << " value=v" << write.value << " path=v"
         << write.authoredPath << '\n';
   for (auto [id, formal] : llvm::enumerate(plan.formalWrites)) {
-    out << "  formal-write f" << id << " frame=f" << formal.frame << " ordinal=" << formal.formal
-        << " payload=v" << formal.payload << " candidate=v" << formal.candidate
-        << " path=v" << formal.authoredPath << " mode=" << (formal.owner ? "owner" : "value");
-    if (formal.owner) out << " owner=o" << *formal.owner << " write=w" << *formal.write;
-    if (formal.snapshot) out << " snapshot=v" << *formal.snapshot << " previous=v" << *formal.previous;
+    out << "  formal-write f" << id << " frame=f" << formal.frame
+        << " ordinal=" << formal.formal << " payload=v" << formal.payload
+        << " candidate=v" << formal.candidate << " path=v"
+        << formal.authoredPath
+        << " mode=" << (formal.owner ? "owner" : "value");
+    if (formal.owner)
+      out << " owner=o" << *formal.owner << " write=w" << *formal.write;
+    if (formal.snapshot)
+      out << " snapshot=v" << *formal.snapshot << " previous=v"
+          << *formal.previous;
     out << '\n';
   }
   for (auto [id, guard] : llvm::enumerate(plan.guards)) {
@@ -3296,56 +3860,89 @@ void printPlan(llvm::raw_ostream &out, const TransactionStatePlan &plan) {
     out << "  queue-owner q" << id << " instance=i" << queue.anchor
         << " occurrence=" << queue.occurrence << " type=" << queue.payloadType
         << " payload-constraint=" << queue.payloadConstraint
-        << " domain=transaction data=v" << queue.data << " valid=v" << queue.valid
-        << " ready=v" << queue.ready << " in-valid=v" << queue.inValid
-        << " in-data=v" << queue.inData << " out-ready=v" << queue.outReady
-        << " unbound-push=" << queue.unboundPush << " unbound-pop=" << queue.unboundPop
+        << " domain=transaction data=v" << queue.data << " valid=v"
+        << queue.valid << " ready=v" << queue.ready << " in-valid=v"
+        << queue.inValid << " in-data=v" << queue.inData << " out-ready=v"
+        << queue.outReady << " unbound-push=" << queue.unboundPush
+        << " unbound-pop=" << queue.unboundPop
         << " depth=" << queue.config.depth
         << " latency=" << queue.config.availabilityLatency << '\n';
   }
   for (auto [id, access] : llvm::enumerate(plan.queueAccesses)) {
-    auto kind = access.kind == TransactionQueueAccessKind::Pop ? "pop"
-              : access.kind == TransactionQueueAccessKind::Peek ? "peek" : "push";
-    out << "  queue-access q" << id << " frame=f" << access.frame
-        << " owner=q" << access.owner << " kind=" << kind
-        << " path=v" << access.authoredPath << " point=";
+    auto kind = access.kind == TransactionQueueAccessKind::Pop    ? "pop"
+                : access.kind == TransactionQueueAccessKind::Peek ? "peek"
+                                                                  : "push";
+    out << "  queue-access q" << id << " frame=f" << access.frame << " owner=q"
+        << access.owner << " kind=" << kind << " path=v" << access.authoredPath
+        << " point=";
     printPoint(out, access.point);
     if (access.payload)
       out << " payload=v" << *access.payload;
     if (access.result)
       out << " result=v" << *access.result;
-    out << " occurrence=" << access.occurrence << " location=" << access.location << '\n';
+    out << " occurrence=" << access.occurrence
+        << " location=" << access.location << '\n';
   }
   for (auto [id, event] : llvm::enumerate(plan.events)) {
     out << "  event " << id << ' ' << eventName(event.kind) << " frame=f"
         << event.frame << " point=";
     printPoint(out, event.point);
-    if (event.selection)
-      out << " selection=s" << *event.selection;
-    if (event.read)
-      out << " read=r" << *event.read;
-    if (event.write)
-      out << " write=w" << *event.write;
-    if (event.formalWrite)
-      out << " formal-write=f" << *event.formalWrite;
-    if (event.guard)
-      out << " guard=g" << *event.guard;
-    if (event.call)
-      out << " call=c" << *event.call;
-    if (event.bodyCheck)
-      out << " body-check=b" << *event.bodyCheck;
-    if (event.observation)
-      out << " observation=o" << *event.observation;
-    if (event.queueAccess)
-      out << " queue-access=q" << *event.queueAccess;
-    if (event.memoryAccess)
-      out << " memory-access=m" << *event.memoryAccess;
-    if (event.branch)
-      out << " branch=h" << *event.branch;
-    if (event.join)
-      out << " join=j" << *event.join;
-    if (event.branchResult)
-      out << " branch-result=b" << *event.branchResult;
+    if (event.record) {
+      StringRef label;
+      switch (event.kind) {
+      case TransactionStateEventKind::Read:
+        label = "read=r";
+        break;
+      case TransactionStateEventKind::Write:
+        label = "write=w";
+        break;
+      case TransactionStateEventKind::FormalWrite:
+        label = "formal-write=f";
+        break;
+      case TransactionStateEventKind::GuardEnter:
+      case TransactionStateEventKind::GuardExit:
+        label = "guard=g";
+        break;
+      case TransactionStateEventKind::SelectionEnter:
+      case TransactionStateEventKind::SelectionExit:
+        label = "selection=s";
+        break;
+      case TransactionStateEventKind::CallEnter:
+      case TransactionStateEventKind::CallExit:
+        label = "call=c";
+        break;
+      case TransactionStateEventKind::BodyCheck:
+        label = "body-check=b";
+        break;
+      case TransactionStateEventKind::Observe:
+        label = "observation=o";
+        break;
+      case TransactionStateEventKind::QueueAccess:
+        label = "queue-access=q";
+        break;
+      case TransactionStateEventKind::MemoryAccess:
+        label = "memory-access=m";
+        break;
+      case TransactionStateEventKind::BranchEnter:
+      case TransactionStateEventKind::ThenEnter:
+      case TransactionStateEventKind::ThenExit:
+      case TransactionStateEventKind::ElseEnter:
+      case TransactionStateEventKind::ElseExit:
+      case TransactionStateEventKind::BranchExit:
+        label = "branch=h";
+        break;
+      case TransactionStateEventKind::StateJoin:
+        label = "join=j";
+        break;
+      case TransactionStateEventKind::BranchResult:
+        label = "branch-result=b";
+        break;
+      case TransactionStateEventKind::TransactionEnter:
+      case TransactionStateEventKind::TransactionExit:
+        break;
+      }
+      out << ' ' << label << *event.record;
+    }
     out << '\n';
   }
   out << "  final=";
@@ -3364,9 +3961,15 @@ namespace {
 // shares its fresh native admission and hierarchy selection but never publishes
 // a partially populated TransactionStatePlan.
 void runTransactionStateAnalysis(
-    Operation *op, SmallVector<TransactionStatePlan, 0> &plans,
-    uint64_t &analysisWork, bool &valid,
-    std::optional<ArrayRef<const TransactionStatePlan *>> expected = std::nullopt) {
+    Operation *op, SmallVector<TransactionDefinitionPlan, 0> &definitionPlans,
+    DenseMap<Operation *, TransactionDefinitionPlanId> &definitionIndex,
+    DenseMap<Operation *, TransactionDefinitionPlanId> &definitionOperationIndex,
+    SmallVector<TransactionStatePlan, 0> &plans, uint64_t &analysisWork,
+    uint64_t &definitionSummaryBuilds,
+    uint64_t &definitionSummaryOperationVisits, uint64_t &irWalks,
+    uint64_t &visitedNodes, bool &valid,
+    std::optional<ArrayRef<const TransactionStatePlan *>> expected =
+        std::nullopt) {
   auto package = dyn_cast_or_null<mlir::ModuleOp>(op);
   if (!package) {
     if (op)
@@ -3376,8 +3979,17 @@ void runTransactionStateAnalysis(
   }
   StateAnalysisBudget budget;
   PackageInventory inventory;
-  if (failed(preflight(package, budget, inventory)) ||
-      failed(mlir::verify(package)))
+  ++irWalks;
+  if (failed(preflight(package, budget, inventory)))
+    return;
+  if (failed(mlir::verify(package)))
+    return;
+  visitedNodes += inventory.operationCosts.size();
+  budget.setPhase("definition plan construction");
+  if (failed(buildDefinitionPlans(package, budget, definitionPlans,
+                                  definitionIndex, definitionOperationIndex,
+                                  definitionSummaryBuilds,
+                                  definitionSummaryOperationVisits)))
     return;
   budget.setPhase("resolver preparation");
   if (failed(priceResolver(package, budget, inventory)))
@@ -3387,31 +3999,51 @@ void runTransactionStateAnalysis(
     return;
   SmallVector<TransactionStatePlan, 0> completed;
   SourceReceiverProofContext receiverProof;
-  ClosedLayoutProofs closedTypes;
+  auto publishWorkStorage = [&](Operation *site, uint64_t work,
+                                uint64_t bytes) {
+    return success(
+        budget.charge(site, work) &&
+        budget.chargeStorage<uint64_t>(site, bytes / 8 + (bytes % 8 != 0)));
+  };
+  for (Operation &definition : package.getBody()->getOperations())
+    if (isa<ModuleOp, ModuleImportOp>(definition) &&
+        failed(receiverProof.publishVerifiedModule(
+            &definition, package, &definition, publishWorkStorage)))
+      return;
+  TransactionStructuralFacts structuralFacts;
+  structuralFacts.definitions = definitionPlans;
+  structuralFacts.definitionIndex = &definitionIndex;
+  structuralFacts.definitionOperationIndex = &definitionOperationIndex;
   HardwareAnalysis hardware(package);
   llvm::DenseSet<Operation *> allocated, referenceDefinitions,
       relativeDefinitions, contextualDefinitions;
   for (const auto &entry : inventory.operationCosts) {
-    if (!budget.charge(entry.first)) return;
+    if (!budget.charge(entry.first))
+      return;
     auto call = dyn_cast<SourceMethodCallOp>(entry.first);
-    if (!call || (!call->hasAttr("receiver_kind") &&
-                  !call->hasAttr("ancestor_depth"))) continue;
+    if (!call ||
+        (!call->hasAttr("receiver_kind") && !call->hasAttr("ancestor_depth")))
+      continue;
     auto module = call->getParentOfType<ModuleOp>();
     if (!relativeDefinitions.contains(module)) {
-      if (!budget.reserveMapInsert(call, relativeDefinitions)) return;
+      if (!budget.reserveMapInsert(call, relativeDefinitions))
+        return;
       relativeDefinitions.insert(module);
     }
     auto depth = call->getAttrOfType<IntegerAttr>("ancestor_depth");
     if (depth && depth.getInt() > 0) {
-      if (!budget.reserveMapInsert(call, contextualDefinitions)) return;
+      if (!budget.reserveMapInsert(call, contextualDefinitions))
+        return;
       contextualDefinitions.insert(module);
     }
   }
   for (auto module : package.getOps<ModuleOp>()) {
     if (auto refs = module->getAttrOfType<ArrayAttr>("ac.reference_parameters");
-        refs && !refs.empty()) referenceDefinitions.insert(module);
+        refs && !refs.empty())
+      referenceDefinitions.insert(module);
     for (auto allocation : module.getBody().front().getOps<InstanceOp>())
-      if (auto child = dyn_cast_or_null<ModuleOp>(hardware.resolveCallee(allocation)))
+      if (auto child =
+              dyn_cast_or_null<ModuleOp>(hardware.resolveCallee(allocation)))
         allocated.insert(child);
   }
   // The executable System is the occurrence authority for relative receivers.
@@ -3422,8 +4054,10 @@ void runTransactionStateAnalysis(
   if (!relativeDefinitions.empty()) {
     for (auto system : package.getOps<SystemOp>()) {
       auto callee = system.getEntry().getAs<FlatSymbolRefAttr>("callee");
-      auto root = dyn_cast_or_null<ModuleOp>(hardware.lookupDefinition(callee.getValue()));
-      if (!root || !budget.charge(system) || !budget.reserve(system, roots, 1)) return;
+      auto root = dyn_cast_or_null<ModuleOp>(
+          hardware.lookupDefinition(callee.getValue()));
+      if (!root || !budget.charge(system) || !budget.reserve(system, roots, 1))
+        return;
       roots.push_back(root);
       selectedRelativeRoot = true;
     }
@@ -3436,11 +4070,14 @@ void runTransactionStateAnalysis(
   // root also allocates the same generic definition with different actuals.
   for (auto system : package.getOps<SystemOp>()) {
     auto callee = system.getEntry().getAs<FlatSymbolRefAttr>("callee");
-    auto root = callee ? dyn_cast_or_null<ModuleOp>(hardware.lookupDefinition(callee.getValue()))
+    auto root = callee ? dyn_cast_or_null<ModuleOp>(
+                             hardware.lookupDefinition(callee.getValue()))
                        : ModuleOp();
-    if (!root || !budget.charge(system)) return;
+    if (!root || !budget.charge(system))
+      return;
     if (!llvm::is_contained(roots, root)) {
-      if (!budget.reserve(system, roots, 1)) return;
+      if (!budget.reserve(system, roots, 1))
+        return;
       roots.push_back(root);
     }
   }
@@ -3449,16 +4086,21 @@ void runTransactionStateAnalysis(
     while (changed) {
       changed = false;
       for (const auto &entry : inventory.operationCosts) {
-        if (!budget.charge(entry.first)) return;
+        if (!budget.charge(entry.first))
+          return;
         auto module = entry.first->getParentOfType<ModuleOp>();
-        if (!module || contextualDefinitions.contains(module)) continue;
+        if (!module || contextualDefinitions.contains(module))
+          continue;
         Operation *target = nullptr;
         if (auto call = dyn_cast<SourceMethodCallOp>(entry.first))
-          target = hardware.lookupDefinition(call.getCalleeAttr().getRootReference().getValue());
+          target = hardware.lookupDefinition(
+              call.getCalleeAttr().getRootReference().getValue());
         else if (auto allocation = dyn_cast<InstanceOp>(entry.first))
           target = hardware.resolveCallee(allocation);
-        if (!target || !contextualDefinitions.contains(target)) continue;
-        if (!budget.reserveMapInsert(entry.first, contextualDefinitions)) return;
+        if (!target || !contextualDefinitions.contains(target))
+          continue;
+        if (!budget.reserveMapInsert(entry.first, contextualDefinitions))
+          return;
         contextualDefinitions.insert(module);
         changed = true;
       }
@@ -3474,32 +4116,44 @@ void runTransactionStateAnalysis(
     llvm::DenseSet<Operation *> seen;
     std::function<LogicalResult(ModuleOp, unsigned)> collect =
         [&](ModuleOp module, unsigned depth) -> LogicalResult {
-      if (depth > maxDepth || !budget.charge(module)) return failure();
-      if (!seen.insert(module).second) return success();
-      if (!budget.reserve(root, closures[root], 1)) return failure();
+      if (depth > maxDepth || !budget.charge(module))
+        return failure();
+      if (!seen.insert(module).second)
+        return success();
+      if (!budget.reserve(root, closures[root], 1))
+        return failure();
       closures[root].push_back(module);
       for (auto allocation : module.getBody().front().getOps<InstanceOp>())
-        if (auto child = dyn_cast_or_null<ModuleOp>(hardware.resolveCallee(allocation)))
-          if (failed(collect(child, depth + 1))) return failure();
+        if (auto child =
+                dyn_cast_or_null<ModuleOp>(hardware.resolveCallee(allocation)))
+          if (failed(collect(child, depth + 1)))
+            return failure();
       return success();
     };
-    if (failed(collect(root, 0))) return;
+    if (failed(collect(root, 0)))
+      return;
   }
   if (!relativeDefinitions.empty()) {
     budget.setPhase("relative receiver occurrence closure");
     llvm::DenseSet<Operation *> selected;
     for (auto root : roots)
       for (auto module : closures[root]) {
-        if (!budget.charge(module)) return;
-        if (selected.contains(module)) continue;
-        if (!budget.reserveMapInsert(module, selected)) return;
+        if (!budget.charge(module))
+          return;
+        if (selected.contains(module))
+          continue;
+        if (!budget.reserveMapInsert(module, selected))
+          return;
         selected.insert(module);
       }
     if (selectedRelativeRoot)
       for (auto module : package.getOps<ModuleOp>()) {
-        if (!budget.charge(module)) return;
-        if (!selected.contains(module) && contextualDefinitions.contains(module)) {
-          module.emitOpError() << "contextual static instance reference has no selected caller occurrence";
+        if (!budget.charge(module))
+          return;
+        if (!selected.contains(module) &&
+            contextualDefinitions.contains(module)) {
+          module.emitOpError() << "contextual static instance reference has no "
+                                  "selected caller occurrence";
           return;
         }
       }
@@ -3507,32 +4161,45 @@ void runTransactionStateAnalysis(
       SmallVector<InstanceOp, 0> path;
       std::function<LogicalResult(ModuleOp, unsigned)> verifyOccurrence =
           [&](ModuleOp module, unsigned depth) -> LogicalResult {
-        if (depth > maxDepth || !budget.charge(module)) return failure();
+        if (depth > maxDepth || !budget.charge(module))
+          return failure();
         TransactionPlanBuilder builder(package, budget, inventory,
-                                       receiverProof, closedTypes);
-        if (failed(builder.verifyReceivers(module, root, path))) return failure();
+                                       receiverProof, structuralFacts);
+        if (failed(builder.verifyReceivers(module, root, path)))
+          return failure();
+        visitedNodes += inventory.moduleMethodCalls.lookup(module).size();
         for (auto allocation : module.getBody().front().getOps<InstanceOp>()) {
-          if (!budget.charge(allocation)) return failure();
-          auto child = dyn_cast_or_null<ModuleOp>(hardware.resolveCallee(allocation));
-          if (!child) continue;
-          if (!budget.reserve(root, path, 1)) return failure();
+          if (!budget.charge(allocation))
+            return failure();
+          auto child =
+              dyn_cast_or_null<ModuleOp>(hardware.resolveCallee(allocation));
+          if (!child)
+            continue;
+          if (!budget.reserve(root, path, 1))
+            return failure();
           path.push_back(allocation);
-          if (failed(verifyOccurrence(child, depth + 1))) return failure();
+          if (failed(verifyOccurrence(child, depth + 1)))
+            return failure();
           path.pop_back();
         }
         return success();
       };
-      if (failed(verifyOccurrence(root, 0))) return;
+      if (failed(verifyOccurrence(root, 0)))
+        return;
     }
     // Depth-zero declarations need local topology proof even when uncalled and
     // outside the executable closure. They do not become selected occurrences.
     if (selectedRelativeRoot)
       for (auto module : package.getOps<ModuleOp>()) {
-        if (!budget.charge(module)) return;
-        if (selected.contains(module)) continue;
+        if (!budget.charge(module))
+          return;
+        if (selected.contains(module))
+          continue;
         TransactionPlanBuilder builder(package, budget, inventory,
-                                       receiverProof, closedTypes);
-        if (failed(builder.verifyReceivers(module, module, {}))) return;
+                                       receiverProof, structuralFacts);
+        if (failed(builder.verifyReceivers(module, module, {})))
+          return;
+        visitedNodes += inventory.moduleMethodCalls.lookup(module).size();
       }
   }
   llvm::DenseSet<Operation *> liftedRoots;
@@ -3542,14 +4209,18 @@ void runTransactionStateAnalysis(
     for (auto root : roots) {
       bool affected = false;
       for (auto module : closures[root]) {
-        if (!budget.charge(root)) return;
+        if (!budget.charge(root))
+          return;
         affected |= referenceDefinitions.contains(module) ||
-                    relativeDefinitions.contains(module) || !module.getParameters().empty() ||
+                    relativeDefinitions.contains(module) ||
+                    !module.getParameters().empty() ||
                     liftedDefinitions.contains(module);
       }
-      if (!affected || !liftedRoots.insert(root).second) continue;
+      if (!affected || !liftedRoots.insert(root).second)
+        continue;
       changed = true;
-      for (auto module : closures[root]) liftedDefinitions.insert(module);
+      for (auto module : closures[root])
+        liftedDefinitions.insert(module);
     }
   }
   if (expected && liftedRoots.empty()) {
@@ -3563,12 +4234,14 @@ void runTransactionStateAnalysis(
       return;
     }
     for (auto [index, transaction] : llvm::enumerate(inventory.transactions)) {
-      if (!budget.charge(transaction, 7)) return;
+      if (!budget.charge(transaction, 7))
+        return;
       auto lexical = transaction->getParentOfType<ModuleOp>();
       const auto *candidate = (*expected)[index];
       if (!candidate || candidate->transaction != transaction ||
-          candidate->lexicalModule != lexical || candidate->routingModule != lexical ||
-          !candidate->registrationPath || !candidate->registrationPath.empty() ||
+          candidate->lexicalModule != lexical ||
+          candidate->routingModule != lexical || !candidate->registrationPath ||
+          !candidate->registrationPath.empty() ||
           candidate->lexicalAnchor != 0 || candidate->ordinal != index) {
         boundedError(transaction) << "transaction occurrence routing differs";
         return;
@@ -3581,39 +4254,56 @@ void runTransactionStateAnalysis(
   auto build = [&](SourceTransactionOp transaction, ModuleOp root,
                    ArrayRef<InstanceOp> path) -> LogicalResult {
     budget.setPhase("transaction plans");
+    // A transaction is the stable owner of its occurrence-local state plan.
+    // Bound construction and final self-validation together, independently of
+    // preceding definition/package work. Persistent storage remains globally
+    // charged by StateAnalysisBudget.
+    StateAnalysisBudget::LocalScope transactionBudget(budget);
     if (!budget.charge(transaction, 2) ||
         !budget.chargeStorage<TransactionStatePlan>(transaction, 1) ||
-        !budget.reserve(transaction, completed, 1)) return failure();
+        !budget.reserve(transaction, completed, 1))
+      return failure();
     TransactionPlanBuilder builder(package, budget, inventory, receiverProof,
-                                   closedTypes);
+                                   structuralFacts);
     auto plan = builder.run(transaction, root, path);
-    if (failed(plan)) return failure();
+    if (failed(plan))
+      return failure();
     plan->ordinal = completed.size();
     completed.push_back(std::move(*plan));
     return success();
   };
   for (SourceTransactionOp transaction : inventory.transactions)
     if (!liftedDefinitions.contains(transaction->getParentOfType<ModuleOp>()))
-      if (failed(build(transaction, {}, {}))) return;
+      if (failed(build(transaction, {}, {})))
+        return;
   for (auto root : roots) {
-    if (!liftedRoots.contains(root)) continue;
+    if (!liftedRoots.contains(root))
+      continue;
     SmallVector<InstanceOp, 0> path;
     std::function<LogicalResult(ModuleOp, unsigned)> expand =
         [&](ModuleOp module, unsigned depth) -> LogicalResult {
-      if (depth > maxDepth || !budget.charge(module)) return failure();
-      for (auto transaction : module.getBody().front().getOps<SourceTransactionOp>())
-        if (failed(build(transaction, root, path))) return failure();
+      if (depth > maxDepth || !budget.charge(module))
+        return failure();
+      for (auto transaction :
+           module.getBody().front().getOps<SourceTransactionOp>())
+        if (failed(build(transaction, root, path)))
+          return failure();
       for (auto allocation : module.getBody().front().getOps<InstanceOp>()) {
-        auto child = dyn_cast_or_null<ModuleOp>(hardware.resolveCallee(allocation));
-        if (!child) continue;
-        if (!budget.reserve(root, path, 1)) return failure();
+        auto child =
+            dyn_cast_or_null<ModuleOp>(hardware.resolveCallee(allocation));
+        if (!child)
+          continue;
+        if (!budget.reserve(root, path, 1))
+          return failure();
         path.push_back(allocation);
-        if (failed(expand(child, depth + 1))) return failure();
+        if (failed(expand(child, depth + 1)))
+          return failure();
         path.pop_back();
       }
       return success();
     };
-    if (failed(expand(root, 0))) return;
+    if (failed(expand(root, 0)))
+      return;
   }
   // Compute the connected transaction components before choosing the physical
   // routing ancestor. Shared state and registrations in
@@ -3621,16 +4311,22 @@ void runTransactionStateAnalysis(
   // of one lexical registration also close together: a shared definition must
   // never execute a retained local copy as well as a routed occurrence.
   if (!budget.chargeStorage<uint64_t>(package, completed.size()) ||
-      !budget.chargeStorage<SmallVector<Attribute, 0>>(package, completed.size()) ||
-      !budget.chargeStorage<uint8_t>(package, completed.size())) return;
+      !budget.chargeStorage<SmallVector<Attribute, 0>>(package,
+                                                       completed.size()) ||
+      !budget.chargeStorage<uint8_t>(package, completed.size()))
+    return;
   SmallVector<uint64_t, 0> component;
   component.reserve(completed.size());
-  for (uint64_t i = 0; i < completed.size(); ++i) component.push_back(i);
+  for (uint64_t i = 0; i < completed.size(); ++i)
+    component.push_back(i);
   bool componentValid = true;
   auto leader = [&](uint64_t i) {
     auto original = i;
     while (component[i] != i) {
-      if (!budget.charge(package)) { componentValid = false; return i; }
+      if (!budget.charge(package)) {
+        componentValid = false;
+        return i;
+      }
       i = component[i];
     }
     while (component[original] != i) {
@@ -3643,18 +4339,24 @@ void runTransactionStateAnalysis(
   for (uint64_t i = 0; i < completed.size(); ++i)
     for (uint64_t j = 0; j < i; ++j) {
       auto &a = completed[i], &b = completed[j];
-      if (!budget.charge(a.transaction)) return;
-      if (a.routingModule != b.routingModule) continue;
+      if (!budget.charge(a.transaction))
+        return;
+      if (a.routingModule != b.routingModule)
+        continue;
       bool connected = a.transaction == b.transaction ||
-          (a.lexicalModule == b.lexicalModule && a.registrationPath == b.registrationPath);
+                       (a.lexicalModule == b.lexicalModule &&
+                        a.registrationPath == b.registrationPath);
       for (const auto &left : a.owners)
         for (const auto &right : b.owners) {
-          if (!budget.charge(a.transaction)) return;
-          connected |= left.declaration == right.declaration && left.instancePath == right.instancePath;
+          if (!budget.charge(a.transaction))
+            return;
+          connected |= left.declaration == right.declaration &&
+                       left.instancePath == right.instancePath;
         }
       if (connected) {
         auto left = leader(i), right = leader(j);
-        if (!componentValid) return;
+        if (!componentValid)
+          return;
         component[std::max(left, right)] = std::min(left, right);
       }
     }
@@ -3671,10 +4373,15 @@ void runTransactionStateAnalysis(
       initialized[group] = true;
       return;
     }
-    if (!budget.charge(package, 1 + std::min(common[group].size(), path.size()))) { componentValid = false; return; }
+    if (!budget.charge(package,
+                       1 + std::min(common[group].size(), path.size()))) {
+      componentValid = false;
+      return;
+    }
     unsigned size = 0;
     while (size < common[group].size() && size < path.size() &&
-           common[group][size] == path[size]) ++size;
+           common[group][size] == path[size])
+      ++size;
     common[group].resize(size);
   };
   for (auto [index, plan] : llvm::enumerate(completed)) {
@@ -3683,25 +4390,33 @@ void runTransactionStateAnalysis(
     for (const auto &frame : plan.frames) {
       intersect(group, plan.instances[frame.anchor].occurrencePath);
       if (!frame.call || !frame.parent ||
-          !frame.call->hasAttr("ancestor_depth")) continue;
+          !frame.call->hasAttr("ancestor_depth"))
+        continue;
       auto anchor = plan.frames[*frame.parent].anchor;
-      auto levels = frame.call->getAttrOfType<IntegerAttr>("ancestor_depth").getInt();
+      auto levels =
+          frame.call->getAttrOfType<IntegerAttr>("ancestor_depth").getInt();
       for (int64_t level = 0; level < levels; ++level) {
-        if (!budget.charge(frame.call)) return;
+        if (!budget.charge(frame.call))
+          return;
         auto parent = plan.instances[anchor].parent;
         if (!parent) {
-          frame.call->emitOpError() << "static instance reference escapes the selected root";
+          frame.call->emitOpError()
+              << "static instance reference escapes the selected root";
           return;
         }
         anchor = *parent;
       }
       intersect(group, plan.instances[anchor].occurrencePath);
     }
-    for (const auto &owner : plan.owners) intersect(group, owner.instancePath);
-    for (const auto &owner : plan.queueOwners) intersect(group, owner.instancePath);
-    for (const auto &owner : plan.memoryOwners) intersect(group, owner.instancePath);
+    for (const auto &owner : plan.owners)
+      intersect(group, owner.instancePath);
+    for (const auto &owner : plan.queueOwners)
+      intersect(group, owner.instancePath);
+    for (const auto &owner : plan.memoryOwners)
+      intersect(group, owner.instancePath);
   }
-  if (!componentValid) return;
+  if (!componentValid)
+    return;
   // If any context needs a lifted registration, every other context of that
   // same source declaration must also supply its result/control ports. Close
   // that selection across roots before rebuilding plans, rather than cloning
@@ -3711,9 +4426,11 @@ void runTransactionStateAnalysis(
     closeSelection = false;
     llvm::DenseSet<Operation *> moved;
     for (auto [index, plan] : llvm::enumerate(completed))
-      if (common[leader(index)].size() < plan.registrationPath.size()) moved.insert(plan.transaction);
+      if (common[leader(index)].size() < plan.registrationPath.size())
+        moved.insert(plan.transaction);
     for (auto [index, plan] : llvm::enumerate(completed)) {
-      if (!budget.charge(plan.transaction)) return;
+      if (!budget.charge(plan.transaction))
+        return;
       auto group = leader(index);
       if (moved.contains(plan.transaction) && !plan.registrationPath.empty() &&
           common[group].size() == plan.registrationPath.size()) {
@@ -3726,12 +4443,16 @@ void runTransactionStateAnalysis(
   for (auto [index, plan] : llvm::enumerate(completed)) {
     auto group = leader(index);
     unsigned prefix = common[group].size();
-    if (llvm::any_of(plan.instances, [](const TransactionLexicalInstance &instance) {
-          auto definition = instance.definition;
-          return !definition.getParameters().empty();
-        })) prefix = 0;
+    if (llvm::any_of(plan.instances,
+                     [](const TransactionLexicalInstance &instance) {
+                       auto definition = instance.definition;
+                       return !definition.getParameters().empty();
+                     }))
+      prefix = 0;
     auto root = plan.routingModule;
-    if (!componentValid || !budget.chargeStorage<InstanceOp>(plan.transaction, plan.registrationPath.size())) return;
+    if (!componentValid || !budget.chargeStorage<InstanceOp>(
+                               plan.transaction, plan.registrationPath.size()))
+      return;
     SmallVector<InstanceOp, 0> registration;
     registration.reserve(plan.registrationPath.size());
     auto anchor = plan.lexicalAnchor;
@@ -3743,23 +4464,34 @@ void runTransactionStateAnalysis(
     for (unsigned depth = 0; depth < prefix; ++depth)
       root = cast<ModuleOp>(hardware.resolveCallee(registration[depth]));
     SmallVector<Attribute, 0> suffix;
-    for (auto allocation : ArrayRef<InstanceOp>(registration).drop_front(prefix)) suffix.push_back(allocation.getOccurrence());
+    for (auto allocation :
+         ArrayRef<InstanceOp>(registration).drop_front(prefix))
+      suffix.push_back(allocation.getOccurrence());
     auto path = ArrayAttr::get(package.getContext(), suffix);
     bool duplicate = false;
     for (const auto &prior : rebased) {
-      if (!budget.charge(plan.transaction)) return;
-      duplicate |= prior.routingModule == root && prior.transaction == plan.transaction && prior.registrationPath == path;
+      if (!budget.charge(plan.transaction))
+        return;
+      duplicate |= prior.routingModule == root &&
+                   prior.transaction == plan.transaction &&
+                   prior.registrationPath == path;
     }
-    if (duplicate) continue;
+    if (duplicate)
+      continue;
     if (prefix) {
+      StateAnalysisBudget::LocalScope transactionBudget(budget);
       TransactionPlanBuilder builder(package, budget, inventory, receiverProof,
-                                     closedTypes);
-      auto fresh = builder.run(plan.transaction, root, ArrayRef<InstanceOp>(registration).drop_front(prefix));
-      if (failed(fresh)) return;
+                                     structuralFacts);
+      auto fresh =
+          builder.run(plan.transaction, root,
+                      ArrayRef<InstanceOp>(registration).drop_front(prefix));
+      if (failed(fresh))
+        return;
       plan = std::move(*fresh);
     }
     if (!budget.chargeStorage<TransactionStatePlan>(plan.transaction, 1) ||
-        !budget.reserve(plan.transaction, rebased, 1)) return;
+        !budget.reserve(plan.transaction, rebased, 1))
+      return;
     plan.ordinal = rebased.size();
     rebased.push_back(std::move(plan));
   }
@@ -3771,7 +4503,8 @@ void runTransactionStateAnalysis(
       return;
     }
     for (auto [index, source] : llvm::enumerate(completed)) {
-      if (!budget.charge(source.transaction, 7)) return;
+      if (!budget.charge(source.transaction, 7))
+        return;
       const auto *candidate = (*expected)[index];
       if (!candidate || candidate->transaction != source.transaction ||
           candidate->routingModule != source.routingModule ||
@@ -3779,7 +4512,8 @@ void runTransactionStateAnalysis(
           candidate->ordinal != source.ordinal ||
           candidate->lexicalModule != source.lexicalModule ||
           candidate->lexicalAnchor != source.lexicalAnchor) {
-        boundedError(source.transaction) << "transaction occurrence routing differs";
+        boundedError(source.transaction)
+            << "transaction occurrence routing differs";
         return;
       }
     }
@@ -3792,49 +4526,169 @@ void runTransactionStateAnalysis(
 } // namespace
 
 SourceTransactionStateAnalysis::SourceTransactionStateAnalysis(Operation *op) {
-  runTransactionStateAnalysis(op, plans, analysisWork, valid);
+  runTransactionStateAnalysis(
+      op, definitionPlans, definitionPlanIndex, definitionOperationIndex,
+      plans, analysisWork, definitionSummaryBuilds,
+      definitionSummaryOperationVisits, irWalks, visitedNodes, valid);
 }
 
 FailureOr<uint64_t> SourceTransactionStateAnalysis::verifyOccurrences(
     Operation *op, ArrayRef<const TransactionStatePlan *> expected) {
   SmallVector<TransactionStatePlan, 0> unused;
+  SmallVector<TransactionDefinitionPlan, 0> definitions;
+  DenseMap<Operation *, TransactionDefinitionPlanId> definitionIndex;
+  DenseMap<Operation *, TransactionDefinitionPlanId> definitionOperationIndex;
   uint64_t work = 0;
+  uint64_t summaryBuilds = 0, summaryOperationVisits = 0;
+  uint64_t walks = 0, visited = 0;
   bool valid = false;
-  runTransactionStateAnalysis(op, unused, work, valid, expected);
-  if (!valid) return failure();
+  runTransactionStateAnalysis(op, definitions, definitionIndex,
+                              definitionOperationIndex, unused, work,
+                              summaryBuilds, summaryOperationVisits, walks,
+                              visited, valid, expected);
+  if (!valid)
+    return failure();
   return work;
+}
+
+void SourceTransactionStateAnalysis::collectMetrics(
+    acir::metrics::CompilerPhaseMetrics &metrics) const {
+  metrics.work = analysisWork;
+  metrics.definitions = definitionPlans.size();
+  metrics.occurrences = plans.size();
+  metrics.irWalks = irWalks;
+  metrics.visitedNodes = visitedNodes;
+  metrics.details["definition_summary_builds"] = definitionSummaryBuilds;
+  metrics.details["definition_summary_operation_visits"] =
+      definitionSummaryOperationVisits;
+  uint64_t valueCount = 0, versionCount = 0, eventCount = 0;
+  uint64_t branchCount = 0, joinCount = 0, frameCount = 0;
+  metrics.planEntries = definitionPlans.size() + plans.size();
+  metrics.planBytes =
+      definitionPlans.capacity() * sizeof(TransactionDefinitionPlan) +
+      plans.capacity() * sizeof(TransactionStatePlan) +
+      definitionPlanIndex.getMemorySize() +
+      definitionOperationIndex.getMemorySize();
+  for (const auto &definition : definitionPlans) {
+    metrics.planEntries +=
+        definition.operations.size() + definition.branchSelections.size();
+    metrics.planBytes +=
+        definition.operations.capacity() * sizeof(Operation *) +
+        definition.branchSelections.getMemorySize();
+  }
+  for (const auto &plan : plans) {
+    valueCount += plan.values.size();
+    versionCount += plan.versions.size();
+    eventCount += plan.events.size();
+    branchCount += plan.branches.size();
+    joinCount += plan.joins.size();
+    frameCount += plan.frames.size();
+    metrics.calls += plan.calls.size();
+    metrics.instances += plan.instances.size();
+#define PYC_TRANSACTION_PLAN_VECTOR(field)                                     \
+  metrics.planEntries += plan.field.size();                                    \
+  metrics.planBytes += plan.field.capacity() *                                 \
+                       sizeof(typename decltype(plan.field)::value_type)
+    PYC_TRANSACTION_PLAN_VECTOR(instances);
+    PYC_TRANSACTION_PLAN_VECTOR(frames);
+    PYC_TRANSACTION_PLAN_VECTOR(values);
+    PYC_TRANSACTION_PLAN_VECTOR(owners);
+    PYC_TRANSACTION_PLAN_VECTOR(queueOwners);
+    PYC_TRANSACTION_PLAN_VECTOR(queueAccesses);
+    PYC_TRANSACTION_PLAN_VECTOR(memoryOwners);
+    PYC_TRANSACTION_PLAN_VECTOR(memoryAccesses);
+    PYC_TRANSACTION_PLAN_VECTOR(versions);
+    PYC_TRANSACTION_PLAN_VECTOR(reads);
+    PYC_TRANSACTION_PLAN_VECTOR(writes);
+    PYC_TRANSACTION_PLAN_VECTOR(formalWrites);
+    PYC_TRANSACTION_PLAN_VECTOR(guards);
+    PYC_TRANSACTION_PLAN_VECTOR(controls);
+    PYC_TRANSACTION_PLAN_VECTOR(selections);
+    PYC_TRANSACTION_PLAN_VECTOR(calls);
+    PYC_TRANSACTION_PLAN_VECTOR(bodyChecks);
+    PYC_TRANSACTION_PLAN_VECTOR(observations);
+    PYC_TRANSACTION_PLAN_VECTOR(branches);
+    PYC_TRANSACTION_PLAN_VECTOR(joins);
+    PYC_TRANSACTION_PLAN_VECTOR(branchResults);
+    PYC_TRANSACTION_PLAN_VECTOR(events);
+    PYC_TRANSACTION_PLAN_VECTOR(finalVersions);
+    PYC_TRANSACTION_PLAN_VECTOR(results);
+#undef PYC_TRANSACTION_PLAN_VECTOR
+  }
+  metrics.details["bound_values"] = valueCount;
+  metrics.details["state_versions"] = versionCount;
+  metrics.details["events"] = eventCount;
+  metrics.details["branches"] = branchCount;
+  metrics.details["joins"] = joinCount;
+  metrics.details["frames"] = frameCount;
+}
+
+const TransactionDefinitionPlan *
+SourceTransactionStateAnalysis::lookupDefinitionPlan(
+    Operation *callable) const {
+  if (!valid || !callable)
+    return nullptr;
+  auto found = definitionPlanIndex.find(callable);
+  return found == definitionPlanIndex.end() ||
+                 found->second >= definitionPlans.size()
+             ? nullptr
+             : &definitionPlans[found->second];
+}
+
+std::optional<TransactionDefinitionPlanId>
+SourceTransactionStateAnalysis::lookupDefinitionPlanId(
+    Operation *operation) const {
+  if (!valid || !operation)
+    return std::nullopt;
+  auto found = definitionOperationIndex.find(operation);
+  if (found == definitionOperationIndex.end() ||
+      found->second >= definitionPlans.size())
+    return std::nullopt;
+  return found->second;
 }
 
 const TransactionStatePlan *
 SourceTransactionStateAnalysis::lookup(SourceTransactionOp transaction) const {
-  if (!valid || !transaction) return nullptr;
+  if (!valid || !transaction)
+    return nullptr;
   const TransactionStatePlan *found = nullptr;
   for (const auto &plan : plans) {
-    if (plan.transaction != transaction) continue;
-    if (plan.registrationPath.empty()) return &plan;
-    if (found) return nullptr;
+    if (plan.transaction != transaction)
+      continue;
+    if (plan.registrationPath.empty())
+      return &plan;
+    if (found)
+      return nullptr;
     found = &plan;
   }
   return found;
 }
 
-const TransactionStatePlan *SourceTransactionStateAnalysis::lookup(
-    SourceTransactionOp transaction, ModuleOp routingModule,
-    ArrayAttr registrationPath) const {
-  if (!valid) return nullptr;
+const TransactionStatePlan *
+SourceTransactionStateAnalysis::lookup(SourceTransactionOp transaction,
+                                       ModuleOp routingModule,
+                                       ArrayAttr registrationPath) const {
+  if (!valid)
+    return nullptr;
   for (const auto &plan : plans)
-    if (plan.transaction == transaction && plan.routingModule == routingModule &&
-        plan.registrationPath == registrationPath) return &plan;
+    if (plan.transaction == transaction &&
+        plan.routingModule == routingModule &&
+        plan.registrationPath == registrationPath)
+      return &plan;
   return nullptr;
 }
 
-LogicalResult SourceTransactionStateAnalysis::print(llvm::raw_ostream &out) const {
-  if (!valid) return failure();
+LogicalResult
+SourceTransactionStateAnalysis::print(llvm::raw_ostream &out) const {
+  if (!valid)
+    return failure();
   StateAnalysisBudget budget(analysisWork);
   budget.setPhase("transaction dump reservation");
   for (const auto &plan : plans)
-    if (failed(chargePlanDump(plan, budget))) return failure();
-  for (const auto &plan : plans) printPlan(out, plan);
+    if (failed(chargePlanDump(plan, budget)))
+      return failure();
+  for (const auto &plan : plans)
+    printPlan(out, plan);
   return success();
 }
 

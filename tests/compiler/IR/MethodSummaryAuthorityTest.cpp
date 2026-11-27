@@ -2591,19 +2591,21 @@ TEST_F(MethodSummaryAuthorityTest,
   });
   ASSERT_TRUE(mlir::succeeded(first)) << diagnostics;
   unsigned warmMisses = misses;
+  unsigned warmSelected = selected;
   unsigned firstBindings = bindings;
   ASSERT_GT(warmMisses, 0u);
+  ASSERT_GT(warmSelected, 0u);
   ASSERT_GT(firstBindings, 0u);
   auto second = capture([&] {
     return resolveSourceMethodCall(*right, parent, lookup, &proof, &fees);
   });
   ASSERT_TRUE(mlir::succeeded(second)) << diagnostics;
   EXPECT_EQ(misses, warmMisses);
+  EXPECT_EQ(selected, warmSelected);
   EXPECT_GT(bindings, firstBindings);
   EXPECT_NE(first->receiver, second->receiver);
   EXPECT_EQ(array(first->receiver, "instance_path")[0], occurrence("Root", 1));
   EXPECT_EQ(array(second->receiver, "instance_path")[0], occurrence("Root", 2));
-  EXPECT_GT(selected, 0u);
   EXPECT_GT(chargedWork + chargedBytes, 0u);
 
   rejectBinding = true;

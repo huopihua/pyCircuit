@@ -3,6 +3,7 @@
 
 #include "PythonImportAST.h"
 #include "SourceUnit.h"
+#include "pycircuit/Analysis/CompilerPhaseMetrics.h"
 #include "mlir/Pass/Pass.h"
 #include <memory>
 
@@ -10,7 +11,8 @@ namespace acir::compiler::detail {
 
 std::unique_ptr<mlir::Pass>
 createLowerPythonSourcePass(mlir::DictionaryAttr owner,
-                            const SourceHeaderRegistry &headers);
+                            const SourceHeaderRegistry &headers,
+                            acir::metrics::CompilerPhaseMetrics *metrics = nullptr);
 
 } // namespace acir::compiler::detail
 

@@ -1146,7 +1146,8 @@ FailureOr<Value> Importer::tableUpdate(Value table, Value index,
 FailureOr<Value> Importer::unsignedBoundary(Value value, Type target,
                                             const AstNode &node, OpBuilder &at,
                                             FlatSymbolRefAttr symbol,
-                                            bool allowFixedWidening) {
+                                            bool allowFixedWidening,
+                                            bool allowTemplateActual) {
   auto info = valueInfo(value);
   auto fixedResult = [&](Value result) {
     auto interval = info.interval;
@@ -1165,10 +1166,42 @@ FailureOr<Value> Importer::unsignedBoundary(Value value, Type target,
     return result;
   };
   auto targetBits = dyn_cast<ac::BitsType>(target);
+  auto actualBits = dyn_cast<ac::BitsType>(value.getType());
   auto equivalent = equivalentBoundaryTypes(value.getType(), target,
                                             at.getBlock()->getParentOp());
   if (failed(equivalent))
     return failure();
+  if (allowTemplateActual && actualBits && targetBits && !*equivalent) {
+    ac::HardwareAnalysis analysis(*body);
+    auto *parent = at.getBlock()->getParentOp();
+    auto lexicalModule = isa<ac::ModuleOp>(parent)
+                             ? cast<ac::ModuleOp>(parent)
+                             : parent->getParentOfType<ac::ModuleOp>();
+    auto *lexical = lexicalModule.getOperation();
+    ac::HardwareBindings bindings;
+    bindings.owner = lexical;
+    if (!analysis.isStaticEvaluable(actualBits.getWidth(), bindings) ||
+        !analysis.isStaticEvaluable(targetBits.getWidth(), bindings)) {
+      // The producer is a generic occurrence-local payload (for example a
+      // Memory T = bits[WIDTH]).  The declared boundary remains concrete, and
+      // every actual occurrence later proves the resolved widths.  Preserve
+      // both types here instead of evaluating the parameter with an empty
+      // binding or borrowing its declaration default.
+      if (failed(ac::detail::verifySourceTemplateType(
+              analysis, value.getType(), bindings, parent)) ||
+          failed(ac::detail::verifySourceTemplateType(
+              analysis, target, bindings, parent)))
+        return failure();
+      // Normalize the producer spelling to the same lexical parameter owner
+      // used by Method results before creating the identity wire.
+      auto actual = analysis.resolveType(value.getType(), bindings, parent);
+      if (failed(actual))
+        return failure();
+      if (*actual != value.getType())
+        value = boundaryBitsIdentity(value, *actual, node, at, symbol);
+      return boundaryBitsIdentity(value, target, node, at, symbol);
+    }
+  }
   if (targetBits && !fixedValues.contains(value) && !info.sourceKind)
     return mlir::emitError(node.location(b.getContext(), source.path))
            << "unsigned boundary requires authoritative bits, Boolean or "

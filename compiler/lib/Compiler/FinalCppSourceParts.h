@@ -17,6 +17,8 @@ struct FinalCppSourceParts {
 };
 mlir::FailureOr<FinalCppSourceParts> emitCppSourceParts(
     mlir::ModuleOp package, ac::HardwareAnalysis &analysis);
+void renderCppSourceParts(const FinalCppSourceParts &parts,
+                          llvm::raw_ostream &out);
 mlir::LogicalResult emitCpp(mlir::ModuleOp package,
     ac::HardwareAnalysis &analysis, llvm::raw_ostream &out);
 } // namespace acir::compiler

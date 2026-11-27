@@ -123,6 +123,9 @@ public:
         demandInventory(demandInventory), authenticate(authenticate) {}
 
   FailureOr<uint64_t> incomingMemoryPorts() { return memoryIncomingCount(); }
+  FailureOr<uint64_t> incomingMemoryReadPorts() {
+    return memoryReadInputCount();
+  }
 
   LogicalResult run() {
     if (authenticate && failed(memoryWiring())) return failure();
@@ -208,6 +211,9 @@ public:
       nextInput = SourceCheckBudget::add(nextInput,
           SourceCheckBudget::multiply(2, routes.size()));
     }
+    auto memoryReadInputs = memoryReadInputCount();
+    if (failed(memoryReadInputs)) return failure();
+    nextInput = SourceCheckBudget::add(nextInput, *memoryReadInputs);
     for (Attribute item : incoming) {
       auto row = dyn_cast<DictionaryAttr>(item);
       auto parsed = route(row, true);
@@ -1041,18 +1047,25 @@ private:
   llvm::DenseSet<OpOperand *> terminals;
   llvm::DenseSet<OpOperand *> prospectiveAllowed;
   llvm::DenseSet<Value> prospectivePrivate, prospectiveLeaves, unusedSummaryRoots;
+  std::optional<uint64_t> memoryReadInputPorts;
   llvm::DenseSet<OpOperand *> &verifiedUses;
   QueueDemandInventory &demandInventory;
   bool authenticate;
 
 };
 } // namespace
-FailureOr<uint64_t> getMemoryIncomingPortCount(ModuleOp module,
+FailureOr<MemoryPrivateInputCount> getMemoryPrivateInputCount(ModuleOp module,
     const HardwareAnalysis &analysis, const HardwareBindings &bindings,
     SourceCheckBudget &budget) {
   llvm::DenseSet<OpOperand *> uses;
   QueueDemandInventory demands;
-  return QueueWiringProof(analysis, budget, module, bindings, uses, demands, false).incomingMemoryPorts();
+  QueueWiringProof proof(analysis, budget, module, bindings, uses, demands,
+                         false);
+  auto reads = proof.incomingMemoryReadPorts();
+  auto pins = succeeded(reads) ? proof.incomingMemoryPorts()
+                               : FailureOr<uint64_t>(failure());
+  if (failed(reads) || failed(pins)) return failure();
+  return MemoryPrivateInputCount{*reads, *pins};
 }
 LogicalResult verifyQueueResourceWiring(const HardwareAnalysis &analysis,
     ArrayRef<std::pair<ModuleOp, HardwareBindings>> scopes, SourceCheckBudget &budget) {
@@ -1060,6 +1073,7 @@ LogicalResult verifyQueueResourceWiring(const HardwareAnalysis &analysis,
   SmallVector<const std::pair<ModuleOp, HardwareBindings> *, 0> verifiedRoots;
   for (const auto &entry : scopes) {
     const auto &[module, bindings] = entry;
+    SourceCheckBudget::LocalScope rootBudget(budget);
     if (failed(budget.debit(1, module))) return failure();
     bool verified = false;
     for (const auto *prior : verifiedRoots) {

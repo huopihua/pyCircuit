@@ -2,6 +2,7 @@
 #define ACIR_LIB_COMPILER_SOURCELINK_H
 
 #include "SourceUnit.h"
+#include "pycircuit/Analysis/CompilerPhaseMetrics.h"
 
 namespace acir::compiler {
 
@@ -18,6 +19,13 @@ struct SourceLinkStages {
   std::string afterTransactions;
   std::string beforeEntryNormalization;
   std::string normalizedEntry;
+};
+
+struct SourceLinkMetrics {
+  acir::metrics::CompilerPhaseMetrics transactionPlanning;
+  acir::metrics::CompilerPhaseMetrics routing;
+  acir::metrics::CompilerPhaseMetrics proof;
+  acir::metrics::CompilerPhaseMetrics finalVerification;
 };
 
 struct SourceLinkParameterBinding {
@@ -38,7 +46,8 @@ linkSourceUnits(llvm::ArrayRef<SourceLinkUnit> units, llvm::StringRef top,
                   SourceLinkStages *retainedStages = nullptr,
                   llvm::ArrayRef<SourceLinkParameterBinding> parameters = {},
                   llvm::StringRef resetSemantics = "strict",
-                  llvm::StringRef execution = "");
+                  llvm::StringRef execution = "",
+                  SourceLinkMetrics *metrics = nullptr);
 
 } // namespace acir::compiler
 

@@ -1,8 +1,9 @@
 // Included beside OrderedPrefixProof so queue proposals reuse the admission
 // grammar and its four-state knownness proof.
 static LogicalResult proveQueueProposalPrefixes(
-    const SampledAdmissionView &view, const PreparedSampledBoundaries &prepared,
-    const HardwareAnalysis &analysis, SourceCheckBudget &budget, OrderedPrefixProof &proof) {
+    const SampledAdmissionView &view, const PreparedSampledDefinition &prepared,
+    const HardwareAnalysis &analysis, SourceCheckBudget &budget,
+    OrderedPrefixProof &proof) {
   if (view.queueProposals.empty() && view.memoryProposals.empty()) return success();
   struct Factor { HardwareIdentityEndpoint value; bool positive; bool expandedSelector = false; bool literal = false; };
   struct Factors { SmallVector<Factor> atoms; bool alwaysFalse = false; };
@@ -60,6 +61,9 @@ static LogicalResult proveQueueProposalPrefixes(
     return view.rule->emitOpError() << "queue prefix references an unavailable selection";
   };
   for (auto [index, control] : llvm::enumerate(view.controls)) {
+    SourceCheckBudget::PhaseScope controlPhase(
+        budget, "sampled proposal acceptance proof");
+    SourceCheckBudget::LocalScope controlBudget(budget);
     auto path = selectedPath(control.executionPath);
     auto raw = normalizedControl(index);
     if (failed(path) || failed(raw)) return failure();
@@ -84,6 +88,9 @@ static LogicalResult proveQueueProposalPrefixes(
     acceptances.push_back(std::move(*accepted));
   }
   for (const auto &proposal : view.queueProposals) {
+    SourceCheckBudget::PhaseScope proposalPhase(
+        budget, "sampled queue proposal proof");
+    SourceCheckBudget::LocalScope proposalBudget(budget);
     auto pathFactors = factors(proposal.rawPath);
     if (failed(pathFactors)) return failure();
     // Each omitted control needs a concrete opposite-arm witness. Unknown

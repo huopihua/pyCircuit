@@ -325,7 +325,7 @@ FailureOr<OwningOpRef<ModuleOp>> linkSourceUnits(
     ac::detail::EmitError emitError, SourceLinkTarget target,
     SourceLinkStages *retainedStages,
     ArrayRef<SourceLinkParameterBinding> parameters, StringRef resetSemantics,
-    StringRef execution) {
+    StringRef execution, SourceLinkMetrics *metrics) {
   if (resetSemantics != "strict" && resetSemantics != "if_one")
     return emitError() << "reset semantics must be strict or if_one";
   auto admitted = admitSourceLinkUnits(units, emitError);
@@ -553,17 +553,30 @@ FailureOr<OwningOpRef<ModuleOp>> linkSourceUnits(
   // Capture storage outlives instrumentation. Validate before any diagnostic
   // printing, using existing hardware limits for packages with no transactions.
   TransactionStageCapture capture;
+  if (metrics) {
+    metrics->transactionPlanning.name = "transaction_planning";
+    metrics->routing.name = "routing";
+    metrics->proof.name = "proof";
+    metrics->finalVerification.name = "final_verification";
+  }
   PassManager pipeline(context);
   pipeline.addPass(acir::createNormalizeSourceControlFlowPass());
   pipeline.addPass(std::make_unique<CompactLiteralPayloadWiresPass>());
   pipeline.addPass(std::make_unique<DiscardUninstantiatedSourceTemplatesPass>());
   pipeline.addPass(std::make_unique<NormalizeEntryBoundaryPass>(
       retainedStages ? &capture : nullptr));
-  if (ac::detail::findUnloweredTransaction(linked->getOperation()))
-    pipeline.addPass(acir::createAnalyzeTransactionStateSSAPass());
-  auto route = acir::createRouteTransactionsPass();
+  const bool hasTransactions =
+      ac::detail::findUnloweredTransaction(linked->getOperation());
+  if (hasTransactions)
+    pipeline.addPass(acir::createAnalyzeTransactionStateSSAPass(
+        metrics ? &metrics->transactionPlanning : nullptr));
+  auto route = acir::createRouteTransactionsPass(
+      metrics ? acir::TransactionRoutingMetrics{&metrics->routing,
+                                                &metrics->proof}
+              : acir::TransactionRoutingMetrics{});
   auto lower = target == SourceLinkTarget::Hardware
-                   ? acir::createLowerTransactionsPass()
+                   ? acir::createLowerTransactionsPass(
+                         metrics ? &metrics->finalVerification : nullptr)
                    : std::unique_ptr<Pass>();
   if (retainedStages)
     pipeline.addInstrumentation(
@@ -574,6 +587,13 @@ FailureOr<OwningOpRef<ModuleOp>> linkSourceUnits(
     pipeline.addPass(std::move(lower));
   if (failed(pipeline.run(*linked)))
     return failure();
+  if (metrics) {
+    if (!hasTransactions) {
+      metrics->transactionPlanning.status = "complete";
+      metrics->routing.status = "complete";
+      metrics->proof.status = "complete";
+    }
+  }
   if (retainedStages) {
     if (capture.beforeCount != 1 || capture.routedCount != 1 ||
         capture.afterCount != (target == SourceLinkTarget::Hardware ? 1u : 0u))

@@ -95,6 +95,7 @@ def compile_command(
     package_prefix: str = "",
     interface_units: Sequence[str | Path] = (),
     replace: bool = False,
+    metrics_out: str | Path | None = None,
 ) -> _SourceCompileResult:
     """``pycircuit compile``: one source into one published source unit."""
 
@@ -108,6 +109,7 @@ def compile_command(
         output=output,
         interface_units=tuple(interface_units),
         replace=replace,
+        metrics_out=metrics_out,
     )
 
 
@@ -193,6 +195,7 @@ def link_command(
     verify_only: bool = False,
     replace: bool = False,
     filesystem: _PublicationFileSystem | None = None,
+    metrics_out: str | Path | None = None,
 ) -> _PublicationResult:
     """``pycircuit link``: one closed unit set into one published program.
 
@@ -207,6 +210,8 @@ def link_command(
     ):
         raise _DriverError("execution selection requires source-unit final linking")
     if from_anchor is not None:
+        if metrics_out is not None:
+            raise _DriverError("--metrics-out currently requires source-unit linking")
         if (
             units
             or top is not None
@@ -336,6 +341,7 @@ def link_command(
                 command += ["--body", str(body), "--header", str(header)]
             program = scratch / ("anchor" if target == "anchor" else "design_top.ac")
             report = scratch / "entry-owner.json"
+            metrics_path = scratch / "link-metrics.json"
             command += [
                 "--top",
                 top,
@@ -346,9 +352,15 @@ def link_command(
                 "--entry-owner-out",
                 str(report),
             ]
+            if metrics_out is not None:
+                command += ["--metrics-out", str(metrics_path)]
             completed = subprocess.run(
                 command, text=True, capture_output=True, check=False
             )
+            if metrics_out is not None:
+                from ._metrics import publish_metrics
+
+                publish_metrics(metrics_path, metrics_out)
             if completed.returncode != 0:
                 detail = completed.stderr.strip() or completed.stdout.strip()
                 raise _DriverError(f"native link rejected the unit set: {detail}")

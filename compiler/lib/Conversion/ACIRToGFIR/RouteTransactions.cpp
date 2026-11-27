@@ -1,20 +1,20 @@
-#include "Dialect/ACIR/SourceFormalProposalProof.h"
 #include "Dialect/ACIR/HardwareGrantProof.h"
-#include "Dialect/ACIR/SourceFormalCandidateSelection.h"
-#include "pycircuit/Conversion/ACIRToGFIR.h"
-#include "TransactionValueAvailability.h"
-#include "Dialect/ACIR/HardwareValueAvailability.h"
 #include "Dialect/ACIR/HardwareQueueResources.h"
-#include "Dialect/ACIR/SourceCheckBudget.h"
 #include "Dialect/ACIR/HardwareSourceChecks.h"
+#include "Dialect/ACIR/HardwareValueAvailability.h"
+#include "Dialect/ACIR/SourceCheckBudget.h"
+#include "Dialect/ACIR/SourceFormalCandidateSelection.h"
+#include "Dialect/ACIR/SourceFormalProposalProof.h"
 #include "Dialect/ACIR/SourceTransactionSummary.h"
+#include "TransactionValueAvailability.h"
+#include "pycircuit/Conversion/ACIRToGFIR.h"
 #include "pycircuit/Dialect/ACIR/ACIRDialect.h"
 #include "pycircuit/Dialect/ACIR/GFIRPackageValidation.h"
 #include "pycircuit/Dialect/ACIR/SourceMethodAnalysis.h"
+#include "pycircuit/Dialect/ACIR/SourceUnitValidation.h"
 #include "pycircuit/Dialect/ACIR/TransactionalContracts.h"
 #include "pycircuit/Dialect/GFIR/GFIRDialect.h"
 #include "pycircuit/Dialect/GFIR/GFIROps.h"
-#include "pycircuit/Dialect/ACIR/SourceUnitValidation.h"
 
 // Conversion-common helpers now live beside both conversion stages.
 #include "../Common/ConversionCommon.h"
@@ -25,9 +25,10 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringSet.h"
+#include <array>
 #include <functional>
 #include <limits>
 #include <map>
@@ -44,16 +45,16 @@ using detail::MaterializedTransaction;
 using detail::MaterializedTransactionLowering;
 using detail::MaterializedVersion;
 using detail::PreparedTransactionLowering;
+using detail::QueueRoutingKey;
+using detail::resourceFrame;
+using detail::resourceLocation;
+using detail::resourceOccurrence;
+using detail::resourceOperation;
+using detail::resourcePoint;
 using detail::Route;
 using detail::RoutingKey;
-using detail::QueueRoutingKey;
-using detail::TransactionQueueProposal;
 using detail::TransactionPreparation;
-using detail::resourcePoint;
-using detail::resourceOperation;
-using detail::resourceFrame;
-using detail::resourceOccurrence;
-using detail::resourceLocation;
+using detail::TransactionQueueProposal;
 
 // Conversion-common helpers shared with the GFIRToHWIR refinement stage;
 // routing call sites keep their original spelling.
@@ -111,7 +112,8 @@ FailureOr<Type> branchResultType(Type type,
                                  Operation *site, SourceCheckBudget &budget) {
   SourceCheckBudget::RawDiagnosticScope rawDiagnostics(budget);
   auto admitted = ac::detail::resolveSourceBranchResultType(
-      type, hardware, bindings, bindings.owner ? bindings.owner : site, [&](uint64_t work, uint64_t bytes) {
+      type, hardware, bindings, bindings.owner ? bindings.owner : site,
+      [&](uint64_t work, uint64_t bytes) {
         return budget.debit(
             SourceCheckBudget::add(work,
                                    bytes == std::numeric_limits<uint64_t>::max()
@@ -119,33 +121,43 @@ FailureOr<Type> branchResultType(Type type,
                                        : SourceCheckBudget::bytes(bytes)),
             site);
       });
-  if (failed(admitted)) return failure();
+  if (failed(admitted))
+    return failure();
   return type;
 }
 
 // Rebase shared-definition payload metadata into the routing declaration's
 // lexical parameter context; actual occurrence layouts remain separate.
-FailureOr<Attribute> routedPayloadAttribute(Attribute attribute,
-    const ac::HardwareAnalysis &hardware, const ac::HardwareBindings &bindings,
-    Operation *site) {
-  if (!attribute || (bindings.integers.empty() && bindings.types.empty())) return attribute;
+FailureOr<Attribute>
+routedPayloadAttribute(Attribute attribute,
+                       const ac::HardwareAnalysis &hardware,
+                       const ac::HardwareBindings &bindings, Operation *site) {
+  if (!attribute || (bindings.integers.empty() && bindings.types.empty()))
+    return attribute;
   if (auto type = dyn_cast<TypeAttr>(attribute)) {
-    if (!isa<ac::BitsType, ac::TableType, ac::StructType, ac::EnumType, ac::TypeParamType>(type.getValue()))
+    if (!isa<ac::BitsType, ac::TableType, ac::StructType, ac::EnumType,
+             ac::TypeParamType>(type.getValue()))
       return attribute;
     auto resolved = hardware.resolveType(type.getValue(), bindings, site);
-    if (failed(resolved)) return failure();
+    if (failed(resolved))
+      return failure();
     return Attribute(TypeAttr::get(*resolved));
   }
   if (auto expression = dyn_cast<ac::StaticExprAttr>(attribute)) {
-    auto substituted = cast<ac::StaticExprAttr>(hardware.substituteAttribute(expression, bindings));
+    auto substituted = cast<ac::StaticExprAttr>(
+        hardware.substituteAttribute(expression, bindings));
     NamedAttrList tree(substituted.getTree());
     for (NamedAttribute field : substituted.getTree()) {
-      if (!isa<TypeAttr, ac::StaticExprAttr>(field.getValue())) continue;
-      auto value = routedPayloadAttribute(field.getValue(), hardware, bindings, site);
-      if (failed(value)) return failure();
+      if (!isa<TypeAttr, ac::StaticExprAttr>(field.getValue()))
+        continue;
+      auto value =
+          routedPayloadAttribute(field.getValue(), hardware, bindings, site);
+      if (failed(value))
+        return failure();
       tree.set(field.getName(), *value);
     }
-    return Attribute(ac::StaticExprAttr::get(attribute.getContext(), tree.getDictionary(attribute.getContext())));
+    return Attribute(ac::StaticExprAttr::get(
+        attribute.getContext(), tree.getDictionary(attribute.getContext())));
   }
   if (auto dictionary = dyn_cast<DictionaryAttr>(attribute)) {
     NamedAttrList result;
@@ -153,10 +165,13 @@ FailureOr<Attribute> routedPayloadAttribute(Attribute attribute,
       // Source evidence retains its original declaration identity.
       if (field.getName() == "origin" || field.getName() == "location" ||
           field.getName() == "occurrence") {
-        result.append(field); continue;
+        result.append(field);
+        continue;
       }
-      auto value = routedPayloadAttribute(field.getValue(), hardware, bindings, site);
-      if (failed(value)) return failure();
+      auto value =
+          routedPayloadAttribute(field.getValue(), hardware, bindings, site);
+      if (failed(value))
+        return failure();
       result.append(field.getName(), *value);
     }
     return Attribute(result.getDictionary(attribute.getContext()));
@@ -165,7 +180,8 @@ FailureOr<Attribute> routedPayloadAttribute(Attribute attribute,
     SmallVector<Attribute> result;
     for (Attribute raw : array) {
       auto value = routedPayloadAttribute(raw, hardware, bindings, site);
-      if (failed(value)) return failure();
+      if (failed(value))
+        return failure();
       result.push_back(*value);
     }
     return Attribute(ArrayAttr::get(attribute.getContext(), result));
@@ -174,21 +190,27 @@ FailureOr<Attribute> routedPayloadAttribute(Attribute attribute,
 }
 
 LogicalResult rebasePayloadClone(Operation *operation,
-    const ac::HardwareAnalysis &hardware, const ac::HardwareBindings &bindings) {
+                                 const ac::HardwareAnalysis &hardware,
+                                 const ac::HardwareBindings &bindings) {
   auto walked = operation->walk([&](Operation *nested) {
-    auto attrs = routedPayloadAttribute(nested->getAttrDictionary(), hardware, bindings, nested);
-    if (failed(attrs)) return WalkResult::interrupt();
+    auto attrs = routedPayloadAttribute(nested->getAttrDictionary(), hardware,
+                                        bindings, nested);
+    if (failed(attrs))
+      return WalkResult::interrupt();
     nested->setAttrs(cast<DictionaryAttr>(*attrs));
     for (Value result : nested->getResults()) {
       auto type = hardware.resolveType(result.getType(), bindings, nested);
-      if (failed(type)) return WalkResult::interrupt();
+      if (failed(type))
+        return WalkResult::interrupt();
       result.setType(*type);
     }
     for (Region &region : nested->getRegions())
       for (Block &block : region)
         for (BlockArgument argument : block.getArguments()) {
-          auto type = hardware.resolveType(argument.getType(), bindings, nested);
-          if (failed(type)) return WalkResult::interrupt();
+          auto type =
+              hardware.resolveType(argument.getType(), bindings, nested);
+          if (failed(type))
+            return WalkResult::interrupt();
           argument.setType(*type);
         }
     return WalkResult::advance();
@@ -251,22 +273,26 @@ public:
   FailureOr<bool> compact(Type type, const ac::HardwareAnalysis &hardware,
                           Operation *site, SourceCheckBudget &budget);
   FailureOr<Type> admit(Type original, const ac::HardwareAnalysis &hardware,
-                         const ac::HardwareBindings &bindings, Operation *site,
-                         SourceCheckBudget &budget) {
-    if (!charge(budget, site, 2)) return failure();
+                        const ac::HardwareBindings &bindings, Operation *site,
+                        SourceCheckBudget &budget) {
+    if (!charge(budget, site, 2))
+      return failure();
     const ac::HardwareBindings *context = &bindings;
     if (bindings.integers.empty() && bindings.types.empty()) {
       // Separate Rule frames of one unparameterized Module carry equivalent
       // immutable bindings. Reuse type admission across those frames while
       // keeping their value histories and generated graph proofs independent.
       for (uint64_t count = emptyContexts.size() + 1; count; count >>= 1)
-        if (!charge(budget, site, 2)) return failure();
+        if (!charge(budget, site, 2))
+          return failure();
       auto found = emptyContexts.find(bindings.owner);
       if (found != emptyContexts.end()) {
         context = found->second;
       } else {
-        if (!charge(budget, site, 8 + SourceCheckBudget::bytes(
-                sizeof(decltype(emptyContexts)::value_type) + 4 * sizeof(void *))))
+        if (!charge(budget, site,
+                    8 + SourceCheckBudget::bytes(
+                            sizeof(decltype(emptyContexts)::value_type) +
+                            4 * sizeof(void *))))
           return failure();
         emptyContexts.try_emplace(bindings.owner, context);
       }
@@ -279,25 +305,33 @@ public:
         context = nullptr;
     }
     auto key = std::make_pair(context, original);
-    if (auto found = admitted.find(key); found != admitted.end()) return found->second;
-    auto resolved = branchResultType(original, hardware, bindings, site, budget);
-    if (failed(resolved)) return failure();
+    if (auto found = admitted.find(key); found != admitted.end())
+      return found->second;
+    auto resolved =
+        branchResultType(original, hardware, bindings, site, budget);
+    if (failed(resolved))
+      return failure();
     using Bucket = decltype(admitted)::value_type;
     uint64_t oldCapacity = admitted.getMemorySize() / sizeof(Bucket);
     uint64_t capacity = std::max(uint64_t(64), oldCapacity);
     uint64_t count = admitted.size() + 1;
     while (SourceCheckBudget::multiply(count, 4) >=
            SourceCheckBudget::multiply(capacity, 3)) {
-      if (!charge(budget, site)) return failure();
+      if (!charge(budget, site))
+        return failure();
       capacity = SourceCheckBudget::multiply(capacity, 2);
     }
     if (capacity > oldCapacity &&
-        !charge(budget, site, SourceCheckBudget::add(admitted.size(),
-            SourceCheckBudget::bytes(SourceCheckBudget::multiply(capacity, sizeof(Bucket))))))
+        !charge(budget, site,
+                SourceCheckBudget::add(
+                    admitted.size(),
+                    SourceCheckBudget::bytes(SourceCheckBudget::multiply(
+                        capacity, sizeof(Bucket))))))
       return failure();
     admitted.try_emplace(key, *resolved);
     return *resolved;
   }
+
 private:
   llvm::DenseMap<std::pair<const ac::HardwareBindings *, Type>, Type> admitted;
   std::map<Operation *, const ac::HardwareBindings *> emptyContexts;
@@ -313,15 +347,16 @@ FailureOr<Type> admittedBranchField(Type declared,
                                     const ac::HardwareBindings &bindings,
                                     Operation *site, SourceCheckBudget &budget,
                                     BranchTypeAdmissionCache *cache) {
-  if (!charge(budget, site, 16)) return failure();
+  if (!charge(budget, site, 16))
+    return failure();
   auto bits = dyn_cast<ac::BitsType>(declared);
   auto tree = bits ? bits.getWidth().getTree() : DictionaryAttr();
   auto kind = tree ? tree.getAs<StringAttr>("kind") : StringAttr();
   auto value = tree ? tree.getAs<DictionaryAttr>("value") : DictionaryAttr();
   auto valueKind = value ? value.getAs<StringAttr>("kind") : StringAttr();
   if (tree && tree.size() == 4 && kind && kind.getValue() == "literal" &&
-      tree.get("origin") && tree.get("location") && value && value.size() == 2 &&
-      valueKind && valueKind.getValue() == "integer" &&
+      tree.get("origin") && tree.get("location") && value &&
+      value.size() == 2 && valueKind && valueKind.getValue() == "integer" &&
       value.getAs<ac::MathIntAttr>("value"))
     return declared;
   return cache ? cache->admit(declared, hardware, bindings, site, budget)
@@ -332,17 +367,18 @@ FailureOr<Type> admittedBranchField(Type declared,
 // probe's traversal separately before the existing static evaluator recurses;
 // no occurrence binding may make a logical Table eligible for compact data.
 LogicalResult prepayBranchShapeProbe(Attribute attribute, Operation *site,
-                                    SourceCheckBudget &budget,
-                                    unsigned depth = 0) {
+                                     SourceCheckBudget &budget,
+                                     unsigned depth = 0) {
   if (depth > 128 || !charge(budget, site, 8))
     return failure();
   if (auto expression = dyn_cast<ac::StaticExprAttr>(attribute))
-    return prepayBranchShapeProbe(expression.getTree(), site, budget, depth + 1);
+    return prepayBranchShapeProbe(expression.getTree(), site, budget,
+                                  depth + 1);
   if (auto dictionary = dyn_cast<DictionaryAttr>(attribute)) {
     for (NamedAttribute field : dictionary) {
       if (!charge(budget, site, field.getName().strref().size()) ||
           failed(prepayBranchShapeProbe(field.getValue(), site, budget,
-                                       depth + 1)))
+                                        depth + 1)))
         return failure();
     }
   } else if (auto array = dyn_cast<ArrayAttr>(attribute)) {
@@ -354,10 +390,10 @@ LogicalResult prepayBranchShapeProbe(Attribute attribute, Operation *site,
       return prepayBranchShapeProbe(bits.getWidth(), site, budget, depth + 1);
     if (auto table = dyn_cast<ac::TableType>(type.getValue())) {
       if (failed(prepayBranchShapeProbe(table.getShape(), site, budget,
-                                       depth + 1)))
+                                        depth + 1)))
         return failure();
       return prepayBranchShapeProbe(TypeAttr::get(table.getElementType()), site,
-                                   budget, depth + 1);
+                                    budget, depth + 1);
     }
   } else if (auto text = dyn_cast<StringAttr>(attribute)) {
     if (!charge(budget, site, SourceCheckBudget::bytes(text.getValue().size())))
@@ -374,9 +410,9 @@ LogicalResult prepayBranchShapeProbe(Attribute attribute, Operation *site,
 // or one occurrence's actual layout. The source proof invokes the predicate
 // afresh against its own original hardware analysis and type admission.
 FailureOr<bool> compactBranchSelection(Type root,
-                                      const ac::HardwareAnalysis &hardware,
-                                      Operation *site,
-                                      SourceCheckBudget &budget) {
+                                       const ac::HardwareAnalysis &hardware,
+                                       Operation *site,
+                                       SourceCheckBudget &budget) {
   if (!charge(budget, site, 4))
     return failure();
   if (isa<ac::BitsType>(root))
@@ -424,8 +460,9 @@ FailureOr<bool> compactBranchSelection(Type root,
     for (Attribute raw : declaration.getFields()) {
       if (!charge(budget, site, 2) || !prepayAppend(budget, site, pending))
         return failure();
-      pending.push_back({cast<DictionaryAttr>(raw).getAs<TypeAttr>("type").getValue(),
-                         next.depth + 1});
+      pending.push_back(
+          {cast<DictionaryAttr>(raw).getAs<TypeAttr>("type").getValue(),
+           next.depth + 1});
     }
   }
   return true;
@@ -449,9 +486,11 @@ BranchTypeAdmissionCache::compact(Type type,
 FailureOr<BranchJoinLayout>
 branchJoinLayout(Type root, const ac::HardwareAnalysis &hardware,
                  const ac::HardwareBindings &bindings, Operation *site,
-                 SourceCheckBudget &budget, BranchTypeAdmissionCache *cache = nullptr) {
-  auto admitted = cache ? cache->admit(root, hardware, bindings, site, budget)
-                        : branchResultType(root, hardware, bindings, site, budget);
+                 SourceCheckBudget &budget,
+                 BranchTypeAdmissionCache *cache = nullptr) {
+  auto admitted =
+      cache ? cache->admit(root, hardware, bindings, site, budget)
+            : branchResultType(root, hardware, bindings, site, budget);
   if (failed(admitted))
     return failure();
   struct Pending {
@@ -494,17 +533,19 @@ branchJoinLayout(Type root, const ac::HardwareAnalysis &hardware,
     } else if (auto table = dyn_cast<ac::TableType>(next.type)) {
       auto count = hardware.getTableSize(table, bindings, site);
       if (failed(count) || !product(budget, site, *count,
-                                   sizeof(BranchJoinNode) + sizeof(uint64_t)))
+                                    sizeof(BranchJoinNode) + sizeof(uint64_t)))
         return failure();
       if (*count > result.nodes[id].children.max_size() ||
-          *count > result.nodes[id].fields.max_size()) return failure();
+          *count > result.nodes[id].fields.max_size())
+        return failure();
       result.nodes[id].children.reserve(*count);
       result.nodes[id].fields.reserve(*count);
       result.operations = SourceCheckBudget::add(
           result.operations, SourceCheckBudget::add(1, 3 * *count));
       // Element order is the established flattened Table order.
       for (uint64_t i = 0; i < *count; ++i) {
-        if (!prepayAppend(budget, site, pending)) return failure();
+        if (!prepayAppend(budget, site, pending))
+          return failure();
         pending.push_back({table.getElementType(), {}, id, next.depth + 1});
       }
     } else if (auto structure = dyn_cast<ac::StructType>(next.type)) {
@@ -525,7 +566,8 @@ branchJoinLayout(Type root, const ac::HardwareAnalysis &hardware,
           result.operations,
           SourceCheckBudget::add(1, SourceCheckBudget::multiply(count, 2)));
       for (Attribute raw : llvm::reverse(fields)) {
-        if (!charge(budget, site, 2)) return failure();
+        if (!charge(budget, site, 2))
+          return failure();
         auto field = cast<DictionaryAttr>(raw);
         Type declared = field.getAs<TypeAttr>("type").getValue();
         // This traversal's admitted root proves the complete nominal closure.
@@ -535,7 +577,8 @@ branchJoinLayout(Type root, const ac::HardwareAnalysis &hardware,
         if (isa<ac::StructType, ac::EnumType>(declared))
           resolved = declared;
         else if (isa<ac::BitsType, ac::TableType>(declared))
-          resolved = admittedBranchField(declared, hardware, bindings, site, budget, cache);
+          resolved = admittedBranchField(declared, hardware, bindings, site,
+                                         budget, cache);
         else
           return site->emitOpError() << "unsupported local branch field type";
         if (failed(resolved) || !prepayAppend(budget, site, pending))
@@ -554,7 +597,8 @@ branchJoinLayout(Type root, const ac::HardwareAnalysis &hardware,
 // authority has already been established from its nominal declaration.
 DictionaryAttr selectionSourceLocation(Operation *source) {
   auto span = source->getAttrOfType<DictionaryAttr>("ac.condition_location");
-  if (!span) span = source->getAttrOfType<DictionaryAttr>("ac.guard_location");
+  if (!span)
+    span = source->getAttrOfType<DictionaryAttr>("ac.guard_location");
   if (!span)
     if (auto transaction = source->getParentOfType<ac::SourceTransactionOp>())
       span = transaction->getAttrOfType<DictionaryAttr>("ac.guard_location");
@@ -576,7 +620,8 @@ Type branchCarrierType(uint64_t width, Operation *branch,
   // transaction region. Its predicate type retains verified width provenance,
   // just as the generated literal values below retain their carrier's span.
   if (!location && predicateType)
-    location = predicateType.getWidth().getTree().getAs<DictionaryAttr>("location");
+    location =
+        predicateType.getWidth().getTree().getAs<DictionaryAttr>("location");
   auto literal = ac::MathIntAttr::get(
       branch->getContext(), llvm::APSInt(llvm::APInt(64, width), true));
   auto tree = builder.getDictionaryAttr(
@@ -615,19 +660,20 @@ bool prepayBranchJoin(SourceCheckBudget &budget, Operation *site,
 // Both preparation and materialization independently reserve the actual one-op
 // graph before allocation, including properties, paths/segments and inventory.
 bool prepayCompactBranchJoin(SourceCheckBudget &budget, Operation *site) {
-  uint64_t bytes = sizeof(Operation *) + sizeof(Operation) +
-                   sizeof(OperationState) + 3 * sizeof(Value) +
-                   2 * sizeof(OpResult) + 2 * sizeof(Type) +
-                   2 * sizeof(NamedAttribute) +
-                   sizeof(ac::ValueMergeOp::Properties) +
-                   2 * sizeof(ArrayAttr) + sizeof(Attribute) +
-                   sizeof(DenseI32ArrayAttr) + 3 * sizeof(int32_t);
+  uint64_t bytes =
+      sizeof(Operation *) + sizeof(Operation) + sizeof(OperationState) +
+      3 * sizeof(Value) + 2 * sizeof(OpResult) + 2 * sizeof(Type) +
+      2 * sizeof(NamedAttribute) + sizeof(ac::ValueMergeOp::Properties) +
+      2 * sizeof(ArrayAttr) + sizeof(Attribute) + sizeof(DenseI32ArrayAttr) +
+      3 * sizeof(int32_t);
   return charge(budget, site, 64 + SourceCheckBudget::bytes(bytes));
 }
 
 LogicalResult prepayBranchSelection(Type type,
-    const ac::HardwareAnalysis &hardware, const ac::HardwareBindings &bindings,
-    Operation *site, SourceCheckBudget &budget, BranchTypeAdmissionCache &cache) {
+                                    const ac::HardwareAnalysis &hardware,
+                                    const ac::HardwareBindings &bindings,
+                                    Operation *site, SourceCheckBudget &budget,
+                                    BranchTypeAdmissionCache &cache) {
   auto admitted = cache.admit(type, hardware, bindings, site, budget);
   if (failed(admitted))
     return failure();
@@ -636,7 +682,8 @@ LogicalResult prepayBranchSelection(Type type,
     return failure();
   if (*compact)
     return success(prepayCompactBranchJoin(budget, site));
-  auto layout = branchJoinLayout(type, hardware, bindings, site, budget, &cache);
+  auto layout =
+      branchJoinLayout(type, hardware, bindings, site, budget, &cache);
   return success(succeeded(layout) && prepayBranchJoin(budget, site, *layout));
 }
 
@@ -715,7 +762,7 @@ FailureOr<DictionaryAttr> sampledPath(const ac::TransactionStatePlan &plan,
 }
 
 FailureOr<bool> staticTotality(const ac::TransactionStatePlan &plan,
-                              SourceCheckBudget &budget) {
+                               SourceCheckBudget &budget) {
   if (!plan.transaction->getNumResults())
     return true;
   if (!plan.queueAccesses.empty() || !plan.memoryAccesses.empty())
@@ -771,7 +818,8 @@ LogicalResult requireStaticTotality(const ac::TransactionStatePlan &plan,
                                     SourceCheckBudget &budget,
                                     bool managed = false) {
   auto total = staticTotality(plan, budget);
-  if (failed(total)) return failure();
+  if (failed(total))
+    return failure();
   if (!*total && !managed)
     return plan.transaction->emitOpError()
            << "ordinary transaction results require proven total admission";
@@ -783,7 +831,8 @@ bool branchHasStateWrites(const ac::TransactionStatePlan &plan,
   for (const auto &write : plan.writes) {
     auto path = plan.versions[write.version].validity.path;
     for (unsigned depth = 0; path.branch && depth < 128; ++depth) {
-      if (*path.branch == wanted) return true;
+      if (*path.branch == wanted)
+        return true;
       path = plan.branches[*path.branch].entry.path;
     }
   }
@@ -830,10 +879,12 @@ verifyPreparedEffectInventory(const PreparedTransactionLowering &prepared,
                               SourceCheckBudget &budget) {
   SmallVector<uint64_t> rank(prepared.transactions.size(), UINT64_MAX);
   if (prepared.transactionSchedule.size() != prepared.transactions.size())
-    return prepared.original->emitError() << "transaction schedule inventory is inconsistent";
+    return prepared.original->emitError()
+           << "transaction schedule inventory is inconsistent";
   for (auto [ordinal, index] : llvm::enumerate(prepared.transactionSchedule)) {
     if (index >= rank.size() || rank[index] != UINT64_MAX)
-      return prepared.original->emitError() << "transaction schedule contains an invalid registration";
+      return prepared.original->emitError()
+             << "transaction schedule contains an invalid registration";
     rank[index] = ordinal;
   }
   for (const auto &item : prepared.transactions) {
@@ -851,17 +902,23 @@ verifyPreparedEffectInventory(const PreparedTransactionLowering &prepared,
     auto guards = item.expectedAdmission.getAs<ArrayAttr>("controls");
     auto requirements = item.expectedAdmission.getAs<ArrayAttr>("requirements");
     if (item.sourceControls.size() != plan.controls.size() ||
-        (item.requirements.empty() ? bool(requirements)
-                                  : (!requirements || requirements.size() != item.requirements.size())))
-      return site.emitOpError() << "transaction required-use inventory is inconsistent";
+        (item.requirements.empty()
+             ? bool(requirements)
+             : (!requirements ||
+                requirements.size() != item.requirements.size())))
+      return site.emitOpError()
+             << "transaction required-use inventory is inconsistent";
     for (auto [index, control] : llvm::enumerate(item.controls)) {
       if (unsigned(bool(control.source)) + unsigned(bool(control.requirement)) +
-              unsigned(bool(control.resource)) != 1 ||
+                  unsigned(bool(control.resource)) !=
+              1 ||
           (control.resource && *control.resource >= item.resources.size()) ||
           (control.source && (*control.source >= plan.controls.size() ||
-                             item.sourceControls[*control.source] != index)) ||
-          (control.requirement && *control.requirement >= item.requirements.size()))
-        return site.emitOpError() << "transaction control interleave is inconsistent";
+                              item.sourceControls[*control.source] != index)) ||
+          (control.requirement &&
+           *control.requirement >= item.requirements.size()))
+        return site.emitOpError()
+               << "transaction control interleave is inconsistent";
     }
     for (const auto &requirement : item.requirements)
       if (!requirement.site || requirement.frame >= plan.frames.size() ||
@@ -870,12 +927,15 @@ verifyPreparedEffectInventory(const PreparedTransactionLowering &prepared,
           requirement.control >= item.controls.size() || !requirement.kind ||
           !requirement.occurrence || !requirement.location ||
           requirement.point.prefix > plan.controls.size() ||
-          (requirement.point.path.branch && *requirement.point.path.branch >= plan.branches.size()))
-        return site.emitOpError() << "transaction required-use bounds are inconsistent";
-    if (item.expectedAdmission.size() != (6 + !item.requirements.empty() +
-            !item.resources.empty() + !item.queueProposals.empty() + !item.memoryProposals.empty() + !item.writeDomains.empty()) ||
-        item.expectedAdmission.get("ehr_entries") ||
-        !guards || !checks ||
+          (requirement.point.path.branch &&
+           *requirement.point.path.branch >= plan.branches.size()))
+        return site.emitOpError()
+               << "transaction required-use bounds are inconsistent";
+    if (item.expectedAdmission.size() !=
+            (6 + !item.requirements.empty() + !item.resources.empty() +
+             !item.queueProposals.empty() + !item.memoryProposals.empty() +
+             !item.writeDomains.empty()) ||
+        item.expectedAdmission.get("ehr_entries") || !guards || !checks ||
         !observations || guards.size() != item.controls.size() ||
         checks.size() != plan.bodyChecks.size() ||
         observations.size() != plan.observations.size() ||
@@ -903,40 +963,53 @@ verifyPreparedEffectInventory(const PreparedTransactionLowering &prepared,
       if (proposal.access >= plan.queueAccesses.size() ||
           proposal.rawResult != total || proposal.pathResult != total + 1 ||
           (proposal.dataResult && *proposal.dataResult != total + 2))
-        return site.emitOpError() << "queue proposal result layout is inconsistent";
+        return site.emitOpError()
+               << "queue proposal result layout is inconsistent";
       total += proposal.dataResult ? 3 : 2;
     }
     for (const auto &proposal : item.memoryProposals) {
-      if (proposal.access >= plan.memoryAccesses.size() || proposal.rawResult != total ||
-          proposal.pathResult != total + 1 || proposal.argumentResults.size() != plan.memoryAccesses[proposal.access].arguments.size())
-        return site.emitOpError() << "Memory proposal result layout is inconsistent";
+      if (proposal.access >= plan.memoryAccesses.size() ||
+          proposal.rawResult != total || proposal.pathResult != total + 1 ||
+          proposal.argumentResults.size() !=
+              plan.memoryAccesses[proposal.access].arguments.size())
+        return site.emitOpError()
+               << "Memory proposal result layout is inconsistent";
       if (proposal.reachedControlEnd > item.controls.size() ||
-          (plan.memoryAccesses[proposal.access].kind != ac::TransactionMemoryAccessKind::Read &&
+          (plan.memoryAccesses[proposal.access].kind !=
+               ac::TransactionMemoryAccessKind::Read &&
            (proposal.reachedControlEnd || !proposal.excludedControls.empty())))
-        return site.emitOpError() << "Memory reached control boundary is inconsistent";
+        return site.emitOpError()
+               << "Memory reached control boundary is inconsistent";
       uint64_t previousExcluded = UINT64_MAX;
       for (uint64_t excluded : proposal.excludedControls) {
         if (excluded >= proposal.reachedControlEnd ||
             (previousExcluded != UINT64_MAX && excluded <= previousExcluded))
-          return site.emitOpError() << "Memory excluded control layout is inconsistent";
+          return site.emitOpError()
+                 << "Memory excluded control layout is inconsistent";
         previousExcluded = excluded;
       }
       if (proposal.physicalReuse) {
         const auto &access = plan.memoryAccesses[proposal.access];
         if (*proposal.physicalReuse >= proposal.access ||
             access.kind != ac::TransactionMemoryAccessKind::Read ||
-            plan.memoryAccesses[*proposal.physicalReuse].kind != ac::TransactionMemoryAccessKind::Read)
-          return site.emitOpError() << "Memory physical read reuse layout is inconsistent";
+            plan.memoryAccesses[*proposal.physicalReuse].kind !=
+                ac::TransactionMemoryAccessKind::Read)
+          return site.emitOpError()
+                 << "Memory physical read reuse layout is inconsistent";
       }
       total += 2;
       for (uint64_t result : proposal.argumentResults)
-        if (result != total++) return site.emitOpError() << "Memory argument result layout is inconsistent";
+        if (result != total++)
+          return site.emitOpError()
+                 << "Memory argument result layout is inconsistent";
     }
     for (const auto &domain : item.writeDomains) {
-      if (domain.write >= plan.writes.size() || domain.candidate >= item.outputs.size() ||
-          domain.result != total || !domain.selectors || !domain.maskType ||
+      if (domain.write >= plan.writes.size() ||
+          domain.candidate >= item.outputs.size() || domain.result != total ||
+          !domain.selectors || !domain.maskType ||
           (domain.index && *domain.index >= plan.values.size()))
-        return site.emitOpError() << "write domain result layout is inconsistent";
+        return site.emitOpError()
+               << "write domain result layout is inconsistent";
       total = SourceCheckBudget::add(total, 1);
     }
     if (item.clockCapture >= item.liveIns.size() ||
@@ -1075,12 +1148,11 @@ verifyPreparedEffectInventory(const PreparedTransactionLowering &prepared,
                << "transaction prepared observation locator is absent";
     for (const auto &event : plan.events) {
       if (event.kind == ac::TransactionStateEventKind::BodyCheck &&
-          (!event.bodyCheck || *event.bodyCheck >= plan.bodyChecks.size()))
+          (!event.record || *event.record >= plan.bodyChecks.size()))
         return site.emitOpError()
                << "transaction prepared body-check event is inconsistent";
       if (event.kind == ac::TransactionStateEventKind::Observe &&
-          (!event.observation ||
-           *event.observation >= plan.observations.size()))
+          (!event.record || *event.record >= plan.observations.size()))
         return site.emitOpError()
                << "transaction prepared observation event is inconsistent";
     }
@@ -1151,46 +1223,59 @@ SmallVector<ac::InstanceOp> anchorPath(const ac::TransactionStatePlan &plan,
 }
 
 DictionaryAttr routedOccurrence(const ac::TransactionStatePlan &plan) {
-  if (plan.registrationPath.empty()) return plan.transaction->getAttrOfType<DictionaryAttr>("occurrence");
+  if (plan.registrationPath.empty())
+    return plan.transaction->getAttrOfType<DictionaryAttr>("occurrence");
   Builder b(plan.transaction->getContext());
   SmallVector<Attribute> expansion;
   auto path = anchorPath(plan, plan.lexicalAnchor);
   for (auto allocation : path) {
     auto occurrence = allocation.getOccurrence();
     llvm::append_range(expansion, occurrence.getAs<ArrayAttr>("expansion"));
-    expansion.push_back(b.getDictionaryAttr({
-        b.getNamedAttr("kind", b.getStringAttr("call")),
-        b.getNamedAttr("site", occurrence.getAs<DictionaryAttr>("site")),
-        b.getNamedAttr("callee", FlatSymbolRefAttr::get(b.getContext(), allocation.getCallee()))}));
+    expansion.push_back(b.getDictionaryAttr(
+        {b.getNamedAttr("kind", b.getStringAttr("call")),
+         b.getNamedAttr("site", occurrence.getAs<DictionaryAttr>("site")),
+         b.getNamedAttr(
+             "callee",
+             FlatSymbolRefAttr::get(b.getContext(), allocation.getCallee()))}));
   }
   auto lexical = plan.transaction->getAttrOfType<DictionaryAttr>("occurrence");
   llvm::append_range(expansion, lexical.getAs<ArrayAttr>("expansion"));
-  expansion.push_back(b.getDictionaryAttr({
-      b.getNamedAttr("kind", b.getStringAttr("call")),
-      b.getNamedAttr("site", lexical.getAs<DictionaryAttr>("site")),
-      b.getNamedAttr("callee", FlatSymbolRefAttr::get(b.getContext(), plan.lexicalModule->getAttrOfType<StringAttr>("sym_name").getValue()))}));
-  return b.getDictionaryAttr({
-      b.getNamedAttr("site", cast<DictionaryAttr>(plan.registrationPath[0]).getAs<DictionaryAttr>("site")),
-      b.getNamedAttr("expansion", b.getArrayAttr(expansion))});
+  expansion.push_back(b.getDictionaryAttr(
+      {b.getNamedAttr("kind", b.getStringAttr("call")),
+       b.getNamedAttr("site", lexical.getAs<DictionaryAttr>("site")),
+       b.getNamedAttr("callee", FlatSymbolRefAttr::get(
+                                    b.getContext(),
+                                    plan.lexicalModule
+                                        ->getAttrOfType<StringAttr>("sym_name")
+                                        .getValue()))}));
+  return b.getDictionaryAttr(
+      {b.getNamedAttr("site", cast<DictionaryAttr>(plan.registrationPath[0])
+                                  .getAs<DictionaryAttr>("site")),
+       b.getNamedAttr("expansion", b.getArrayAttr(expansion))});
 }
 
 FailureOr<StringAttr> routedRuleName(const ac::TransactionStatePlan &plan,
-                                    SourceCheckBudget &budget) {
+                                     SourceCheckBudget &budget) {
   auto transaction = plan.transaction;
-  std::string stem = (Twine("__ac_routed_") + Twine(plan.ordinal) + "_" + transaction.getName()).str();
+  std::string stem = (Twine("__ac_routed_") + Twine(plan.ordinal) + "_" +
+                      transaction.getName())
+                         .str();
   std::string name = stem;
   uint64_t collision = 0;
   while (true) {
     bool occupied = false;
     for (Operation &operation : plan.routingModule->getRegion(0).front()) {
-      if (!charge(budget, transaction)) return failure();
+      if (!charge(budget, transaction))
+        return failure();
       auto prior = operation.getAttrOfType<StringAttr>("name");
       if (isa<ac::SourceTransactionOp, ac::RuleOp>(operation) && prior) {
-        if (!charge(budget, transaction, prior.getValue().size() + name.size())) return failure();
+        if (!charge(budget, transaction, prior.getValue().size() + name.size()))
+          return failure();
         occupied |= prior.getValue() == name;
       }
     }
-    if (!occupied) break;
+    if (!occupied)
+      break;
     name = (Twine(stem) + "_route" + Twine(++collision)).str();
   }
   return StringAttr::get(transaction.getContext(), name);
@@ -1202,19 +1287,22 @@ void registrationInvocation(const ac::TransactionStatePlan &plan,
   SmallVector<Attribute> prefix;
   for (Attribute occurrence : plan.registrationPath) {
     prefix.push_back(occurrence);
-    rows.push_back(b.getDictionaryAttr({
-        b.getNamedAttr("call", occurrence),
-        b.getNamedAttr("receiver", b.getDictionaryAttr({
-            b.getNamedAttr("instance_path", b.getArrayAttr(prefix))}))}));
+    rows.push_back(b.getDictionaryAttr(
+        {b.getNamedAttr("call", occurrence),
+         b.getNamedAttr("receiver",
+                        b.getDictionaryAttr({b.getNamedAttr(
+                            "instance_path", b.getArrayAttr(prefix))}))}));
   }
 }
 
-FailureOr<ac::LexicalInstanceId> sourceActualReceiver(
-    const ac::TransactionStatePlan &plan, ac::LexicalInstanceId anchor,
-    DictionaryAttr receiver, Operation *site, SourceCheckBudget &budget,
-    unsigned depth = 0) {
+FailureOr<ac::LexicalInstanceId>
+sourceActualReceiver(const ac::TransactionStatePlan &plan,
+                     ac::LexicalInstanceId anchor, DictionaryAttr receiver,
+                     Operation *site, SourceCheckBudget &budget,
+                     unsigned depth = 0) {
   if (depth > 128 || !receiver || anchor >= plan.instances.size() ||
-      !charge(budget, site)) return failure();
+      !charge(budget, site))
+    return failure();
   if (receiver.get("receiver_kind") || receiver.get("ancestor_depth")) {
     auto payWorkStorage = [&](Operation *at, uint64_t work, uint64_t bytes) {
       return success(charge(budget, at, work) &&
@@ -1225,9 +1313,11 @@ FailureOr<ac::LexicalInstanceId> sourceActualReceiver(
       return failure();
     auto levels = receiver.getAs<IntegerAttr>("ancestor_depth").getInt();
     for (int64_t level = 0; level < levels; ++level) {
-      if (!charge(budget, site)) return failure();
+      if (!charge(budget, site))
+        return failure();
       auto parent = plan.instances[anchor].parent;
-      if (!parent || *parent >= anchor) return failure();
+      if (!parent || *parent >= anchor)
+        return failure();
       anchor = *parent;
     }
     for (Attribute name : receiver.getAs<ArrayAttr>("instance_path")) {
@@ -1235,56 +1325,76 @@ FailureOr<ac::LexicalInstanceId> sourceActualReceiver(
       // occurrence path cannot supply a missing/misnamed source allocation.
       ac::InstanceOp allocation;
       auto definition = plan.instances[anchor].definition;
-      for (auto candidate : definition.getBody().front().getOps<ac::InstanceOp>()) {
-        if (!charge(budget, site)) return failure();
-        if (candidate.getInstanceNameAttr() != name) continue;
-        if (allocation) return failure();
+      for (auto candidate :
+           definition.getBody().front().getOps<ac::InstanceOp>()) {
+        if (!charge(budget, site))
+          return failure();
+        if (candidate.getInstanceNameAttr() != name)
+          continue;
+        if (allocation)
+          return failure();
         allocation = candidate;
       }
-      if (!allocation) return failure();
+      if (!allocation)
+        return failure();
       std::optional<ac::LexicalInstanceId> next;
       for (auto [index, child] : llvm::enumerate(plan.instances)) {
-        if (!charge(budget, site)) return failure();
-        if (child.parent != anchor || child.allocation != allocation) continue;
+        if (!charge(budget, site))
+          return failure();
+        if (child.parent != anchor || child.allocation != allocation)
+          continue;
         if (next || child.occurrencePath.empty() ||
-            child.occurrencePath[child.occurrencePath.size() - 1] != allocation.getOccurrence())
+            child.occurrencePath[child.occurrencePath.size() - 1] !=
+                allocation.getOccurrence())
           return failure();
         next = index;
       }
-      if (!next) return failure();
+      if (!next)
+        return failure();
       anchor = *next;
     }
     return anchor;
   }
   if (auto formal = receiver.getAs<StringAttr>("reference")) {
     const auto &instance = plan.instances[anchor];
-    if (!instance.parent || !instance.allocation) return failure();
+    if (!instance.parent || !instance.allocation)
+      return failure();
     DictionaryAttr actual;
-    if (auto bindings = instance.allocation->getAttrOfType<ArrayAttr>("ac.reference_bindings"))
+    if (auto bindings = instance.allocation->getAttrOfType<ArrayAttr>(
+            "ac.reference_bindings"))
       for (Attribute raw : bindings) {
-        if (!charge(budget, site)) return failure();
+        if (!charge(budget, site))
+          return failure();
         auto row = cast<DictionaryAttr>(raw);
         if (row.getAs<StringAttr>("name") == formal)
           actual = row.getAs<DictionaryAttr>("receiver");
       }
-    if (!actual) return failure();
-    auto resolved = sourceActualReceiver(plan, *instance.parent, actual, site, budget, depth + 1);
-    if (failed(resolved)) return failure();
+    if (!actual)
+      return failure();
+    auto resolved = sourceActualReceiver(plan, *instance.parent, actual, site,
+                                         budget, depth + 1);
+    if (failed(resolved))
+      return failure();
     anchor = *resolved;
   }
   auto suffix = receiver.getAs<ArrayAttr>("instance_path");
-  if (!suffix) return failure();
+  if (!suffix)
+    return failure();
   for (auto occurrence : suffix) {
     std::optional<ac::LexicalInstanceId> next;
     for (auto [index, child] : llvm::enumerate(plan.instances)) {
-      if (!charge(budget, site)) return failure();
+      if (!charge(budget, site))
+        return failure();
       if (child.parent == anchor && child.allocation &&
-          child.allocation->getAttrOfType<DictionaryAttr>("occurrence") == occurrence) {
-        if (next) return failure();
+          child.allocation->getAttrOfType<DictionaryAttr>("occurrence") ==
+              occurrence) {
+        if (next)
+          return failure();
         next = index;
       }
     }
-    if (!next) return failure();
+    if (!next)
+      return failure();
     anchor = *next;
   }
   return anchor;
@@ -1295,19 +1405,26 @@ FailureOr<ac::LexicalInstanceId> sourceActualReceiver(
 StringRef memoryKind(ac::TransactionMemoryAccessKind kind) {
   using K = ac::TransactionMemoryAccessKind;
   switch (kind) {
-  case K::Request: return "request";
-  case K::Result: return "result";
-  case K::Read: return "read";
-  case K::Write: return "write";
+  case K::Request:
+    return "request";
+  case K::Result:
+    return "result";
+  case K::Read:
+    return "read";
+  case K::Write:
+    return "write";
   }
   llvm_unreachable("invalid Memory access kind");
 }
-SmallVector<unsigned, 4> memoryOperands(const ac::TransactionMemoryAccess &access,
-                                       const ac::MemoryPrimitiveLayout &layout) {
+SmallVector<unsigned, 4>
+memoryOperands(const ac::TransactionMemoryAccess &access,
+               const ac::MemoryPrimitiveLayout &layout) {
   using K = ac::TransactionMemoryAccessKind;
   if (access.kind == K::Request)
-    return {layout.readEnableOperands[access.port], layout.readAddressOperands[access.port]};
-  if (access.kind == K::Read) return {layout.readAddressOperands[0]};
+    return {layout.readEnableOperands[access.port],
+            layout.readAddressOperands[access.port]};
+  if (access.kind == K::Read)
+    return {layout.readAddressOperands[0]};
   if (access.kind == K::Write)
     return {layout.writeEnableOperand, layout.writeAddressOperand,
             layout.writeDataOperand, layout.writeMaskOperand};
@@ -1330,7 +1447,7 @@ public:
   }
 
   LogicalResult run() {
-    if (failed(mergedEnvelope(package)) || failed(prepayClone(package, budget)))
+    if (failed(mergedEnvelope(package)))
       return failure();
     for (auto imported : package.getOps<ac::ModuleImportOp>()) {
       if (!charge(budget, imported) || failed(hardware.verifyImport(imported)))
@@ -1360,22 +1477,27 @@ public:
           states.push_back(state);
         } else if (auto queue = dyn_cast<ac::InstanceOp>(op);
                    queue && ac::isQueueInstance(queue)) {
-          if (!charge(budget, queue, 8)) return failure();
+          if (!charge(budget, queue, 8))
+            return failure();
           definitions.back().queueIndices.push_back(queues.size());
           queues.push_back(queue);
         }
-
       }
     }
     for (const auto &plan : analysis.getPlans()) {
-      if (failed(admit(plan)) || !charge(budget, plan.transaction, 2)) return failure();
-      if (plan.ordinal != transactions.size()) return failure();
-      routing(plan.routingModule).transactionIndices.push_back(transactions.size());
-      transactions.push_back({&plan, {}, {}});
+      if (failed(admit(plan)) || !charge(budget, plan.transaction, 2))
+        return failure();
+      if (plan.ordinal != transactions.size())
+        return failure();
+      routing(plan.routingModule)
+          .transactionIndices.push_back(transactions.size());
+      transactions.push_back(
+          {std::make_shared<const ac::TransactionStatePlan>(plan), {}, {}});
     }
     for (const auto &prepared : transactions) {
       auto total = staticTotality(*prepared.plan, budget);
-      if (failed(total)) return failure();
+      if (failed(total))
+        return failure();
       // A lifted public result enters its lexical Module through a private
       // D/fire pair. The receiving input has symbolic availability even when
       // the source callable is total, so propagate its companion through
@@ -1386,29 +1508,57 @@ public:
            prepared.plan->transaction->getNumResults() != 0))
         valueAvailability = true;
       if (!*total) {
-        if (!prepared.plan->lexicalModule->getAttrOfType<ArrayAttr>("ac.result_availability"))
+        if (!prepared.plan->lexicalModule->getAttrOfType<ArrayAttr>(
+                "ac.result_availability"))
           return prepared.plan->transaction->emitOpError()
-                 << "ordinary transaction results require compiler-managed availability";
+                 << "ordinary transaction results require compiler-managed "
+                    "availability";
         valueAvailability = true;
       }
     }
     budget.setPhase("prep: live-ins/outputs");
     for (auto &prepared : transactions)
-      if (failed(liveIns(prepared)) || failed(outputs(prepared))) return failure();
+      if (failed(liveIns(prepared)) || failed(outputs(prepared)))
+        return failure();
     budget.setPhase("prep: independent registrations");
-    if (failed(scheduleTransactions())) return failure();
+    if (failed(scheduleTransactions()))
+      return failure();
     budget.setPhase("prep: write domains");
     for (auto &prepared : transactions)
-      if (failed(writeDomains(prepared))) return failure();
-    budget.setPhase("prep: requirements/expansion/queues/admission");
-    for (auto &prepared : transactions)
-      if (failed(valueRequirements(prepared)) || failed(expansion(prepared)) ||
-          failed(resourceSpecializations(prepared)) || failed(queueRoutes(prepared)) ||
-          failed(memoryRoutes(prepared)) ||
-          failed(admissionMetadata(prepared)))
+      if (failed(writeDomains(prepared)))
         return failure();
+    for (auto &prepared : transactions) {
+      budget.setPhase("prep: requirements");
+      if (failed(valueRequirements(prepared)))
+        return failure();
+      budget.setPhase("prep: expansion");
+      {
+        SourceCheckBudget::LocalScope expansionBudget(budget);
+        if (failed(expansion(prepared)))
+          return failure();
+      }
+      budget.setPhase("prep: resource specializations");
+      {
+        SourceCheckBudget::LocalScope resourceBudget(budget);
+        if (failed(resourceSpecializations(prepared)))
+          return failure();
+      }
+      budget.setPhase("prep: queue routes");
+      if (failed(queueRoutes(prepared)))
+        return failure();
+      budget.setPhase("prep: memory routes");
+      if (failed(memoryRoutes(prepared)))
+        return failure();
+      budget.setPhase("prep: admission metadata");
+      {
+        SourceCheckBudget::LocalScope admissionBudget(budget);
+        if (failed(admissionMetadata(prepared)))
+          return failure();
+      }
+    }
     budget.setPhase("prep: prospective queue routes");
-    if (failed(queueProspectiveRoutes())) return failure();
+    if (failed(queueProspectiveRoutes()))
+      return failure();
     // Every definition participates, including definitions not selected by the
     // System. Summaries are relative to definitions, never root occurrences.
     budget.setPhase("prep: writer summary");
@@ -1434,7 +1584,8 @@ public:
     for (auto &definition : definitions) {
       uint64_t ports =
           definition.upward.size() + 2 * definition.downward.size() +
-          queueInputCount(definition) + 2 * definition.memoryIncoming.size() + definition.queuePopSummaries.size();
+          queueInputCount(definition) + 2 * definition.memoryIncoming.size() +
+          definition.queuePopSummaries.size();
       if (!charge(budget, definition.module, 16 * ports + 1))
         return failure();
       for (auto allocation :
@@ -1447,7 +1598,9 @@ public:
         if (!charge(budget, allocation,
                     allocation.getNumOperands() + allocation.getNumResults() +
                         32 * (child.upward.size() + 2 * child.downward.size() +
-                              queueInputCount(child) + 2 * child.memoryIncoming.size() + child.queuePopSummaries.size()) +
+                              queueInputCount(child) +
+                              2 * child.memoryIncoming.size() +
+                              child.queuePopSummaries.size()) +
                         1))
           return failure();
         // Each actual occurrence prepends itself to every descendant proposal
@@ -1459,7 +1612,8 @@ public:
       }
     }
     for (auto &definition : definitions)
-      if (failed(wiringMetadata(definition)) || failed(queueWiringMetadata(definition)))
+      if (failed(wiringMetadata(definition)) ||
+          failed(queueWiringMetadata(definition)))
         return failure();
     return success();
   }
@@ -1473,8 +1627,8 @@ public:
   ac::HardwareAnalysis hardware;
 
 private:
-#include "TransactionQueuePreparation.inc"
 #include "TransactionMemoryPreparation.inc"
+#include "TransactionQueuePreparation.inc"
 
 #include "TransactionSelectedWritePreparation.inc"
 
@@ -1485,125 +1639,159 @@ private:
       prepared.sourceControls[source] = prepared.controls.size();
       prepared.controls.push_back({source, std::nullopt});
     };
-    if (!valueAvailability && plan.queueAccesses.empty() && plan.memoryAccesses.empty()) {
-      for (uint64_t i = 0; i < plan.controls.size(); ++i) control(i);
+    if (!valueAvailability && plan.queueAccesses.empty() &&
+        plan.memoryAccesses.empty()) {
+      for (uint64_t i = 0; i < plan.controls.size(); ++i)
+        control(i);
       return success();
     }
     Builder b(package.getContext());
     auto append = [&](Operation *site, ac::InvocationFrameId frame,
                       ac::BoundValueId value, StringRef kind, uint64_t operand,
                       ac::TransactionPoint point,
-                      std::optional<ac::BoundValueId> path = std::nullopt) -> LogicalResult {
-      if (!valueAvailability) return success();
-      if (!charge(budget, site, 32)) return failure();
+                      std::optional<ac::BoundValueId> path =
+                          std::nullopt) -> LogicalResult {
+      if (!valueAvailability)
+        return success();
+      if (!charge(budget, site, 32))
+        return failure();
       Operation *function = plan.frames[frame].method
-          ? plan.frames[frame].method.operator->() : plan.transaction.operator->();
+                                ? plan.frames[frame].method.operator->()
+                                : plan.transaction.operator->();
       auto occurrence = site->getAttrOfType<DictionaryAttr>("occurrence");
-      if (!occurrence) occurrence = function->getAttrOfType<DictionaryAttr>(
-          isa<ac::SourceTransactionOp>(function) ? "declaration" : "occurrence");
+      if (!occurrence)
+        occurrence = function->getAttrOfType<DictionaryAttr>(
+            isa<ac::SourceTransactionOp>(function) ? "declaration"
+                                                   : "occurrence");
       auto location = site->getAttrOfType<DictionaryAttr>("ac.location");
-      if (!location) location = site->getAttrOfType<DictionaryAttr>("ac.condition_location");
-      if (!location) location = function->getAttrOfType<DictionaryAttr>("ac.guard_location");
+      if (!location)
+        location = site->getAttrOfType<DictionaryAttr>("ac.condition_location");
+      if (!location)
+        location = function->getAttrOfType<DictionaryAttr>("ac.guard_location");
       uint64_t index = prepared.requirements.size();
-      prepared.requirements.push_back({site, frame, value, path, point,
-          b.getStringAttr(kind), operand, prepared.controls.size(), occurrence, location});
+      prepared.requirements.push_back(
+          {site, frame, value, path, point, b.getStringAttr(kind), operand,
+           prepared.controls.size(), occurrence, location});
       prepared.controls.push_back({std::nullopt, index});
       return success();
     };
     for (const auto &event : plan.events) {
       using K = ac::TransactionStateEventKind;
       if (event.kind == K::GuardExit) {
-        const auto &guard = plan.guards[*event.guard];
+        const auto &guard = plan.guards[*event.record];
         auto site = guard.callable->getRegion(0).front().getTerminator();
         if (failed(append(site, guard.frame, guard.predicate, "guard", 0,
                           {guard.control, plan.controls[guard.control].path})))
           return failure();
         control(guard.control);
       } else if (event.kind == K::BranchEnter &&
-                 !plan.branches[*event.branch].selection &&
-                 branchHasStateWrites(plan, *event.branch)) {
-        const auto &branch = plan.branches[*event.branch];
+                 !plan.branches[*event.record].selection &&
+                 branchHasStateWrites(plan, *event.record)) {
+        const auto &branch = plan.branches[*event.record];
         if (failed(append(branch.operation, branch.frame, branch.condition,
-                          "branch", 0, branch.entry))) return failure();
+                          "branch", 0, branch.entry)))
+          return failure();
       } else if (event.kind == K::SelectionEnter) {
-        const auto &selection = plan.selections[*event.selection];
+        const auto &selection = plan.selections[*event.record];
         const auto &branch = plan.branches[selection.branch];
         if (failed(append(branch.operation, branch.frame, branch.condition,
-                          "branch", 0, branch.entry))) return failure();
+                          "branch", 0, branch.entry)))
+          return failure();
         control(selection.control);
       } else if (event.kind == K::Write) {
-        const auto &write = plan.writes[*event.write];
+        const auto &write = plan.writes[*event.record];
         if ((!write.pathFact || !write.pathFact.getValue()) &&
             failed(append(write.operation, write.frame, write.authoredPath,
-                          "write_path", 0, event.point))) return failure();
-        if (failed(append(write.operation, write.frame, write.value,
-                          "state_write", 1, event.point,
-                          (!write.pathFact || !write.pathFact.getValue())
-                              ? std::optional<ac::BoundValueId>(write.authoredPath)
-                              : std::nullopt))) return failure();
+                          "write_path", 0, event.point)))
+          return failure();
+        if (failed(
+                append(write.operation, write.frame, write.value, "state_write",
+                       1, event.point,
+                       (!write.pathFact || !write.pathFact.getValue())
+                           ? std::optional<ac::BoundValueId>(write.authoredPath)
+                           : std::nullopt)))
+          return failure();
         for (auto [ordinal, index] : llvm::enumerate(write.indices))
-          if (failed(append(write.operation, write.frame, index, "state_write", 2 + ordinal,
-                            event.point, write.authoredPath))) return failure();
+          if (failed(append(write.operation, write.frame, index, "state_write",
+                            2 + ordinal, event.point, write.authoredPath)))
+            return failure();
       } else if (event.kind == K::QueueAccess) {
-        const auto &access = plan.queueAccesses[*event.queueAccess];
-        if (access.payload && failed(append(access.operation, access.frame,
-              *access.payload, "queue_push", 1, event.point,
-              access.authoredPath))) return failure();
-        if (failed(queueControl(prepared, *event.queueAccess))) return failure();
+        const auto &access = plan.queueAccesses[*event.record];
+        if (access.payload &&
+            failed(append(access.operation, access.frame, *access.payload,
+                          "queue_push", 1, event.point, access.authoredPath)))
+          return failure();
+        if (failed(queueControl(prepared, *event.record)))
+          return failure();
       } else if (event.kind == K::MemoryAccess) {
-        const auto &access = plan.memoryAccesses[*event.memoryAccess];
+        const auto &access = plan.memoryAccesses[*event.record];
         for (auto [ordinal, argument] : llvm::enumerate(access.arguments))
           if (failed(append(access.operation, access.frame, argument,
                             "memory_argument", ordinal, event.point,
-                            access.authoredPath))) return failure();
-        if (failed(memoryControl(prepared, *event.memoryAccess))) return failure();
+                            access.authoredPath)))
+            return failure();
+        if (failed(memoryControl(prepared, *event.record)))
+          return failure();
       } else if (event.kind == K::FormalWrite) {
-        const auto &formal = plan.formalWrites[*event.formalWrite];
-        if (!formal.owner) continue;
+        const auto &formal = plan.formalWrites[*event.record];
+        if (!formal.owner)
+          continue;
         if (failed(append(formal.operation, formal.frame, formal.authoredPath,
                           "formal_path", 0, event.point)) ||
             failed(append(formal.operation, formal.frame, formal.payload,
-                          "formal_write", 1, event.point, formal.authoredPath)) ||
+                          "formal_write", 1, event.point,
+                          formal.authoredPath)) ||
             failed(append(formal.operation, formal.frame, formal.candidate,
-                          "formal_candidate", 2, event.point, formal.authoredPath)))
+                          "formal_candidate", 2, event.point,
+                          formal.authoredPath)))
           return failure();
         for (auto [ordinal, index] : llvm::enumerate(formal.indices))
-          if (failed(append(formal.operation, formal.frame, index, "formal_write", 3 + ordinal,
-                            event.point, formal.authoredPath))) return failure();
+          if (failed(append(formal.operation, formal.frame, index,
+                            "formal_write", 3 + ordinal, event.point,
+                            formal.authoredPath)))
+            return failure();
       } else if (event.kind == K::CallEnter) {
-        const auto &call = plan.calls[*event.call];
+        const auto &call = plan.calls[*event.record];
         for (auto [ordinal, argument] : llvm::enumerate(call.arguments))
           if (failed(append(call.operation, call.caller, argument,
-                            "call_argument", ordinal, event.point))) return failure();
+                            "call_argument", ordinal, event.point)))
+            return failure();
       } else if (event.kind == K::BodyCheck) {
-        const auto &check = plan.bodyChecks[*event.bodyCheck];
+        const auto &check = plan.bodyChecks[*event.record];
         if (failed(append(check.operation, check.frame, check.condition,
-                          "assert", 0, event.point))) return failure();
+                          "assert", 0, event.point)))
+          return failure();
       } else if (event.kind == K::Observe) {
-        const auto &observation = plan.observations[*event.observation];
+        const auto &observation = plan.observations[*event.record];
         for (auto [ordinal, value] : llvm::enumerate(observation.values))
           if (failed(append(observation.operation, observation.frame, value,
-                            "log", ordinal, event.point))) return failure();
+                            "log", ordinal, event.point)))
+            return failure();
       } else if (event.kind == K::CallExit) {
-        const auto &call = plan.calls[*event.call];
+        const auto &call = plan.calls[*event.record];
         const auto &frame = plan.frames[call.callee];
-        ac::SourceMethodView method{plan.instances[frame.anchor].definition,
-                                    frame.method, {}};
+        ac::SourceMethodView method{
+            plan.instances[frame.anchor].definition, frame.method, {}};
         auto site = frame.method->getRegion(1).front().getTerminator();
-        for (uint64_t ordinal = 0; ordinal < method.getNumPublicResults(); ++ordinal)
+        for (uint64_t ordinal = 0; ordinal < method.getNumPublicResults();
+             ++ordinal)
           if (failed(append(site, call.callee, call.results[ordinal].yielded,
-                            "return", ordinal, frame.exit))) return failure();
+                            "return", ordinal, frame.exit)))
+            return failure();
       } else if (event.kind == K::TransactionExit) {
         auto rootMethod = plan.frames[plan.rootFrame].method;
-        Operation *root = rootMethod ? rootMethod.operator->() : plan.transaction.operator->();
+        Operation *root = rootMethod ? rootMethod.operator->()
+                                     : plan.transaction.operator->();
         auto site = root->getRegion(1).front().getTerminator();
         for (auto [ordinal, result] : llvm::enumerate(plan.results))
           if (failed(append(site, plan.rootFrame, result.yielded, "return",
-                            ordinal, event.point))) return failure();
+                            ordinal, event.point)))
+            return failure();
       }
     }
     if (llvm::is_contained(prepared.sourceControls, UINT64_MAX))
-      return plan.transaction->emitOpError() << "required-use control schedule is incomplete";
+      return plan.transaction->emitOpError()
+             << "required-use control schedule is incomplete";
     return success();
   }
 
@@ -1707,29 +1895,40 @@ private:
       }
     }
     for (auto &domain : prepared.writeDomains) {
-      if (!charge(budget, transaction)) return failure();
+      if (!charge(budget, transaction))
+        return failure();
       domain.result = prepared.totalResults;
       prepared.totalResults = SourceCheckBudget::add(prepared.totalResults, 1);
       if (prepared.totalResults == std::numeric_limits<uint64_t>::max())
-        return transaction.emitOpError() << "write domain result count overflows";
+        return transaction.emitOpError()
+               << "write domain result count overflows";
     }
-    SmallVector<Attribute> guards, bodyChecks, observations, checks, requirements;
-    auto projectedPath = [&](ac::TransactionSourcePath source) -> FailureOr<DictionaryAttr> {
+    SmallVector<Attribute> guards, bodyChecks, observations, checks,
+        requirements;
+    auto projectedPath =
+        [&](ac::TransactionSourcePath source) -> FailureOr<DictionaryAttr> {
       auto path = sampledPath(plan, source, budget);
-      if (failed(path) || path->empty()) return path;
+      if (failed(path) || path->empty())
+        return path;
       NamedAttrList mapped(*path);
       uint64_t index = path->getAs<IntegerAttr>("selection").getInt();
-      mapped.set("selection", b.getI64IntegerAttr(prepared.sourceControls[index]));
+      mapped.set("selection",
+                 b.getI64IntegerAttr(prepared.sourceControls[index]));
       return mapped.getDictionary(b.getContext());
     };
     for (auto [ordinal, scheduled] : llvm::enumerate(prepared.controls)) {
-      const ac::AdmissionControl *original = scheduled.source
-          ? &plan.controls[*scheduled.source] : nullptr;
-      const auto *requirement = scheduled.requirement
-          ? &prepared.requirements[*scheduled.requirement] : nullptr;
-      const auto *resource = scheduled.resource ? &prepared.resources[*scheduled.resource] : nullptr;
-      ac::TransactionSourcePath sourcePath = original ? original->path : requirement
-          ? requirement->point.path : resourcePoint(plan, *resource).path;
+      const ac::AdmissionControl *original =
+          scheduled.source ? &plan.controls[*scheduled.source] : nullptr;
+      const auto *requirement =
+          scheduled.requirement ? &prepared.requirements[*scheduled.requirement]
+                                : nullptr;
+      const auto *resource = scheduled.resource
+                                 ? &prepared.resources[*scheduled.resource]
+                                 : nullptr;
+      ac::TransactionSourcePath sourcePath =
+          original      ? original->path
+          : requirement ? requirement->point.path
+                        : resourcePoint(plan, *resource).path;
       ac::InvocationFrameId frame;
       DictionaryAttr occurrence, location;
       StringRef kind;
@@ -1743,14 +1942,15 @@ private:
         occurrence = requirement->occurrence;
         location = requirement->location;
         kind = "value_available";
-        requirements.push_back(b.getDictionaryAttr({
-            b.getNamedAttr("control", b.getI64IntegerAttr(ordinal)),
-            b.getNamedAttr("kind", requirement->kind),
-            b.getNamedAttr("operand", b.getI64IntegerAttr(requirement->operand)),
-            b.getNamedAttr("occurrence", occurrence),
-            b.getNamedAttr("location", location)}));
-      } else if (auto *binding =
-              std::get_if<ac::CallableGuardControl>(&original->boundary)) {
+        requirements.push_back(b.getDictionaryAttr(
+            {b.getNamedAttr("control", b.getI64IntegerAttr(ordinal)),
+             b.getNamedAttr("kind", requirement->kind),
+             b.getNamedAttr("operand",
+                            b.getI64IntegerAttr(requirement->operand)),
+             b.getNamedAttr("occurrence", occurrence),
+             b.getNamedAttr("location", location)}));
+      } else if (auto *binding = std::get_if<ac::CallableGuardControl>(
+                     &original->boundary)) {
         const auto &guard = plan.guards[binding->guard];
         frame = guard.frame;
         occurrence = guard.callable->getAttrOfType<DictionaryAttr>(
@@ -1794,8 +1994,9 @@ private:
       auto id = b.getDictionaryAttr(
           {b.getNamedAttr("registration", routedOccurrence(plan)),
            b.getNamedAttr("check", check.occurrence),
-           b.getNamedAttr("obligation", b.getI64IntegerAttr(
-                                            prepared.controls.size() + ordinal))});
+           b.getNamedAttr(
+               "obligation",
+               b.getI64IntegerAttr(prepared.controls.size() + ordinal))});
       auto path = projectedPath(check.point.path);
       if (failed(path))
         return failure();
@@ -1840,15 +2041,18 @@ private:
       admission.append("requirements", b.getArrayAttr(requirements));
       prepared.expectedAdmission = admission.getDictionary(b.getContext());
     }
-    if (failed(queueAdmissionMetadata(prepared)) || failed(memoryAdmissionMetadata(prepared))) return failure();
+    if (failed(queueAdmissionMetadata(prepared)) ||
+        failed(memoryAdmissionMetadata(prepared)))
+      return failure();
     if (!prepared.writeDomains.empty()) {
       SmallVector<Attribute> domains;
       for (const auto &domain : prepared.writeDomains) {
-        if (!charge(budget, transaction, 16)) return failure();
-        domains.push_back(b.getDictionaryAttr({
-            b.getNamedAttr("candidate", b.getI64IntegerAttr(domain.candidate)),
-            b.getNamedAttr("selectors", domain.selectors),
-            b.getNamedAttr("mask", b.getI64IntegerAttr(domain.result))}));
+        if (!charge(budget, transaction, 16))
+          return failure();
+        domains.push_back(b.getDictionaryAttr(
+            {b.getNamedAttr("candidate", b.getI64IntegerAttr(domain.candidate)),
+             b.getNamedAttr("selectors", domain.selectors),
+             b.getNamedAttr("mask", b.getI64IntegerAttr(domain.result))}));
       }
       NamedAttrList admission(prepared.expectedAdmission);
       admission.append("write_domains", b.getArrayAttr(domains));
@@ -1872,7 +2076,8 @@ private:
       inventory.push_back(states[index].getOccurrence());
     }
     for (auto [ordinal, route] : llvm::enumerate(definition.downward)) {
-      if (!route.value.getDefiningOp<ac::SourceStateOp>()) continue;
+      if (!route.value.getDefiningOp<ac::SourceStateOp>())
+        continue;
       if (!charge(budget, definition.module, 32 + route.path.size() * 8))
         return failure();
       incoming.push_back(b.getDictionaryAttr(
@@ -1904,8 +2109,7 @@ private:
       if (!charge(budget, definition.module, 16))
         return failure();
       writers.push_back(b.getDictionaryAttr(
-          {b.getNamedAttr("registration",
-                          routedOccurrence(plan)),
+          {b.getNamedAttr("registration", routedOccurrence(plan)),
            b.getNamedAttr(
                "ordinary_results",
                b.getI64IntegerAttr(plan.transaction->getNumResults())),
@@ -1914,34 +2118,50 @@ private:
     SmallVector<Attribute> returnInputs, returnWriters;
     for (auto [ordinal, route] : llvm::enumerate(definition.downward)) {
       auto source = route.value.getDefiningOp<ac::SourceTransactionOp>();
-      if (!source) continue;
-      returnInputs.push_back(b.getDictionaryAttr({
-          b.getNamedAttr("owner", b.getDictionaryAttr({b.getNamedAttr("instance_path", routePath(b.getContext(), route.path))})),
-          b.getNamedAttr("registration", source.getOccurrence()),
-          b.getNamedAttr("ordinal", b.getI64IntegerAttr(cast<OpResult>(route.value).getResultNumber())),
-          b.getNamedAttr("data", b.getI64IntegerAttr(definition.sourceInputs + 2 * ordinal)),
-          b.getNamedAttr("enable", b.getI64IntegerAttr(definition.sourceInputs + 2 * ordinal + 1))}));
+      if (!source)
+        continue;
+      returnInputs.push_back(b.getDictionaryAttr(
+          {b.getNamedAttr(
+               "owner",
+               b.getDictionaryAttr({b.getNamedAttr(
+                   "instance_path", routePath(b.getContext(), route.path))})),
+           b.getNamedAttr("registration", source.getOccurrence()),
+           b.getNamedAttr("ordinal",
+                          b.getI64IntegerAttr(
+                              cast<OpResult>(route.value).getResultNumber())),
+           b.getNamedAttr("data", b.getI64IntegerAttr(definition.sourceInputs +
+                                                      2 * ordinal)),
+           b.getNamedAttr("enable",
+                          b.getI64IntegerAttr(definition.sourceInputs +
+                                              2 * ordinal + 1))}));
     }
     for (auto index : definition.transactionIndices) {
       const auto &transaction = transactions[index];
       const auto &plan = *transaction.plan;
-      if (plan.registrationPath.empty() || plan.transaction->getNumResults() == 0) continue;
+      if (plan.registrationPath.empty() ||
+          plan.transaction->getNumResults() == 0)
+        continue;
       SmallVector<Attribute> results;
-      for (unsigned ordinal = 0; ordinal < plan.transaction->getNumResults(); ++ordinal)
-        results.push_back(b.getDictionaryAttr({
-            b.getNamedAttr("ordinal", b.getI64IntegerAttr(ordinal)),
-            b.getNamedAttr("data", b.getI64IntegerAttr(ordinal)),
-            b.getNamedAttr("enable", b.getI64IntegerAttr(transaction.fireResult))}));
-      returnWriters.push_back(b.getDictionaryAttr({
-          b.getNamedAttr("registration", routedOccurrence(plan)),
-          b.getNamedAttr("owner", b.getDictionaryAttr({b.getNamedAttr("instance_path", plan.registrationPath)})),
-          b.getNamedAttr("lexical_registration", plan.transaction->getAttr("occurrence")),
-          b.getNamedAttr("results", b.getArrayAttr(results))}));
+      for (unsigned ordinal = 0; ordinal < plan.transaction->getNumResults();
+           ++ordinal)
+        results.push_back(b.getDictionaryAttr(
+            {b.getNamedAttr("ordinal", b.getI64IntegerAttr(ordinal)),
+             b.getNamedAttr("data", b.getI64IntegerAttr(ordinal)),
+             b.getNamedAttr("enable",
+                            b.getI64IntegerAttr(transaction.fireResult))}));
+      returnWriters.push_back(b.getDictionaryAttr(
+          {b.getNamedAttr("registration", routedOccurrence(plan)),
+           b.getNamedAttr("owner",
+                          b.getDictionaryAttr({b.getNamedAttr(
+                              "instance_path", plan.registrationPath)})),
+           b.getNamedAttr("lexical_registration",
+                          plan.transaction->getAttr("occurrence")),
+           b.getNamedAttr("results", b.getArrayAttr(results))}));
     }
     if (!returnInputs.empty() || !returnWriters.empty())
-      definition.expectedReturns = b.getDictionaryAttr({
-          b.getNamedAttr("incoming", b.getArrayAttr(returnInputs)),
-          b.getNamedAttr("writers", b.getArrayAttr(returnWriters))});
+      definition.expectedReturns = b.getDictionaryAttr(
+          {b.getNamedAttr("incoming", b.getArrayAttr(returnInputs)),
+           b.getNamedAttr("writers", b.getArrayAttr(returnWriters))});
     definition.expectedWiring = b.getDictionaryAttr(
         {b.getNamedAttr("states", b.getArrayAttr(inventory)),
          b.getNamedAttr("incoming", b.getArrayAttr(incoming)),
@@ -1951,15 +2171,16 @@ private:
 
   LogicalResult admit(const ac::TransactionStatePlan &plan) {
     auto transaction = plan.transaction;
-    if (failed(requireStaticTotality(plan, budget,
-          bool(plan.lexicalModule->getAttrOfType<ArrayAttr>("ac.result_availability")))))
+    if (failed(requireStaticTotality(
+            plan, budget,
+            bool(plan.lexicalModule->getAttrOfType<ArrayAttr>(
+                "ac.result_availability")))))
       return failure();
     for (const auto &owner : plan.owners) {
       if (!charge(budget, transaction, 1 + owner.instancePath.size()))
         return failure();
-      auto width = hardware.getPackedWidth(owner.payloadType,
-                                           plan.instances[0].bindings,
-                                           owner.declaration);
+      auto width = hardware.getPackedWidth(
+          owner.payloadType, plan.instances[0].bindings, owner.declaration);
       if (failed(width) || !*width)
         return transaction.emitOpError()
                << "transaction state requires a finite storage representation";
@@ -1991,9 +2212,11 @@ private:
     if (downward) {
       auto state = value.getDefiningOp<ac::SourceStateOp>();
       auto transaction = value.getDefiningOp<ac::SourceTransactionOp>();
-      if (!state && !transaction) return failure();
-      auto enable = hardware.resolveType(
-          state ? state.getClk().getType() : transaction.getClk().getType(), bindings, module);
+      if (!state && !transaction)
+        return failure();
+      auto enable = hardware.resolveType(state ? state.getClk().getType()
+                                               : transaction.getClk().getType(),
+                                         bindings, module);
       if (failed(enable))
         return failure();
       enableType = *enable;
@@ -2057,7 +2280,8 @@ private:
     const auto &plan = *prepared.plan;
     if (!plan.registrationPath.empty())
       for (Value result : plan.transaction->getResults())
-        if (failed(propagate(plan, plan.lexicalAnchor, result, true))) return failure();
+        if (failed(propagate(plan, plan.lexicalAnchor, result, true)))
+          return failure();
     for (auto binding : plan.finalVersions) {
       if (!charge(budget, plan.transaction))
         return failure();
@@ -2095,7 +2319,8 @@ private:
 
   LogicalResult scheduleTransactions() {
     for (uint64_t index = 0; index < transactions.size(); ++index) {
-      if (!charge(budget, transactions[index].plan->transaction)) return failure();
+      if (!charge(budget, transactions[index].plan->transaction))
+        return failure();
       transactionSchedule.push_back(index);
     }
     return success();
@@ -2124,33 +2349,51 @@ private:
     auto &summary = summaries[module];
     std::unique_ptr<SourceWriteGrantProof> grant;
     auto add = [&](Writer writer) -> LogicalResult {
-      if (!charge(budget, module, 8 + writer.ownerPath.size() + writer.transactionPath.size()))
+      if (!charge(budget, module,
+                  8 + writer.ownerPath.size() + writer.transactionPath.size()))
         return failure();
       auto ownerKey = key(writer.ownerPath, writer.state);
       for (const auto &prior : summary) {
-        if (!charge(budget, module)) return failure();
-        if (ownerKey != key(prior.ownerPath, prior.state)) continue;
+        if (!charge(budget, module))
+          return failure();
+        if (ownerKey != key(prior.ownerPath, prior.state))
+          continue;
         if (prior.plan == writer.plan &&
-            prior.transactionPath == writer.transactionPath) return success();
+            prior.transactionPath == writer.transactionPath)
+          return success();
         {
-          if (!prior.plan || !writer.plan) return failure();
+          if (!prior.plan || !writer.plan)
+            return failure();
           if (!grant) {
-            if (!charge(budget, module, 1 + SourceCheckBudget::bytes(sizeof(SourceWriteGrantProof)))) return failure();
-            grant = std::make_unique<SourceWriteGrantProof>(module, hardware, budget);
+            if (!charge(budget, module,
+                        1 + SourceCheckBudget::bytes(
+                                sizeof(SourceWriteGrantProof))))
+              return failure();
+            grant = std::make_unique<SourceWriteGrantProof>(module, hardware,
+                                                            budget);
           }
           for (auto [left, first] : llvm::enumerate(prior.plan->writes)) {
-            if (!charge(budget, module)) return failure();
-            if (first.owner != prior.owner || first.forwardedProposal) continue;
+            if (!charge(budget, module))
+              return failure();
+            if (first.owner != prior.owner || first.forwardedProposal)
+              continue;
             for (auto [right, second] : llvm::enumerate(writer.plan->writes)) {
-              if (!charge(budget, module)) return failure();
-              if (second.owner != writer.owner || second.forwardedProposal) continue;
-              auto disjoint = grant->disjoint(*prior.plan, prior.transactionPath, left,
-                                               *writer.plan, writer.transactionPath, right);
-              if (failed(disjoint)) return module.emitOpError()
-                  << "source write grant proof could not resolve scoped SSA: " << grant->failureReason();
+              if (!charge(budget, module))
+                return failure();
+              if (second.owner != writer.owner || second.forwardedProposal)
+                continue;
+              auto disjoint =
+                  grant->disjoint(*prior.plan, prior.transactionPath, left,
+                                  *writer.plan, writer.transactionPath, right);
+              if (failed(disjoint))
+                return module.emitOpError() << "source write grant proof could "
+                                               "not resolve scoped SSA: "
+                                            << grant->failureReason();
               if (!*disjoint) {
-                auto diagnostic = module.emitOpError()
-                    << "multiple outer writers require proved disjoint write domains or mutually exclusive controls";
+                auto diagnostic =
+                    module.emitOpError()
+                    << "multiple outer writers require proved disjoint write "
+                       "domains or mutually exclusive controls";
                 diagnostic.attachNote(prior.transaction->getLoc())
                     << "previous rule registration is here";
                 diagnostic.attachNote(writer.transaction.getLoc())
@@ -2177,7 +2420,9 @@ private:
         if (failed(add({anchorPath(plan, owner.anchor),
                         declaration.getQ(),
                         {},
-                        plan.transaction, &plan, write.owner})))
+                        plan.transaction,
+                        &plan,
+                        write.owner})))
           return failure();
       }
     }
@@ -2238,7 +2483,8 @@ private:
                 SourceCheckBudget::multiply(plan.versions.size(),
                                             sizeof(MaterializedVersion)),
                 SourceCheckBudget::multiply(
-                    plan.branchResults.size() + plan.joins.size() + plan.writes.size(),
+                    plan.branchResults.size() + plan.joins.size() +
+                        plan.writes.size(),
                     sizeof(MaterializedBranchResult)))));
     storage = SourceCheckBudget::add(
         storage, SourceCheckBudget::add(
@@ -2251,9 +2497,10 @@ private:
                          SourceCheckBudget::multiply(
                              plan.selections.size(),
                              sizeof(detail::MaterializedSelection)))));
-    storage = SourceCheckBudget::add(storage,
-        SourceCheckBudget::multiply(prepared.writeDomains.empty() ? 0 : plan.writes.size(),
-                                    sizeof(detail::MaterializedSelectedWrite)));
+    storage = SourceCheckBudget::add(
+        storage, SourceCheckBudget::multiply(
+                     prepared.writeDomains.empty() ? 0 : plan.writes.size(),
+                     sizeof(detail::MaterializedSelectedWrite)));
     uint64_t effectValues = 0;
     for (const auto &observation : plan.observations)
       effectValues =
@@ -2292,70 +2539,64 @@ private:
     for (const auto &result : plan.branchResults) {
       auto branch = plan.branches[result.branch].operation;
       if (failed(prepayBranchSelection(result.payloadType, hardware,
-              plan.instances[0].bindings, branch, budget, branchTypes)))
+                                       plan.instances[0].bindings, branch,
+                                       budget, branchTypes)))
         return failure();
     }
     for (const auto &join : plan.joins) {
       const auto &branch = plan.branches[join.branch];
       if (failed(prepayBranchSelection(plan.owners[join.owner].payloadType,
-              hardware, plan.instances[0].bindings, branch.operation, budget,
-              branchTypes)))
+                                       hardware, plan.instances[0].bindings,
+                                       branch.operation, budget, branchTypes)))
         return failure();
     }
     for (const auto &write : plan.writes) {
       if (write.pathFact && write.pathFact.getValue())
         continue;
       if (failed(prepayBranchSelection(plan.owners[write.owner].payloadType,
-              hardware, plan.instances[0].bindings, write.operation, budget,
-              branchTypes)))
+                                       hardware, plan.instances[0].bindings,
+                                       write.operation, budget, branchTypes)))
         return failure();
     }
+    // Invocation frames carry only occurrence-specific bindings. Whether a
+    // callable body can be materialized is immutable definition structure and
+    // was already inventoried by transaction state analysis. Validate that
+    // inventory once instead of walking the same Method body for every call.
     for (const auto &frame : plan.frames) {
-      auto method = frame.method;
       Operation *function =
-          method ? method.operator->() : transaction.operator->();
+          frame.method ? frame.method.operator->() : transaction.operator->();
       if (!charge(budget, function,
                   frame.guardArguments.size() + frame.bodyArguments.size()))
         return failure();
-      SmallVector<Operation *> pending;
-      for (Region &region : function->getRegions())
-        for (Operation &op : region.front()) {
-          if (!charge(budget, function))
+    }
+    if (!materializationDefinitionsChecked) {
+      for (const auto &definition : analysis.getDefinitionPlans()) {
+        for (Operation *op : llvm::drop_begin(definition.operations)) {
+          if (!charge(budget, op,
+                      3 + uint64_t(op->getNumOperands()) * 2 +
+                          uint64_t(op->getNumResults()) * 2 +
+                          op->getNumRegions() +
+                          op->getRawDictionaryAttrs().size() +
+                          op->getPropertiesStorageSize()))
             return failure();
-          pending.push_back(&op);
+          if (!isa<ac::SourceStateReadOp, ac::SourceStateWriteOp,
+                   ac::SourceFormalWriteOp, ac::SourceMethodCallOp,
+                   ac::SourceExpectOp, ac::SourceObserveOp, ac::SourceBranchOp,
+                   ac::SourceQueuePopOp, ac::SourceQueuePeekOp,
+                   ac::SourceQueuePushOp, ac::YieldOp>(op) &&
+              !ac::detail::isCombinationalHardwareOperation(op))
+            return op->emitOpError()
+                   << "transaction lowering cannot materialize this operation";
         }
-      while (!pending.empty()) {
-        Operation *op = pending.pop_back_val();
-        if (!charge(budget, op,
-                    3 + uint64_t(op->getNumOperands()) * 2 +
-                        uint64_t(op->getNumResults()) * 2 +
-                        op->getNumRegions() +
-                        op->getRawDictionaryAttrs().size() +
-                        op->getPropertiesStorageSize()))
-          return failure();
-        if (!isa<ac::SourceStateReadOp, ac::SourceStateWriteOp,
-                 ac::SourceFormalWriteOp, ac::SourceMethodCallOp, ac::SourceExpectOp,
-                 ac::SourceObserveOp, ac::SourceBranchOp, ac::SourceQueuePopOp,
-                 ac::SourceQueuePeekOp, ac::SourceQueuePushOp, ac::YieldOp>(op) &&
-            !ac::detail::isCombinationalHardwareOperation(op))
-          return op->emitOpError()
-                 << "transaction lowering cannot materialize this operation";
-        for (Region &region : op->getRegions())
-          for (Block &block : region) {
-            if (!charge(budget, op, 1 + uint64_t(block.getNumArguments()) * 2))
-              return failure();
-            for (Operation &nested : block) {
-              if (!charge(budget, op))
-                return failure();
-              pending.push_back(&nested);
-            }
-          }
       }
+      materializationDefinitionsChecked = true;
     }
     return success();
   }
 
   mlir::ModuleOp package;
+  bool materializationDefinitionsChecked = false;
+  llvm::DenseMap<std::pair<uint64_t, uint64_t>, bool> resourcePathDisjoint;
   const ac::SourceTransactionStateAnalysis &analysis;
   SourceCheckBudget &budget;
   llvm::DenseMap<Operation *, unsigned> summaryStatus;
@@ -2410,14 +2651,15 @@ private:
 Value bitsLiteral(Type payload, DictionaryAttr occurrence, Location location,
                   bool one, OpBuilder &builder);
 
-FailureOr<MaterializedBranchResult> materializeSelection(
-  Operation *branch, const ac::HardwareBindings &bindings,
-  Value condition, Value whenTrue, Value whenFalse, Type type,
-  OpBuilder &builder, SourceCheckBudget &budget,
-  BranchTypeAdmissionCache *cache = nullptr) {
+FailureOr<MaterializedBranchResult>
+materializeSelection(Operation *branch, const ac::HardwareBindings &bindings,
+                     Value condition, Value whenTrue, Value whenFalse,
+                     Type type, OpBuilder &builder, SourceCheckBudget &budget,
+                     BranchTypeAdmissionCache *cache = nullptr) {
   ac::HardwareAnalysis hardware(branch->getParentOfType<mlir::ModuleOp>());
-  auto admitted = cache ? cache->admit(type, hardware, bindings, branch, budget)
-                        : branchResultType(type, hardware, bindings, branch, budget);
+  auto admitted =
+      cache ? cache->admit(type, hardware, bindings, branch, budget)
+            : branchResultType(type, hardware, bindings, branch, budget);
   if (failed(admitted) || !condition || !whenTrue || !whenFalse ||
       !ac::areEquivalentHardwareTypes(whenTrue.getType(), type) ||
       !ac::areEquivalentHardwareTypes(whenFalse.getType(), type))
@@ -2431,19 +2673,22 @@ FailureOr<MaterializedBranchResult> materializeSelection(
       return failure();
     MaterializedBranchResult result;
     result.generated.reserve(1);
-    OperationState state(branch->getLoc(), ac::ValueMergeOp::getOperationName());
+    OperationState state(branch->getLoc(),
+                         ac::ValueMergeOp::getOperationName());
     state.addOperands({whenFalse, condition, whenTrue});
     state.addTypes({type, condition.getType()});
-    state.addAttributes({
-        builder.getNamedAttr("paths", builder.getArrayAttr({builder.getArrayAttr({})})),
-        builder.getNamedAttr("operandSegmentSizes", builder.getDenseI32ArrayAttr({1, 1, 1}))});
+    state.addAttributes(
+        {builder.getNamedAttr("paths",
+                              builder.getArrayAttr({builder.getArrayAttr({})})),
+         builder.getNamedAttr("operandSegmentSizes",
+                              builder.getDenseI32ArrayAttr({1, 1, 1}))});
     Operation *merge = builder.create(state);
     result.generated.push_back(merge);
     result.value = merge->getResult(0);
     return result;
   }
-  auto layout = branchJoinLayout(type, hardware, bindings,
-                                 branch, budget, cache);
+  auto layout =
+      branchJoinLayout(type, hardware, bindings, branch, budget, cache);
   if (failed(layout) || !condition || !whenTrue || !whenFalse ||
       !ac::areEquivalentHardwareTypes(whenTrue.getType(), type) ||
       !ac::areEquivalentHardwareTypes(whenFalse.getType(), type) ||
@@ -2476,30 +2721,44 @@ FailureOr<MaterializedBranchResult> materializeSelection(
     if (!exiting && node.parent != UINT64_MAX) {
       auto &parent = layout->nodes[node.parent];
       if (isa<ac::TableType>(parent.type)) {
-        auto integer = ac::MathIntAttr::get(branch->getContext(),
+        auto integer = ac::MathIntAttr::get(
+            branch->getContext(),
             llvm::APSInt(llvm::APInt(64, node.ordinal), true));
-        auto expression = builder.getDictionaryAttr({
-            builder.getNamedAttr("kind", builder.getStringAttr("literal")),
-            builder.getNamedAttr("value", builder.getDictionaryAttr({
-                builder.getNamedAttr("kind", builder.getStringAttr("integer")),
-                builder.getNamedAttr("value", integer)})),
-            builder.getNamedAttr("origin", branch->getAttrOfType<DictionaryAttr>("occurrence")),
-            builder.getNamedAttr("location", selectionSourceLocation(branch))});
-        Value index = create(ac::BitsConstantOp::getOperationName(), {},
-                             {branchCarrierType(64, branch)},
-                             {builder.getNamedAttr("value", ac::StaticExprAttr::get(
-                                 branch->getContext(), expression))})->getResult(0);
+        auto expression = builder.getDictionaryAttr(
+            {builder.getNamedAttr("kind", builder.getStringAttr("literal")),
+             builder.getNamedAttr(
+                 "value", builder.getDictionaryAttr(
+                              {builder.getNamedAttr(
+                                   "kind", builder.getStringAttr("integer")),
+                               builder.getNamedAttr("value", integer)})),
+             builder.getNamedAttr(
+                 "origin", branch->getAttrOfType<DictionaryAttr>("occurrence")),
+             builder.getNamedAttr("location",
+                                  selectionSourceLocation(branch))});
+        Value index =
+            create(ac::BitsConstantOp::getOperationName(), {},
+                   {branchCarrierType(64, branch)},
+                   {builder.getNamedAttr(
+                       "value", ac::StaticExprAttr::get(branch->getContext(),
+                                                        expression))})
+                ->getResult(0);
         Type membership = branchCarrierType(1, branch);
-        node.whenTrue = create(ac::TableGetOp::getOperationName(),
-                               {parent.whenTrue, index}, {node.type, membership})->getResult(0);
-        node.whenFalse = create(ac::TableGetOp::getOperationName(),
-                                {parent.whenFalse, index}, {node.type, membership})->getResult(0);
+        node.whenTrue =
+            create(ac::TableGetOp::getOperationName(), {parent.whenTrue, index},
+                   {node.type, membership})
+                ->getResult(0);
+        node.whenFalse =
+            create(ac::TableGetOp::getOperationName(),
+                   {parent.whenFalse, index}, {node.type, membership})
+                ->getResult(0);
       } else {
         auto field = builder.getNamedAttr("field", node.field);
         node.whenTrue = create(ac::StructGetOp::getOperationName(),
-                               {parent.whenTrue}, {node.type}, {field})->getResult(0);
+                               {parent.whenTrue}, {node.type}, {field})
+                            ->getResult(0);
         node.whenFalse = create(ac::StructGetOp::getOperationName(),
-                                {parent.whenFalse}, {node.type}, {field})->getResult(0);
+                                {parent.whenFalse}, {node.type}, {field})
+                             ->getResult(0);
       }
     }
     if (isa<ac::StructType, ac::TableType>(node.type) && !exiting) {
@@ -2539,12 +2798,10 @@ FailureOr<MaterializedBranchResult> materializeSelection(
       layout->nodes[node.parent].fields.push_back(node.joined);
   }
   if (result.generated.size() != layout->operations)
-    return branch->emitOpError()
-           << "local branch join operation count differs";
+    return branch->emitOpError() << "local branch join operation count differs";
   result.value = layout->nodes[0].joined;
   return result;
 }
-
 
 ac::StaticExprAttr bitsLiteralAttribute(Type payload, DictionaryAttr occurrence,
                                         MLIRContext *context, bool one);
@@ -2553,18 +2810,22 @@ class RuleMaterializer {
 public:
   RuleMaterializer(const TransactionPreparation &prepared,
                    IRMapping &packageMap, MaterializationRoutes &routes,
+                   ArrayRef<Value> memoryReadValues,
                    SourceCheckBudget &budget)
       : prepared(prepared), plan(*prepared.plan), packageMap(packageMap),
-        routes(routes), budget(budget), hardware(plan.transaction->getParentOfType<mlir::ModuleOp>()), frames(plan.frames.size()),
-        versions(plan.versions.size()),
+        routes(routes), memoryReadValues(memoryReadValues), budget(budget),
+        hardware(plan.transaction->getParentOfType<mlir::ModuleOp>()),
+        frames(plan.frames.size()), versions(plan.versions.size()),
         branchResults(plan.branchResults.size()), stateJoins(plan.joins.size()),
         conditionalWrites(plan.writes.size()),
         controls(prepared.controls.size()), selections(plan.selections.size()),
-        requirements(prepared.requirements.size()), resources(prepared.resources.size()),
+        requirements(prepared.requirements.size()),
+        resources(prepared.resources.size()),
         queuePaths(prepared.plan->queueAccesses.size()),
         memoryPaths(prepared.plan->memoryAccesses.size()),
         memoryReadPrefixes(prepared.plan->memoryAccesses.size()),
-        selectedWrites(prepared.writeDomains.empty() ? 0 : prepared.plan->writes.size()) {
+        selectedWrites(
+            prepared.writeDomains.empty() ? 0 : prepared.plan->writes.size()) {
     prefixes.reserve(prepared.controls.size() + 1);
     for (auto [id, requirement] : llvm::enumerate(prepared.requirements))
       requirementSites[{requirement.frame, requirement.site}].push_back(id);
@@ -2594,12 +2855,15 @@ public:
       return failure();
     SmallVector<Value> captures;
     SmallVector<Type> types;
-    const auto &rootLogical = plan.instances[plan.lexicalAnchor].logicalBindings;
+    const auto &rootLogical =
+        plan.instances[plan.lexicalAnchor].logicalBindings;
     for (Type original : transaction->getResultTypes()) {
-      auto type = rootLogical.integers.empty() && rootLogical.types.empty()
-                      ? FailureOr<Type>(original)
-                      : hardware.resolveType(original, rootLogical, transaction);
-      if (failed(type)) return failure();
+      auto type =
+          rootLogical.integers.empty() && rootLogical.types.empty()
+              ? FailureOr<Type>(original)
+              : hardware.resolveType(original, rootLogical, transaction);
+      if (failed(type))
+        return failure();
       types.push_back(*type);
     }
     for (auto liveIn : prepared.liveIns) {
@@ -2612,9 +2876,17 @@ public:
     // replaces every external operand with its independently checked union
     // before candidate verification or publication.
     for (const auto &external : prepared.externalPops) {
-      auto placeholder = routes.bound(plan, plan.queueOwners[external.owner].valid);
-      if (failed(placeholder)) return failure();
+      auto placeholder =
+          routes.bound(plan, plan.queueOwners[external.owner].valid);
+      if (failed(placeholder))
+        return failure();
       captures.push_back(*placeholder);
+    }
+    for (uint64_t channel : prepared.memoryReadCaptures) {
+      if (channel >= memoryReadValues.size() || !memoryReadValues[channel])
+        return transaction.emitOpError()
+               << "transaction Memory read capture is missing";
+      captures.push_back(memoryReadValues[channel]);
     }
     Type predicateType = captures[prepared.clockCapture].getType();
     for (auto output : prepared.outputs) {
@@ -2636,14 +2908,25 @@ public:
       types.push_back(predicateType);
     }
     for (const auto &proposal : prepared.queueProposals) {
-      types.push_back(predicateType); types.push_back(predicateType);
+      types.push_back(predicateType);
+      types.push_back(predicateType);
       if (proposal.dataResult)
-        types.push_back(plan.queueOwners[plan.queueAccesses[proposal.access].owner].payloadType);
+        types.push_back(
+            plan.queueOwners[plan.queueAccesses[proposal.access].owner]
+                .payloadType);
     }
     for (const auto &proposal : prepared.memoryProposals) {
-      types.push_back(predicateType); types.push_back(predicateType);
-      for (auto argument : plan.memoryAccesses[proposal.access].arguments)
-        types.push_back(plan.values[argument].value.getType());
+      types.push_back(predicateType);
+      types.push_back(predicateType);
+      for (auto argument : plan.memoryAccesses[proposal.access].arguments) {
+        const auto &value = plan.values[argument];
+        auto type = hardware.resolveType(
+            value.value.getType(),
+            plan.instances[value.anchor].logicalBindings, transaction);
+        if (failed(type))
+          return failure();
+        types.push_back(*type);
+      }
     }
     for (const auto &domain : prepared.writeDomains)
       types.push_back(domain.maskType);
@@ -2661,9 +2944,15 @@ public:
       attributes.set("occurrence", routedOccurrence(plan));
       attributes.set("ac.lexical_registration", transaction.getOccurrence());
       attributes.set("ac.registration_path", plan.registrationPath);
-      attributes.set("ac.registration_owner", FlatSymbolRefAttr::get(transaction.getContext(), plan.lexicalModule->getAttrOfType<StringAttr>("sym_name").getValue()));
+      attributes.set(
+          "ac.registration_owner",
+          FlatSymbolRefAttr::get(
+              transaction.getContext(),
+              plan.lexicalModule->getAttrOfType<StringAttr>("sym_name")
+                  .getValue()));
       auto name = routedRuleName(plan, budget);
-      if (failed(name)) return failure();
+      if (failed(name))
+        return failure();
       attributes.set("name", *name);
     }
     attributes.set("ac.sampled_admission", prepared.expectedAdmission);
@@ -2671,7 +2960,8 @@ public:
     state.addAttributes(attributes);
     state.addRegion();
     auto rule = cast<ac::RuleOp>(Operation::create(state));
-    auto routingModule = cast<ac::ModuleOp>(packageMap.lookup(plan.routingModule.operator->()));
+    auto routingModule =
+        cast<ac::ModuleOp>(packageMap.lookup(plan.routingModule.operator->()));
     if (plan.registrationPath.empty())
       staged->getBlock()->getOperations().insert(staged->getIterator(), rule);
     else
@@ -2685,8 +2975,15 @@ public:
           block->addArgument(captures[ordinal].getType(), ref.value.getLoc());
       lexical.try_emplace(LexicalKey{ref.anchor, ref.value}, argument);
     }
-    for (uint64_t ordinal = prepared.liveIns.size(); ordinal < captures.size(); ++ordinal)
+    for (uint64_t ordinal = prepared.liveIns.size(); ordinal < captures.size();
+         ++ordinal)
       block->addArgument(captures[ordinal].getType(), transaction.getLoc());
+    uint64_t memoryReadCaptureBase =
+        prepared.liveIns.size() + prepared.externalPops.size();
+    for (auto [ordinal, channel] :
+         llvm::enumerate(prepared.memoryReadCaptures))
+      memoryReadValues[channel] =
+          block->getArgument(memoryReadCaptureBase + ordinal);
     // Isolated callable regions receive lexical values through explicit formal
     // bindings. Keep raw Module values only in the shared lexical map.
     for (const auto &read : plan.reads)
@@ -2781,11 +3078,14 @@ public:
     }
     for (const auto &proposal : prepared.queueProposals) {
       auto path = queueProposalPath(proposal, builder);
-      if (failed(path)) return failure();
-      results.push_back(queuePaths[proposal.access]); results.push_back(*path);
+      if (failed(path))
+        return failure();
+      results.push_back(queuePaths[proposal.access]);
+      results.push_back(*path);
       if (proposal.dataResult) {
         auto data = bound(*plan.queueAccesses[proposal.access].payload);
-        if (failed(data)) return failure();
+        if (failed(data))
+          return failure();
         results.push_back(*data);
       }
     }
@@ -2793,23 +3093,38 @@ public:
       const auto &access = plan.memoryAccesses[proposal.access];
       Value reached = prefix;
       if (access.kind == ac::TransactionMemoryAccessKind::Read) {
-        auto retained = retainedPrefix(access.operation, proposal.excludedControls,
-                                       proposal.reachedControlEnd, builder);
-        if (failed(retained)) return failure();
-        reached = *retained;
+        reached = bitsLiteral(prefix.getType(), transaction.getOccurrence(),
+                              access.operation->getLoc(), true, builder);
+        if (proposal.reachedControlEnd < access.arguments.size())
+          return failure();
+        uint64_t first =
+            proposal.reachedControlEnd - access.arguments.size();
+        for (uint64_t control = first;
+             control < proposal.reachedControlEnd; ++control) {
+          auto next = binary(reached, controls[control].accepted, "and",
+                             access.operation->getLoc(), builder);
+          if (failed(next))
+            return failure();
+          reached = *next;
+        }
       }
-      auto path = binary(reached, memoryPaths[proposal.access], "and", access.operation->getLoc(), builder);
-      if (failed(path)) return failure();
-      results.push_back(memoryPaths[proposal.access]); results.push_back(*path);
+      auto path = binary(reached, memoryPaths[proposal.access], "and",
+                         access.operation->getLoc(), builder);
+      if (failed(path))
+        return failure();
+      results.push_back(memoryPaths[proposal.access]);
+      results.push_back(*path);
       for (auto argument : access.arguments) {
         auto value = bound(argument);
-        if (failed(value)) return failure();
+        if (failed(value))
+          return failure();
         results.push_back(*value);
       }
     }
     for (const auto &domain : prepared.writeDomains) {
       if (!selectedWrites[domain.write].mask)
-        return transaction.emitOpError() << "transaction write domain mask is unmapped";
+        return transaction.emitOpError()
+               << "transaction write domain mask is unmapped";
       results.push_back(selectedWrites[domain.write].mask);
     }
     if (results.size() != prepared.totalResults)
@@ -2832,7 +3147,8 @@ public:
       rule->getResult(result + 1).setType(control.reached.getType());
     }
     for (auto [id, check] : llvm::enumerate(savedChecks)) {
-      uint64_t result = prepared.checkBase + 2 * (prepared.controls.size() + id);
+      uint64_t result =
+          prepared.checkBase + 2 * (prepared.controls.size() + id);
       rule->getResult(result).setType(check.first.getType());
       rule->getResult(result + 1).setType(prefix.getType());
     }
@@ -2945,7 +3261,8 @@ private:
                                                 Value whenFalse, Type type,
                                                 OpBuilder &builder) {
     return materializeSelection(branch, plan.instances[0].bindings, condition,
-                                whenTrue, whenFalse, type, builder, budget, &branchTypes);
+                                whenTrue, whenFalse, type, builder, budget,
+                                &branchTypes);
   }
 
   FailureOr<Value> binary(Value lhs, Value rhs, StringRef opcode,
@@ -2991,21 +3308,27 @@ private:
       return failure();
     return result;
   }
-#include "TransactionRawStatementPath.inc"
-#include "TransactionQueueMaterialization.inc"
 #include "TransactionMemoryMaterialization.inc"
+#include "TransactionQueueMaterialization.inc"
+#include "TransactionRawStatementPath.inc"
 #include "TransactionResourceDemandMaterialization.inc"
 
   LogicalResult admitControl(ac::AdmissionControlId id, Value raw,
-                             Location location, OpBuilder &builder, bool generated = false) {
+                             Location location, OpBuilder &builder,
+                             bool generated = false) {
     uint64_t source = id;
-    if (!generated) id = prepared.sourceControls[id];
+    if (!generated)
+      id = prepared.sourceControls[id];
     if (id != prefixes.size() - 1 || id >= controls.size())
       return plan.transaction->emitOpError() << "control order differs";
-    auto sourcePath = !generated ? plan.controls[source].path
+    auto sourcePath =
+        !generated ? plan.controls[source].path
         : prepared.controls[id].requirement
-            ? prepared.requirements[*prepared.controls[id].requirement].point.path
-            : resourcePoint(plan, prepared.resources[*prepared.controls[id].resource]).path;
+            ? prepared.requirements[*prepared.controls[id].requirement]
+                  .point.path
+            : resourcePoint(plan,
+                            prepared.resources[*prepared.controls[id].resource])
+                  .path;
     auto path = selectedPath(sourcePath);
     if (failed(path))
       return failure();
@@ -3013,8 +3336,9 @@ private:
     if (failed(k1))
       return failure();
     Value accepted = *k1;
-    auto *selection = generated ? nullptr :
-        std::get_if<ac::BranchSelectControl>(&plan.controls[source].boundary);
+    auto *selection = generated ? nullptr
+                                : std::get_if<ac::BranchSelectControl>(
+                                      &plan.controls[source].boundary);
     Value k0;
     if (selection) {
       auto zero = known(raw, false, location, builder);
@@ -3073,42 +3397,51 @@ private:
   LogicalResult emitRequirements(Operation *site, ac::InvocationFrameId frame,
                                  OpBuilder &builder) {
     auto found = requirementSites.find({frame, site});
-    if (found == requirementSites.end()) return success();
+    if (found == requirementSites.end())
+      return success();
     for (uint64_t id : found->second) {
       const auto &requirement = prepared.requirements[id];
       if (requirements[id])
         return site->emitOpError() << "required use materialized twice";
       auto payload = bound(requirement.payload);
       auto one = intentLiteral(prefix.getType(), true, site->getLoc(), builder);
-      if (failed(payload) || failed(one)) return failure();
+      if (failed(payload) || failed(one))
+        return failure();
       Value path = *one;
       auto ancestry = requirement.point.path;
       for (unsigned depth = 0; ancestry.branch; ++depth) {
-        if (depth > 128 || !charge(budget, site)) return failure();
+        if (depth > 128 || !charge(budget, site))
+          return failure();
         const auto &branch = plan.branches[*ancestry.branch];
         auto condition = bound(branch.condition);
-        if (failed(condition)) return failure();
+        if (failed(condition))
+          return failure();
         Value selected = *condition;
         if (!ancestry.whenTrue) {
-          OperationState invert(site->getLoc(), ac::BitsUnaryOp::getOperationName());
+          OperationState invert(site->getLoc(),
+                                ac::BitsUnaryOp::getOperationName());
           invert.addOperands(selected);
           invert.addTypes(selected.getType());
           invert.addAttribute("opcode", builder.getStringAttr("not"));
           selected = builder.create(invert)->getResult(0);
         }
         auto joined = binary(path, selected, "and", site->getLoc(), builder);
-        if (failed(joined)) return failure();
+        if (failed(joined))
+          return failure();
         path = *joined;
         ancestry = branch.entry.path;
       }
       if (requirement.rawPath) {
         auto raw = bound(*requirement.rawPath);
-        if (failed(raw)) return failure();
+        if (failed(raw))
+          return failure();
         auto joined = binary(path, *raw, "and", site->getLoc(), builder);
-        if (failed(joined)) return failure();
+        if (failed(joined))
+          return failure();
         path = *joined;
       }
-      OperationState state(site->getLoc(), ac::ValueRequireOp::getOperationName());
+      OperationState state(site->getLoc(),
+                           ac::ValueRequireOp::getOperationName());
       // Availability is filled from actual producer SSA after every Rule and
       // physical Module route exists. No speculative zero/one wire is seeded.
       state.addOperands({*payload, path});
@@ -3118,7 +3451,8 @@ private:
       auto operation = cast<ac::ValueRequireOp>(builder.create(state));
       requirements[id] = operation;
       if (failed(admitControl(requirement.control, operation.getResult(),
-                              site->getLoc(), builder, true))) return failure();
+                              site->getLoc(), builder, true)))
+        return failure();
     }
     return success();
   }
@@ -3127,44 +3461,52 @@ private:
 
   LogicalResult materializeWrite(const ac::StateWriteIntent &write,
                                  OpBuilder &builder) {
-        auto rhs = bound(write.value);
-        if (failed(rhs))
-          return failure();
-        uint64_t writeId = *plan.versions[write.version].write;
-        auto domain = llvm::find_if(prepared.writeDomains, [&](const auto &entry) {
-          return entry.write == writeId;
-        });
-        if (domain != prepared.writeDomains.end()) {
-          if (failed(ensureVersion(write.predecessor, prefix.getType(), builder)))
-            return failure();
-          auto payload = write.selectedPayload ? bound(*write.selectedPayload) : rhs;
-          if (failed(payload)) return failure();
-          auto selected = selectedWrite(write, *domain, versions[write.predecessor].data, *payload, builder);
-          if (failed(selected)) return failure();
-          selectedWrites[writeId] = std::move(*selected);
-          if (isa<ac::SourceStateWriteOp>(write.operation) && !write.selectors.empty())
-            rhs = selectedWrites[writeId].data;
-        }
-        if (write.pathFact && write.pathFact.getValue()) {
-          auto rawIntent =
-              intentLiteral(prefix.getType(), true, write.operation->getLoc(), builder);
-          if (failed(rawIntent)) return failure();
-          versions[write.version] = {*rhs, *rawIntent};
-        } else {
-          auto path = bound(write.authoredPath);
-          if (failed(path) ||
-              failed(ensureVersion(write.predecessor, prefix.getType(), builder)))
-            return failure();
-          auto selected = materializeSelection(write.operation, plan.instances[0].bindings,
-              *path, *rhs, versions[write.predecessor].data,
-              plan.owners[write.owner].payloadType, builder, budget, &branchTypes);
-          auto rawIntent = binary(versions[write.predecessor].rawIntent, *path,
-                                  "or", write.operation->getLoc(), builder);
-          if (failed(selected) || failed(rawIntent)) return failure();
-          versions[write.version] = {selected->value, *rawIntent};
-          conditionalWrites[*plan.versions[write.version].write] =
-              std::move(*selected);
-        }
+    auto rhs = bound(write.value);
+    if (failed(rhs))
+      return failure();
+    uint64_t writeId = *plan.versions[write.version].write;
+    auto domain = llvm::find_if(prepared.writeDomains, [&](const auto &entry) {
+      return entry.write == writeId;
+    });
+    if (domain != prepared.writeDomains.end()) {
+      if (failed(ensureVersion(write.predecessor, prefix.getType(), builder)))
+        return failure();
+      auto payload =
+          write.selectedPayload ? bound(*write.selectedPayload) : rhs;
+      if (failed(payload))
+        return failure();
+      auto selected = selectedWrite(
+          write, *domain, versions[write.predecessor].data, *payload, builder);
+      if (failed(selected))
+        return failure();
+      selectedWrites[writeId] = std::move(*selected);
+      if (isa<ac::SourceStateWriteOp>(write.operation) &&
+          !write.selectors.empty())
+        rhs = selectedWrites[writeId].data;
+    }
+    if (write.pathFact && write.pathFact.getValue()) {
+      auto rawIntent = intentLiteral(prefix.getType(), true,
+                                     write.operation->getLoc(), builder);
+      if (failed(rawIntent))
+        return failure();
+      versions[write.version] = {*rhs, *rawIntent};
+    } else {
+      auto path = bound(write.authoredPath);
+      if (failed(path) ||
+          failed(ensureVersion(write.predecessor, prefix.getType(), builder)))
+        return failure();
+      auto selected = materializeSelection(
+          write.operation, plan.instances[0].bindings, *path, *rhs,
+          versions[write.predecessor].data,
+          plan.owners[write.owner].payloadType, builder, budget, &branchTypes);
+      auto rawIntent = binary(versions[write.predecessor].rawIntent, *path,
+                              "or", write.operation->getLoc(), builder);
+      if (failed(selected) || failed(rawIntent))
+        return failure();
+      versions[write.version] = {selected->value, *rawIntent};
+      conditionalWrites[*plan.versions[write.version].write] =
+          std::move(*selected);
+    }
     return success();
   }
 
@@ -3178,9 +3520,13 @@ private:
                                              sizeof(depth))))
       return failure();
     for (Operation &op : source.without_terminator()) {
-      if (!isa<ac::SourceStateWriteOp, ac::SourceBranchOp, ac::SourceMethodCallOp>(op) &&
-          failed(emitRequirements(&op, frame, builder))) return failure();
-      if (isa<ac::SourceQueuePopOp, ac::SourceQueuePeekOp, ac::SourceQueuePushOp>(op)) {
+      SourceCheckBudget::LocalScope statementBudget(budget);
+      if (!isa<ac::SourceStateWriteOp, ac::SourceBranchOp,
+               ac::SourceMethodCallOp>(op) &&
+          failed(emitRequirements(&op, frame, builder)))
+        return failure();
+      if (isa<ac::SourceQueuePopOp, ac::SourceQueuePeekOp,
+              ac::SourceQueuePushOp>(op)) {
         return op.emitOpError()
                << "retired dedicated queue effects are not admitted";
       } else if (auto access = dyn_cast<ac::SourceStateReadOp>(op)) {
@@ -3193,27 +3539,35 @@ private:
         frames[frame].map(access.getValue(),
                           versions[found->second->version].data);
       } else if (auto intent = dyn_cast<ac::SourceStateWriteOp>(op)) {
-        if (failed(emitRequirements(intent, frame, builder))) return failure();
+        if (failed(emitRequirements(intent, frame, builder)))
+          return failure();
         auto found = writes.find({frame, intent});
         if (found == writes.end())
           return intent.emitOpError() << "transaction write plan is missing";
-        if (failed(materializeWrite(*found->second, builder))) return failure();
+        if (failed(materializeWrite(*found->second, builder)))
+          return failure();
       } else if (auto formal = dyn_cast<ac::SourceFormalWriteOp>(op)) {
         auto found = llvm::find_if(plan.formalWrites, [&](const auto &write) {
           return write.frame == frame && write.operation == formal;
         });
         if (found == plan.formalWrites.end())
-          return formal.emitOpError() << "transaction formal write plan is missing";
-        if (found->write && failed(materializeWrite(plan.writes[*found->write], builder)))
+          return formal.emitOpError()
+                 << "transaction formal write plan is missing";
+        if (found->write &&
+            failed(materializeWrite(plan.writes[*found->write], builder)))
           return failure();
         if (found->snapshot) {
-          auto selected = bound(found->owner ? found->candidate : *found->previous);
-          if (failed(selected) || !prepayValueMapping(budget, formal, frames[frame],
-                                                     formal.getSnapshot())) return failure();
+          auto selected =
+              bound(found->owner ? found->candidate : *found->previous);
+          if (failed(selected) ||
+              !prepayValueMapping(budget, formal, frames[frame],
+                                  formal.getSnapshot()))
+            return failure();
           frames[frame].map(formal.getSnapshot(), *selected);
         }
       } else if (auto split = dyn_cast<ac::SourceBranchOp>(op)) {
-        if (failed(emitRequirements(split, frame, builder))) return failure();
+        if (failed(emitRequirements(split, frame, builder)))
+          return failure();
         if (!charge(budget, split))
           return failure();
         auto branchEntry = branches.find({frame, split});
@@ -3266,19 +3620,23 @@ private:
           branchResults[id] = std::move(*joined);
         }
       } else if (auto call = dyn_cast<ac::SourceMethodCallOp>(op)) {
-        if (failed(emitRequirements(call, frame, builder))) return failure();
-        auto memory = llvm::find_if(plan.memoryAccesses, [&](const auto &access) {
-          return access.operation == call && access.frame == frame;
-        });
+        if (failed(emitRequirements(call, frame, builder)))
+          return failure();
+        auto memory =
+            llvm::find_if(plan.memoryAccesses, [&](const auto &access) {
+              return access.operation == call && access.frame == frame;
+            });
         if (memory != plan.memoryAccesses.end()) {
-          if (failed(emitMemoryAccess(call, frame, builder))) return failure();
+          if (failed(emitMemoryAccess(call, frame, builder)))
+            return failure();
           continue;
         }
         auto queue = llvm::find_if(plan.queueAccesses, [&](const auto &access) {
           return access.operation == call && access.frame == frame;
         });
         if (queue != plan.queueAccesses.end()) {
-          if (failed(emitQueueAccess(call, frame, builder))) return failure();
+          if (failed(emitQueueAccess(call, frame, builder)))
+            return failure();
           continue;
         }
         auto found = calls.find({frame, call});
@@ -3303,7 +3661,7 @@ private:
             effectEvents[nextEffectEvent]->kind !=
                 ac::TransactionStateEventKind::BodyCheck ||
             effectEvents[nextEffectEvent]->frame != frame ||
-            effectEvents[nextEffectEvent]->bodyCheck != found->second)
+            effectEvents[nextEffectEvent]->record != found->second)
           return op.emitOpError()
                  << "transaction body-check event order is inconsistent";
         const auto &record = plan.bodyChecks[found->second];
@@ -3320,7 +3678,7 @@ private:
             effectEvents[nextEffectEvent]->kind !=
                 ac::TransactionStateEventKind::Observe ||
             effectEvents[nextEffectEvent]->frame != frame ||
-            effectEvents[nextEffectEvent]->observation != found->second)
+            effectEvents[nextEffectEvent]->record != found->second)
           return op.emitOpError()
                  << "transaction observation event order is inconsistent";
         const auto &record = plan.observations[found->second];
@@ -3347,15 +3705,18 @@ private:
           if (!frames[frame].contains(operand))
             return op.emitOpError() << "transaction pure operand is unmapped";
         auto *cloned = builder.clone(op, frames[frame]);
-        const auto &logical = plan.instances[plan.frames[frame].anchor].logicalBindings;
+        const auto &logical =
+            plan.instances[plan.frames[frame].anchor].logicalBindings;
         if ((!logical.integers.empty() || !logical.types.empty()) &&
-            failed(rebasePayloadClone(cloned, hardware, logical))) return failure();
+            failed(rebasePayloadClone(cloned, hardware, logical)))
+          return failure();
       }
     }
     return success();
   }
 
   LogicalResult invocation(ac::InvocationFrameId frame, OpBuilder &builder) {
+    SourceCheckBudget::LocalScope invocationBudget(budget);
     const auto &binding = plan.frames[frame];
     for (ArrayRef<ac::TransactionValueBinding> arguments :
          {ArrayRef<ac::TransactionValueBinding>(binding.guardArguments),
@@ -3377,8 +3738,12 @@ private:
          llvm::enumerate(function->getRegions())) {
       if (failed(statements(region.front(), frame, builder)))
         return failure();
-      if (failed(emitRequirements(region.front().getTerminator(), frame, builder)))
-        return failure();
+      {
+        SourceCheckBudget::LocalScope terminatorBudget(budget);
+        if (failed(emitRequirements(region.front().getTerminator(), frame,
+                                    builder)))
+          return failure();
+      }
       if (regionOrdinal == 0) {
         auto found = llvm::find_if(plan.guards, [&](const auto &guard) {
           return guard.frame == frame;
@@ -3406,6 +3771,7 @@ private:
   IRMapping &packageMap;
   using LexicalKey = std::pair<ac::LexicalInstanceId, Value>;
   MaterializationRoutes &routes;
+  SmallVector<Value, 0> memoryReadValues;
   SourceCheckBudget &budget;
   BranchTypeAdmissionCache branchTypes;
   ac::HardwareAnalysis hardware;
@@ -3420,7 +3786,7 @@ private:
   SmallVector<detail::MaterializedSelection, 0> selections;
   llvm::DenseMap<Key, const ac::StateReadBinding *> reads;
   llvm::DenseMap<Key, const ac::StateWriteIntent *> writes;
-  llvm::DenseMap<Key, const ac::TransactionCallBinding *> calls;
+  llvm::DenseMap<Key, const ac::TransactionCallDelta *> calls;
   llvm::DenseMap<Key, ac::BodyCheckId> bodyCheckPlans;
   llvm::DenseMap<Key, ac::ObservationId> observationPlans;
   SmallVector<detail::MaterializedSelectedWrite, 0> selectedWrites;
@@ -3460,8 +3826,8 @@ Value bitsLiteral(Type payload, DictionaryAttr occurrence, Location location,
 }
 
 #include "TransactionDomainCommitMaterialization.inc"
-#include "TransactionQueuePins.inc"
 #include "TransactionMemoryPins.inc"
+#include "TransactionQueuePins.inc"
 
 /// Remove every clone-map entry whose target lies in one of the retired
 /// subtrees. The map is package-wide and immutable during cleanup, so one
@@ -3506,26 +3872,77 @@ LogicalResult eraseTargetMappings(IRMapping &mapping,
   return success();
 }
 
-LogicalResult materialize(PreparedTransactionLowering &prepared,
-                          mlir::ModuleOp staged, IRMapping &mapping,
-                          SmallVectorImpl<MaterializedTransaction> &records,
-                          SmallVectorImpl<detail::MaterializedIncomingCommit> &incomingCommits,
-                          SourceCheckBudget &budget) {
+LogicalResult materialize(
+    const PreparedTransactionLowering &prepared, mlir::ModuleOp staged,
+    IRMapping &mapping, SmallVectorImpl<MaterializedTransaction> &records,
+    SmallVectorImpl<detail::MaterializedIncomingCommit> &incomingCommits,
+    SmallVectorImpl<ac::InstanceOp> &memoryReadInstances,
+    SourceCheckBudget &budget) {
   ac::HardwareAnalysis hardware(prepared.original);
   Builder attributes(staged.getContext());
   // No source envelope or input object is changed before the complete proof.
   staged->setAttr("ac.stage", attributes.getStringAttr("routed"));
-  staged->setAttr("ac.routed_contract", attributes.getI64IntegerAttr(llvm::any_of(staged.getOps<ac::SystemOp>(), [](ac::SystemOp system) { return system->hasAttr("ac.entry_boundary"); }) ? 5 : 4));
+  staged->setAttr(
+      "ac.routed_contract",
+      attributes.getI64IntegerAttr(llvm::any_of(staged.getOps<ac::SystemOp>(),
+                                                [](ac::SystemOp system) {
+                                                  return system->hasAttr(
+                                                      "ac.entry_boundary");
+                                                })
+                                       ? 5
+                                       : 4));
   using CandidateMap = llvm::DenseMap<RoutingKey, std::pair<Value, Value>>;
   llvm::DenseMap<Operation *, CandidateMap> nextValues;
   llvm::DenseMap<Operation *, SmallVector<std::pair<Value, Value>>> incoming;
   MaterializationRoutes routes(prepared, mapping);
 
+  memoryReadInstances.resize(prepared.memoryReadChannels.size());
+  for (auto [channelId, channel] :
+       llvm::enumerate(prepared.memoryReadChannels)) {
+    auto original = cast<ac::InstanceOp>(
+        mapping.lookup(channel.allocation.operator->()));
+    OpBuilder builder(original);
+    OperationState state(original.getLoc(), ac::InstanceOp::getOperationName());
+    state.addOperands(original.getOperands());
+    state.addTypes(original.getResultTypes());
+    NamedAttrList attributes(original->getAttrs());
+    attributes.set(
+        "instance_name",
+        builder.getStringAttr((Twine(original.getInstanceName()) +
+                               "__ac_read_" + Twine(channelId))
+                                  .str()));
+    auto occurrence = original.getOccurrence();
+    auto site = occurrence.getAs<DictionaryAttr>("site");
+    SmallVector<Attribute> astPath(
+        site.getAs<ArrayAttr>("ast_path").begin(),
+        site.getAs<ArrayAttr>("ast_path").end());
+    astPath.push_back(builder.getDictionaryAttr(
+        {builder.getNamedAttr("kind", builder.getStringAttr("index")),
+         builder.getNamedAttr("value",
+                              builder.getI64IntegerAttr(channelId))}));
+    NamedAttrList channelSite(site);
+    channelSite.set("ast_path", builder.getArrayAttr(astPath));
+    attributes.set(
+        "occurrence",
+        builder.getDictionaryAttr(
+            {builder.getNamedAttr(
+                 "site", channelSite.getDictionary(builder.getContext())),
+             builder.getNamedAttr(
+                 "expansion", occurrence.getAs<ArrayAttr>("expansion"))}));
+    attributes.erase("ac.source_memory");
+    attributes.erase("ac.payload_constraint");
+    attributes.set("ac.memory_read_mirror", original.getOccurrence());
+    state.addAttributes(attributes);
+    memoryReadInstances[channelId] =
+        cast<ac::InstanceOp>(builder.create(state));
+  }
+
   // Definitions receive the union of demands from every caller occurrence.
   // Source types/names/domain ordinals are preserved as an exact prefix.
-  for (auto &definition : prepared.definitions) {
+  for (const auto &definition : prepared.definitions) {
     if (definition.upward.empty() && definition.downward.empty() &&
-        definition.queuePopSummaries.empty())
+        definition.queuePopSummaries.empty() &&
+        definition.memoryReadOutputs.empty())
       continue;
     auto module =
         cast<ac::ModuleOp>(mapping.lookup(definition.module.operator->()));
@@ -3560,13 +3977,29 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
       Value e = body.addArgument(route.enableType, module.getLoc());
       arguments.emplace_back(d, e);
     }
+    for (auto [ordinal, route] :
+         llvm::enumerate(definition.memoryReadOutputs)) {
+      inputs.push_back(route.predicateType);
+      inputs.push_back(route.addressType);
+      inputNames.push_back(portName("memory_read_path", ordinal));
+      inputNames.push_back(portName("memory_read_address", ordinal));
+      auto &body = module.getBody().front();
+      body.addArgument(route.predicateType, module.getLoc());
+      body.addArgument(route.addressType, module.getLoc());
+    }
     for (auto [ordinal, route] : llvm::enumerate(definition.upward)) {
       outputs.push_back(route.type);
       outputNames.push_back(portName("q_or_capture", ordinal));
     }
-    for (auto [ordinal, route] : llvm::enumerate(definition.queuePopSummaries)) {
+    for (auto [ordinal, route] :
+         llvm::enumerate(definition.queuePopSummaries)) {
       outputs.push_back(route.predicateType);
       outputNames.push_back(portName("pop_summary", ordinal));
+    }
+    for (auto [ordinal, route] :
+         llvm::enumerate(definition.memoryReadOutputs)) {
+      outputs.push_back(route.payloadType);
+      outputNames.push_back(portName("memory_read", ordinal));
     }
     module->setAttr(
         "function_type",
@@ -3593,7 +4026,7 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
   // Rebuild each affected original Instance once, preserving its identity and
   // complete source arity. Even unrelated occurrences bind every suffix port.
   // Candidate suffix operands are bound after every physical allocation exists.
-  for (auto &parent : prepared.definitions) {
+  for (const auto &parent : prepared.definitions) {
     for (auto original :
          parent.module->getRegion(0).front().getOps<ac::InstanceOp>()) {
       auto child =
@@ -3604,7 +4037,8 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
           prepared
               .definitions[prepared.definitionIndex.lookup(child.operator->())];
       if (definition.upward.empty() && definition.downward.empty() &&
-        definition.queuePopSummaries.empty())
+          definition.queuePopSummaries.empty() &&
+          definition.memoryReadOutputs.empty())
         continue;
       auto old = cast<ac::InstanceOp>(mapping.lookup(original.operator->()));
       auto bindings = hardware.bindInstance(original);
@@ -3618,12 +4052,33 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
         resultTypes.push_back(*type);
       }
       for (const auto &route : definition.queuePopSummaries) {
-        auto type = hardware.resolveType(route.predicateType, *bindings, original);
-        if (failed(type)) return failure();
+        auto type =
+            hardware.resolveType(route.predicateType, *bindings, original);
+        if (failed(type))
+          return failure();
+        resultTypes.push_back(*type);
+      }
+      for (const auto &route : definition.memoryReadOutputs) {
+        auto type = hardware.resolveType(route.payloadType, *bindings,
+                                         original);
+        if (failed(type))
+          return failure();
         resultTypes.push_back(*type);
       }
       SmallVector<Value> operands(old.getOperands());
       OpBuilder builder(old);
+      for (const auto &route : definition.memoryReadOutputs) {
+        auto pathType = hardware.resolveType(route.predicateType, *bindings,
+                                             original);
+        auto addressType = hardware.resolveType(route.addressType, *bindings,
+                                                original);
+        if (failed(pathType) || failed(addressType))
+          return failure();
+        operands.push_back(bitsLiteral(*pathType, original.getOccurrence(),
+                                       original.getLoc(), false, builder));
+        operands.push_back(bitsLiteral(*addressType, original.getOccurrence(),
+                                       original.getLoc(), false, builder));
+      }
       // Detached reconstruction binds complete candidate pairs after every
       // allocation exists. Avoid inventing an untyped zero for nominal data.
       OperationState replacement(old.getLoc(),
@@ -3649,28 +4104,35 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
   // Close every incoming definition-relative prefix against the actual Q0.
   // Disabled occurrences may bind arbitrary typed D: only E gives write intent.
   for (const auto &definition : prepared.definitions) {
-    auto module = cast<ac::ModuleOp>(mapping.lookup(definition.module.operator->()));
+    auto module =
+        cast<ac::ModuleOp>(mapping.lookup(definition.module.operator->()));
     OpBuilder builder(module.getBody().front().getTerminator());
     ac::HardwareBindings bindings;
     bindings.owner = definition.module;
     for (auto [ordinal, route] : llvm::enumerate(definition.downward)) {
       if (route.value.getDefiningOp<ac::SourceTransactionOp>()) {
         auto [data, enable] = incoming[definition.module][ordinal];
-        nextValues[definition.module][routingKey(route.path, route.value)] = {data, enable};
+        nextValues[definition.module][routingKey(route.path, route.value)] = {
+            data, enable};
         if (route.path.empty()) {
           auto old = mapping.lookupOrNull(route.value);
-          if (old) old.replaceAllUsesWith(data);
+          if (old)
+            old.replaceAllUsesWith(data);
           mapping.map(route.value, data);
         }
         continue;
       }
       auto oldQ = routes.value(definition.module, route.path, route.value);
-      if (failed(oldQ) || !prepayAppend(budget, definition.module, incomingCommits)) return failure();
+      if (failed(oldQ) ||
+          !prepayAppend(budget, definition.module, incomingCommits))
+        return failure();
       auto [data, enable] = incoming[definition.module][ordinal];
       auto state = route.value.getDefiningOp<ac::SourceStateOp>();
-      auto closed = materializeDomainCommit(state, state.getOccurrence(), route.type,
-          bindings, *oldQ, data, enable, {}, hardware, builder, budget);
-      if (failed(closed)) return failure();
+      auto closed = materializeDomainCommit(
+          state, state.getOccurrence(), route.type, bindings, *oldQ, data,
+          enable, {}, hardware, builder, budget);
+      if (failed(closed))
+        return failure();
       auto key = routingKey(route.path, route.value);
       nextValues[definition.module][key] = {closed->value, enable};
       incomingCommits.push_back({definition.module, key, std::move(*closed)});
@@ -3681,11 +4143,33 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
     ac::SourceTransactionOp original;
     ac::RuleOp rule;
   };
+  SmallVector<Value> memoryReadValues(prepared.memoryReadChannels.size());
+  for (auto [channelId, channel] :
+       llvm::enumerate(prepared.memoryReadChannels)) {
+    if (channel.path.empty()) {
+      memoryReadValues[channelId] = memoryReadInstances[channelId]->getResult(0);
+      continue;
+    }
+    auto child =
+        cast<ac::ModuleOp>(hardware.resolveCallee(channel.path.front()));
+    const auto &definition = prepared.definitions[
+        prepared.definitionIndex.lookup(child.operator->())];
+    auto found = definition.memoryReadOutputIndex.find(channelId);
+    if (found == definition.memoryReadOutputIndex.end())
+      return failure();
+    auto allocation = cast<ac::InstanceOp>(
+        mapping.lookup(channel.path.front().operator->()));
+    memoryReadValues[channelId] = allocation.getResult(
+        definition.sourceOutputs + definition.upward.size() +
+        definition.queuePopSummaries.size() + found->second);
+  }
   SmallVector<Replacement> replacements;
   records.resize(prepared.transactions.size());
   for (uint64_t transactionIndex : prepared.transactionSchedule) {
+    SourceCheckBudget::LocalScope transactionBudget(budget);
     const auto &transaction = prepared.transactions[transactionIndex];
-    RuleMaterializer builder(transaction, mapping, routes, budget);
+    RuleMaterializer builder(transaction, mapping, routes,
+                             memoryReadValues, budget);
     auto rule = builder.run();
     if (failed(rule))
       return failure();
@@ -3699,8 +4183,7 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
     replacements.push_back({original, materializedRule});
     OpBuilder expectBuilder(materializedRule);
     expectBuilder.setInsertionPointAfter(materializedRule);
-    for (auto [ordinal, control] :
-         llvm::enumerate(transaction.controls)) {
+    for (auto [ordinal, control] : llvm::enumerate(transaction.controls)) {
       auto check =
           cast<DictionaryAttr>(transaction.expectedRequiredChecks[ordinal]);
       OperationState expect(original.getLoc(),
@@ -3724,11 +4207,11 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
       if (!charge(budget, original))
         return failure();
       if (event.kind == ac::TransactionStateEventKind::BodyCheck) {
-        auto id = *event.bodyCheck;
+        auto id = *event.record;
         const auto &source = transaction.plan->bodyChecks[id];
         auto metadata = cast<DictionaryAttr>(bodyRows[id]);
-        uint64_t result = transaction.checkBase +
-                          2 * (transaction.controls.size() + id);
+        uint64_t result =
+            transaction.checkBase + 2 * (transaction.controls.size() + id);
         OperationState expect(source.operation->getLoc(),
                               ac::SourceExpectOp::getOperationName());
         expect.addOperands({materializedRule->getResult(result),
@@ -3741,7 +4224,7 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
         materialized.bodyChecks[id] =
             cast<ac::SourceExpectOp>(expectBuilder.create(expect));
       } else if (event.kind == ac::TransactionStateEventKind::Observe) {
-        auto id = *event.observation;
+        auto id = *event.record;
         const auto &source = transaction.plan->observations[id];
         auto metadata = cast<DictionaryAttr>(observationRows[id]);
         uint64_t pathResult = transaction.observationPathResults[id];
@@ -3761,11 +4244,14 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
       }
     }
     if (!transaction.plan->registrationPath.empty()) {
-      auto registrationPath = anchorPath(*transaction.plan, transaction.plan->lexicalAnchor);
+      auto registrationPath =
+          anchorPath(*transaction.plan, transaction.plan->lexicalAnchor);
       for (Value result : original->getResults()) {
         unsigned ordinal = cast<OpResult>(result).getResultNumber();
-        nextValues[transaction.plan->routingModule][routingKey(registrationPath, result)] =
-            {materializedRule->getResult(ordinal), materializedRule->getResult(transaction.fireResult)};
+        nextValues[transaction.plan->routingModule]
+                  [routingKey(registrationPath, result)] = {
+                      materializedRule->getResult(ordinal),
+                      materializedRule->getResult(transaction.fireResult)};
       }
     }
     for (auto [ordinal, binding] : llvm::enumerate(transaction.outputs)) {
@@ -3777,14 +4263,18 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
       Value data = materializedRule->getResult(binding.dataResult);
       Value enable = materializedRule->getResult(binding.enableResult);
       auto prior = candidates.find(key);
-      auto unordered = unorderedOwnerGroup(prepared, transaction, binding.binding.owner, budget);
-      if (failed(unordered)) return failure();
-      const auto &definition = prepared.definitions[prepared.definitionIndex.lookup(
-          transaction.plan->routingModule.operator->())];
+      auto unordered = unorderedOwnerGroup(prepared, transaction,
+                                           binding.binding.owner, budget);
+      if (failed(unordered))
+        return failure();
+      const auto &definition =
+          prepared.definitions[prepared.definitionIndex.lookup(
+              transaction.plan->routingModule.operator->())];
       bool crossScope = !path.empty();
-      bool candidateDomains = llvm::any_of(
-          transaction.writeDomains,
-          [&](const auto &domain) { return domain.candidate == ordinal; });
+      bool candidateDomains =
+          llvm::any_of(transaction.writeDomains, [&](const auto &domain) {
+            return domain.candidate == ordinal;
+          });
       // An ancestor's partial writer is routed as a complete lane. Pre-compose
       // that lane with its own write domains so the receiving definition and
       // the final proof can recover exactly which leaves it owns; masks never
@@ -3792,51 +4282,73 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
       if (*unordered || definition.downwardIndex.contains(key) ||
           (prior == candidates.end() && crossScope && candidateDomains)) {
         Value previous;
-        if (prior != candidates.end()) previous = prior->second.first;
+        if (prior != candidates.end())
+          previous = prior->second.first;
         else {
           auto oldQ = routes.value(transaction.plan->routingModule, path,
                                    declaration.getQ());
-          if (failed(oldQ)) return failure();
+          if (failed(oldQ))
+            return failure();
           previous = *oldQ;
         }
         OpBuilder commitBuilder(materializedRule);
         commitBuilder.setInsertionPointAfter(materializedRule);
         SmallVector<DomainCommitUse, 0> domains;
         for (const auto &domain : transaction.writeDomains) {
-          if (!charge(budget, original)) return failure();
-          if (domain.candidate != ordinal) continue;
-          if (!prepayAppend(budget, original, domains)) return failure();
-          domains.push_back({domain.selectors.getValue(), materializedRule->getResult(domain.result)});
+          if (!charge(budget, original))
+            return failure();
+          if (domain.candidate != ordinal)
+            continue;
+          if (!prepayAppend(budget, original, domains))
+            return failure();
+          domains.push_back({domain.selectors.getValue(),
+                             materializedRule->getResult(domain.result)});
         }
-        auto composed = materializeDomainCommit(original, original.getOccurrence(), owner.payloadType,
-            transaction.plan->instances[0].bindings, previous,
-            data, enable, domains, hardware, commitBuilder, budget);
-        if (failed(composed)) return failure();
+        auto composed = materializeDomainCommit(
+            original, original.getOccurrence(), owner.payloadType,
+            transaction.plan->instances[0].bindings, previous, data, enable,
+            domains, hardware, commitBuilder, budget);
+        if (failed(composed))
+          return failure();
         auto &commit = materialized.commits[ordinal];
-        commit.data = std::move(*composed); commit.domainMerge = true; commit.enable = enable;
+        commit.data = std::move(*composed);
+        commit.domainMerge = true;
+        commit.enable = enable;
         if (prior != candidates.end()) {
-          auto gate = [&](Value first, Value second, StringRef opcode) -> FailureOr<Value> {
-            if (!charge(budget, original, 32) || !prepayAppend(budget, original, commit.enableGenerated)) return failure();
-            OperationState state(original->getLoc(), ac::BitsBinaryOp::getOperationName());
-            state.addOperands({first, second}); state.addTypes(first.getType());
+          auto gate = [&](Value first, Value second,
+                          StringRef opcode) -> FailureOr<Value> {
+            if (!charge(budget, original, 32) ||
+                !prepayAppend(budget, original, commit.enableGenerated))
+              return failure();
+            OperationState state(original->getLoc(),
+                                 ac::BitsBinaryOp::getOperationName());
+            state.addOperands({first, second});
+            state.addTypes(first.getType());
             state.addAttribute("opcode", commitBuilder.getStringAttr(opcode));
-            Operation *operation = commitBuilder.create(state); commit.enableGenerated.push_back(operation);
+            Operation *operation = commitBuilder.create(state);
+            commit.enableGenerated.push_back(operation);
             return operation->getResult(0);
           };
           auto active = gate(prior->second.second, enable, "or");
-          auto leftPoison = gate(prior->second.second, prior->second.second, "xor");
+          auto leftPoison =
+              gate(prior->second.second, prior->second.second, "xor");
           auto rightPoison = gate(enable, enable, "xor");
-          if (failed(active) || failed(leftPoison) || failed(rightPoison)) return failure();
+          if (failed(active) || failed(leftPoison) || failed(rightPoison))
+            return failure();
           auto poison = gate(*leftPoison, *rightPoison, "or");
-          if (failed(poison)) return failure();
+          if (failed(poison))
+            return failure();
           auto combined = gate(*active, *poison, "xor");
-          if (failed(combined)) return failure(); commit.enable = *combined;
+          if (failed(combined))
+            return failure();
+          commit.enable = *combined;
         }
         candidates[key] = {commit.data.value, commit.enable};
         continue;
       }
       if (prior != candidates.end())
-        return original.emitOpError() << "independent writer group bypassed disjoint domain composition";
+        return original.emitOpError() << "independent writer group bypassed "
+                                         "disjoint domain composition";
       candidates.try_emplace(key, std::make_pair(data, enable));
     }
   }
@@ -3846,7 +4358,8 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
     auto original = replacement.original;
     auto transaction =
         cast<ac::SourceTransactionOp>(mapping.lookup(original.operator->()));
-    if (replacement.rule->getParentOp() != transaction->getParentOp()) continue;
+    if (replacement.rule->getParentOp() != transaction->getParentOp())
+      continue;
     for (auto [source, old, result] :
          llvm::zip(original.getResults(), transaction.getResults(),
                    replacement.rule.getResults().take_front(
@@ -3879,7 +4392,7 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
     return {*oldQ, bitsLiteral(eType, occurrence, location, false, builder)};
   };
 
-  for (auto &parent : prepared.definitions) {
+  for (const auto &parent : prepared.definitions) {
     for (auto original :
          parent.module->getRegion(0).front().getOps<ac::InstanceOp>()) {
       auto child =
@@ -3893,6 +4406,10 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
         continue;
       auto allocation =
           cast<ac::InstanceOp>(mapping.lookup(original.operator->()));
+      SmallVector<Value> memoryReadOperands(
+          allocation.getOperands().slice(
+              definition.sourceInputs,
+              2 * definition.memoryReadOutputs.size()));
       SmallVector<Value> operands(
           allocation.getOperands().take_front(definition.sourceInputs));
       OpBuilder builder(allocation);
@@ -3900,16 +4417,20 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
         SmallVector<ac::InstanceOp> path{original};
         llvm::append_range(path, route.path);
         auto bindings = hardware.bindInstance(original);
-        if (failed(bindings)) return failure();
+        if (failed(bindings))
+          return failure();
         auto dataType = hardware.resolveType(route.type, *bindings, original);
-        auto enableType = hardware.resolveType(route.enableType, *bindings, original);
-        if (failed(dataType) || failed(enableType)) return failure();
+        auto enableType =
+            hardware.resolveType(route.enableType, *bindings, original);
+        if (failed(dataType) || failed(enableType))
+          return failure();
         auto [d, e] =
             candidate(parent.module, path, route.value, *dataType, *enableType,
                       original.getOccurrence(), original.getLoc(), builder);
         operands.push_back(d);
         operands.push_back(e);
       }
+      llvm::append_range(operands, memoryReadOperands);
       allocation->setOperands(operands);
     }
     if (!parent.upward.empty()) {
@@ -3925,9 +4446,42 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
       }
       yield->setOperands(outputs);
     }
+    if (!parent.memoryReadOutputs.empty()) {
+      auto module =
+          cast<ac::ModuleOp>(mapping.lookup(parent.module.operator->()));
+      auto yield = cast<ac::YieldOp>(module.getBody().front().getTerminator());
+      SmallVector<Value> outputs(yield.getValues());
+      for (const auto &route : parent.memoryReadOutputs) {
+        if (route.channel >= memoryReadInstances.size())
+          return failure();
+        Value value;
+        if (route.path.empty()) {
+          value = memoryReadInstances[route.channel]->getResult(0);
+        } else {
+          auto child = route.path.front();
+          auto childDefinition = dyn_cast_or_null<ac::ModuleOp>(
+              hardware.resolveCallee(child));
+          if (!childDefinition)
+            return failure();
+          const auto &routing = prepared.definitions[
+              prepared.definitionIndex.lookup(childDefinition.operator->())];
+          auto found = routing.memoryReadOutputIndex.find(route.channel);
+          if (found == routing.memoryReadOutputIndex.end())
+            return failure();
+          auto allocation = cast<ac::InstanceOp>(
+              mapping.lookup(child.operator->()));
+          value = allocation.getResult(
+              routing.sourceOutputs + routing.upward.size() +
+              routing.queuePopSummaries.size() + found->second);
+        }
+        outputs.push_back(value);
+      }
+      yield->setOperands(outputs);
+    }
   }
   for (auto original : prepared.states) {
-    auto replaced = cast<ac::SourceStateOp>(mapping.lookup(original.operator->()));
+    auto replaced =
+        cast<ac::SourceStateOp>(mapping.lookup(original.operator->()));
     // gfir.state keeps the declaration's exact operands, one Q result,
     // instance_name/occurrence properties, optional payload constraint and
     // location. The ODS builder stores the declared attributes in the
@@ -3952,25 +4506,27 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
         candidate(module, {}, original.getQ(), original.getQ().getType(),
                   original.getClk().getType(), original.getOccurrence(),
                   original.getLoc(), terminal);
-    terminal.create<gfir::StateUpdateOp>(original.getLoc(), routed.getQ(),
-                                         data, intent);
+    terminal.create<gfir::StateUpdateOp>(original.getLoc(), routed.getQ(), data,
+                                         intent);
   }
   SmallVector<Operation *> retired;
   for (auto replacement : replacements) {
     auto old = mapping.lookupOrNull(replacement.original.operator->());
-    if (!old) return failure();
+    if (!old)
+      return failure();
     if (old->getParentOp() == replacement.rule->getParentOp())
-      mapping.map(replacement.original.operator->(), replacement.rule.operator->());
+      mapping.map(replacement.original.operator->(),
+                  replacement.rule.operator->());
   }
   for (auto module : staged.getOps<ac::ModuleOp>()) {
     module->removeAttr("ac.reference_parameters");
     for (auto allocation : module.getBody().front().getOps<ac::InstanceOp>())
       allocation->removeAttr("ac.reference_bindings");
     for (Operation &op : module.getBody().front())
-      if (isa<ac::SourceMethodOp, ac::SourceTransactionOp>(op)) retired.push_back(&op);
+      if (isa<ac::SourceMethodOp, ac::SourceTransactionOp>(op))
+        retired.push_back(&op);
   }
-  if (!retired.empty() &&
-      failed(eraseTargetMappings(mapping, retired, budget)))
+  if (!retired.empty() && failed(eraseTargetMappings(mapping, retired, budget)))
     return failure();
   for (Operation *old : retired) {
     if (!old)
@@ -3982,7 +4538,8 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
         cast<ac::ModuleOp>(mapping.lookup(definition.module.operator->()));
     if (definition.expectedWiring)
       module->setAttr("ac.transaction_wiring", definition.expectedWiring);
-    if (definition.expectedReturns) module->setAttr("ac.transaction_returns", definition.expectedReturns);
+    if (definition.expectedReturns)
+      module->setAttr("ac.transaction_returns", definition.expectedReturns);
   }
   return success();
 }
@@ -4034,20 +4591,25 @@ public:
                  3 + SourceCheckBudget::bytes(
                          sizeof(ac::TransactionPoint) + sizeof(bool) +
                          2 * sizeof(std::optional<ac::BoundValueId>))) ||
-        !product(
-            budget, plan.transaction, plan.branches.size(),
-            1 + SourceCheckBudget::bytes(sizeof(ac::TransactionSourcePath))))
+        !product(budget, plan.transaction,
+                 SourceCheckBudget::add(
+                     1, SourceCheckBudget::multiply(plan.branches.size(), 2)),
+                 1 + SourceCheckBudget::bytes(sizeof(PathAncestry))))
       return failure();
     if (n > validity.max_size() || n > assigned.max_size() ||
         n > edges.max_size() || n > resultEdges.max_size() ||
-        plan.branches.size() > parents.max_size())
+        SourceCheckBudget::add(
+            1, SourceCheckBudget::multiply(plan.branches.size(), 2)) >
+            paths.max_size())
       return error("source replay capacity exceeded");
     index.reserve(n);
     validity.resize(n);
     assigned.resize(n, false);
     edges.resize(n);
     resultEdges.resize(n);
-    parents.reserve(plan.branches.size());
+    paths.reserve(SourceCheckBudget::add(
+        1, SourceCheckBudget::multiply(plan.branches.size(), 2)));
+    paths.push_back({});
     for (auto [id, ref] : llvm::enumerate(plan.values)) {
       if (!ref.value || ref.anchor >= plan.instances.size() ||
           ref.frame >= plan.frames.size())
@@ -4093,29 +4655,41 @@ public:
     return success();
   }
   LogicalResult branch(ac::BranchId id, ac::TransactionSourcePath parent) {
-    if (!charge(budget, plan.transaction) || id != parents.size())
+    if (!charge(budget, plan.transaction) ||
+        paths.size() !=
+            SourceCheckBudget::add(1, SourceCheckBudget::multiply(id, 2)))
       return failure();
-    parents.push_back(parent);
+    auto parentNode = pathNode(parent);
+    if (failed(parentNode))
+      return failure();
+    PathAncestry ancestry;
+    ancestry.depth = paths[*parentNode].depth + 1;
+    ancestry.up[0] = *parentNode;
+    for (unsigned level = 1; level < ancestry.up.size(); ++level)
+      ancestry.up[level] = paths[ancestry.up[level - 1]].up[level - 1];
+    paths.push_back(ancestry);
+    paths.push_back(ancestry);
     return success();
   }
   FailureOr<bool> sourcePathDominates(ac::TransactionSourcePath definition,
                                       ac::TransactionSourcePath use) {
-    for (unsigned depth = 0; depth <= 128; ++depth) {
-      if (!charge(budget, plan.transaction))
+    auto definitionNode = pathNode(definition), useNode = pathNode(use);
+    if (failed(definitionNode) || failed(useNode))
+      return failure();
+    if (!charge(budget, plan.transaction, 2))
+      return failure();
+    if (paths[*definitionNode].depth > paths[*useNode].depth)
+      return false;
+    uint32_t candidate = *useNode;
+    uint32_t difference = paths[candidate].depth - paths[*definitionNode].depth;
+    for (unsigned level = 0; difference; ++level, difference >>= 1) {
+      if (!charge(budget, plan.transaction) ||
+          level >= paths[candidate].up.size())
         return failure();
-      if ((!definition.branch && definition.whenTrue) ||
-          (!use.branch && use.whenTrue) ||
-          (definition.branch && *definition.branch >= parents.size()) ||
-          (use.branch && *use.branch >= parents.size()))
-        return failure();
-      if (sameSourcePath(definition, use))
-        return true;
-      if (!use.branch)
-        return false;
-      use = parents[*use.branch];
+      if (difference & 1)
+        candidate = paths[candidate].up[level];
     }
-    (void)error("source path depth exceeded");
-    return failure();
+    return candidate == *definitionNode;
   }
   LogicalResult assignValidity(ac::BoundValueId id,
                                ac::TransactionPoint point) {
@@ -4157,9 +4731,10 @@ public:
     return success();
   }
   LogicalResult snapshot(ac::BoundValueId output, ac::BoundValueId selected,
-                          ac::TransactionPoint point) {
+                         ac::TransactionPoint point) {
     if (output >= edges.size() || edges[output] || resultEdges[output] ||
-        failed(requireAvailable(selected, point)) || failed(assignValidity(output, point)))
+        failed(requireAvailable(selected, point)) ||
+        failed(assignValidity(output, point)))
       return error("original formal snapshot binding differs");
     edges[output] = selected;
     return success();
@@ -4167,18 +4742,27 @@ public:
   FailureOr<ac::BoundValueId> identity(ac::BoundValueId id,
                                        ac::TransactionPoint point) {
     for (unsigned depth = 0; depth <= 258; ++depth) {
-      if (failed(requireAvailable(id, point))) return failure();
-      if (edges[id]) { id = *edges[id]; continue; }
+      if (failed(requireAvailable(id, point)))
+        return failure();
+      if (edges[id]) {
+        id = *edges[id];
+        continue;
+      }
       const auto &ref = plan.values[id];
       auto argument = dyn_cast<BlockArgument>(ref.value);
-      if (!argument || argument.getOwner()->getParentOp() !=
-              plan.instances[ref.anchor].definition || !plan.instances[ref.anchor].parent)
+      if (!argument ||
+          argument.getOwner()->getParentOp() !=
+              plan.instances[ref.anchor].definition ||
+          !plan.instances[ref.anchor].parent)
         return id;
       const auto &instance = plan.instances[ref.anchor];
-      if (argument.getArgNumber() >= instance.allocation->getNumOperands()) return failure();
-      auto actual = find(instance.allocation->getOperand(argument.getArgNumber()),
-                         *instance.parent, plan.rootFrame);
-      if (failed(actual)) return failure();
+      if (argument.getArgNumber() >= instance.allocation->getNumOperands())
+        return failure();
+      auto actual =
+          find(instance.allocation->getOperand(argument.getArgNumber()),
+               *instance.parent, plan.rootFrame);
+      if (failed(actual))
+        return failure();
       id = *actual;
     }
     return failure();
@@ -4282,8 +4866,25 @@ public:
   }
 
 private:
-  using Key = std::pair<Value, std::pair<ac::LexicalInstanceId,
-                                        ac::InvocationFrameId>>;
+  struct PathAncestry {
+    uint32_t depth = 0;
+    std::array<uint32_t, 8> up{};
+  };
+  using Key =
+      std::pair<Value, std::pair<ac::LexicalInstanceId, ac::InvocationFrameId>>;
+  FailureOr<uint32_t> pathNode(ac::TransactionSourcePath path) {
+    if (!path.branch) {
+      if (path.whenTrue)
+        return failure();
+      return uint32_t(0);
+    }
+    uint64_t node = 1 + 2 * uint64_t(*path.branch) + !path.whenTrue;
+    if (node >= paths.size()) {
+      (void)error("source path references an unverified branch");
+      return failure();
+    }
+    return uint32_t(node);
+  }
   LogicalResult error(StringRef message) {
     return plan.transaction->emitOpError()
            << "transaction source replay: " << message;
@@ -4295,7 +4896,7 @@ private:
   SmallVector<ac::TransactionPoint, 0> validity;
   SmallVector<bool, 0> assigned;
   SmallVector<std::optional<ac::BoundValueId>, 0> edges, resultEdges;
-  SmallVector<ac::TransactionSourcePath, 0> parents;
+  SmallVector<PathAncestry, 0> paths;
 };
 
 class OriginalSourceProof {
@@ -4308,142 +4909,215 @@ public:
 
   LogicalResult run() {
     auto staged = *candidate.module;
-    if (!charge(budget, prepared.original,
-                SourceCheckBudget::bytes(sizeof(*this))))
-      return failure();
-    if (staged->getName() != prepared.original->getName() ||
-        staged->getNumRegions() != prepared.original->getNumRegions() ||
-        staged->getLoc() != prepared.original->getLoc())
-      return reject("original package shape differs");
-    NamedAttrList expectedEnvelope(prepared.original->getAttrs());
-    expectedEnvelope.set("ac.stage",
-                         StringAttr::get(staged.getContext(), "routed"));
-    expectedEnvelope.set("ac.routed_contract",
-                         IntegerAttr::get(IntegerType::get(staged.getContext(), 64),
-                             llvm::any_of(prepared.original->getRegion(0).getOps<ac::SystemOp>(), [](ac::SystemOp system) { return system->hasAttr("ac.entry_boundary"); }) ? 5 : 4));
-    if (staged->getAttrs() != expectedEnvelope.getAttrs() ||
-        staged->getPropertiesAsAttribute() !=
-            prepared.original->getPropertiesAsAttribute())
-      return reject("original package envelope differs");
-    uint64_t locatorEntries = SourceCheckBudget::add(
-        candidate.packageMap.getOperationMap().size(),
-        SourceCheckBudget::add(candidate.packageMap.getBlockMap().size(),
-                               candidate.packageMap.getValueMap().size()));
-    if (!charge(budget, prepared.original,
-                SourceCheckBudget::multiply(locatorEntries, 4)))
-      return failure();
-    // The clone map already enumerates every operation and block copied from
-    // the original package. Seed the live-inventory sets from it once instead
-    // of re-allocating the same entries during the staged walk. The walk still
-    // visits every staged operation, charges that traversal, and pays full
-    // inventory cost only for generated operations absent from the map.
-    for (const auto &entry : candidate.packageMap.getOperationMap())
-      if (entry.second) {
-        operations.insert(entry.second);
-        for (auto result : entry.second->getResults())
-          values.insert(result);
-      }
-    for (const auto &entry : candidate.packageMap.getBlockMap())
-      if (entry.second) {
-        blocks.insert(entry.second);
-        for (auto argument : entry.second->getArguments())
-          values.insert(argument);
-      }
-    for (const auto &entry : candidate.packageMap.getValueMap())
-      if (entry.second)
-        values.insert(entry.second);
-    llvm::DenseSet<Operation *> visited;
-    bool paid = true;
-    staged.walk([&](Operation *op) {
-      if (!paid)
-        return;
-      if (!charge(budget, prepared.original, 1)) {
-        paid = false;
-        return;
-      }
-      bool cloned = operations.contains(op);
-      visited.insert(op);
-      if (!cloned &&
-          !charge(budget, prepared.original,
-                  8 + 4 * op->getNumResults() + op->getNumRegions())) {
-        paid = false;
-        return;
-      }
-      operations.insert(op);
-      for (auto result : op->getResults())
-        values.insert(result);
-      for (Region &region : op->getRegions())
-        for (Block &block : region) {
-          if (!blocks.contains(&block) &&
-              !charge(budget, prepared.original,
-                      4 + 4 * block.getNumArguments())) {
-            paid = false;
-            return;
-          }
-          blocks.insert(&block);
-          for (auto argument : block.getArguments())
+    budget.setPhase("transaction source candidate inventory");
+    {
+      SourceCheckBudget::LocalScope inventoryBudget(budget);
+      if (!charge(budget, prepared.original,
+                  SourceCheckBudget::bytes(sizeof(*this))))
+        return failure();
+      if (staged->getName() != prepared.original->getName() ||
+          staged->getNumRegions() != prepared.original->getNumRegions() ||
+          staged->getLoc() != prepared.original->getLoc())
+        return reject("original package shape differs");
+      NamedAttrList expectedEnvelope(prepared.original->getAttrs());
+      expectedEnvelope.set("ac.stage",
+                           StringAttr::get(staged.getContext(), "routed"));
+      expectedEnvelope.set(
+          "ac.routed_contract",
+          IntegerAttr::get(
+              IntegerType::get(staged.getContext(), 64),
+              llvm::any_of(
+                  prepared.original->getRegion(0).getOps<ac::SystemOp>(),
+                  [](ac::SystemOp system) {
+                    return system->hasAttr("ac.entry_boundary");
+                  })
+                  ? 5
+                  : 4));
+      if (staged->getAttrs() != expectedEnvelope.getAttrs() ||
+          staged->getPropertiesAsAttribute() !=
+              prepared.original->getPropertiesAsAttribute())
+        return reject("original package envelope differs");
+      uint64_t locatorEntries = SourceCheckBudget::add(
+          candidate.packageMap.getOperationMap().size(),
+          SourceCheckBudget::add(candidate.packageMap.getBlockMap().size(),
+                                 candidate.packageMap.getValueMap().size()));
+      if (!charge(budget, prepared.original,
+                  SourceCheckBudget::multiply(locatorEntries, 4)))
+        return failure();
+      // The clone map already enumerates every operation and block copied from
+      // the original package. Seed the live-inventory sets from it once instead
+      // of re-allocating the same entries during the staged walk. The walk
+      // still visits every staged operation, charges that traversal, and pays
+      // full inventory cost only for generated operations absent from the map.
+      for (const auto &entry : candidate.packageMap.getOperationMap())
+        if (entry.second) {
+          operations.insert(entry.second);
+          for (auto result : entry.second->getResults())
+            values.insert(result);
+        }
+      for (const auto &entry : candidate.packageMap.getBlockMap())
+        if (entry.second) {
+          blocks.insert(entry.second);
+          for (auto argument : entry.second->getArguments())
             values.insert(argument);
         }
-    });
-    if (!paid)
-      return failure();
-    for (const auto &entry : candidate.packageMap.getOperationMap())
-      if (!entry.second || !visited.contains(entry.second))
-        return reject("package mapping contains an erased operation");
-    bool transportedAvailability = prepared.valueAvailability;
-    for (const auto &definition : prepared.definitions) {
-      if (!charge(budget, staged, 1)) return failure();
-      transportedAvailability |= bool(definition.expectedReturns);
-    }
-    // Authenticate return-fire transport independently of source callable
-    // totality, including every actual availability companion connection.
-    if (transportedAvailability) {
-      auto proved = ac::detail::getVerifiedValueAvailabilityUses(ac::HardwareAnalysis(staged));
-      if (failed(proved)) return failure();
-      availabilityUses = std::move(*proved);
-    }
-    for (const auto &entry : candidate.packageMap.getOperationMap())
-      if (!operations.contains(entry.second))
-        return reject("package mapping contains an erased operation");
-    for (const auto &entry : candidate.packageMap.getBlockMap())
-      if (!blocks.contains(entry.second))
-        return reject("package mapping contains an erased block");
-    for (const auto &entry : candidate.packageMap.getValueMap())
-      if (!values.contains(entry.second))
-        return reject("package mapping contains an erased value");
-    if (candidate.transactions.size() != prepared.transactions.size() ||
-        staged.getBody()->getOperations().size() !=
-            prepared.original->getRegion(0).front().getOperations().size())
-      return reject("original transaction/declaration inventory differs");
-    // Validate closed payload placement before rebuilding callable order. A
-    // source object may have changed after preparation; newly injected effects
-    // inside a pure nested region must retain their owning-layer diagnostic.
-    SmallVector<Operation *, 0> sourcePending{prepared.original};
-    while (!sourcePending.empty()) {
-      Operation *source = sourcePending.pop_back_val();
-      if (!charge(budget, source)) return failure();
-      if (isa<ac::SourceExpectOp, ac::SourceObserveOp>(source) &&
-          !isa_and_nonnull<ac::ModuleOp, ac::SourceMethodOp,
-                           ac::SourceTransactionOp, ac::SourceBranchOp>(source->getParentOp()))
-        return source->emitOpError()
-               << "transaction body checks/observations require sampled effect lowering";
-      for (Region &region : source->getRegions())
-        for (Block &block : region)
-          for (Operation &child : block) {
-            if (!prepayAppend(budget, source, sourcePending)) return failure();
-            sourcePending.push_back(&child);
+      for (const auto &entry : candidate.packageMap.getValueMap())
+        if (entry.second)
+          values.insert(entry.second);
+      llvm::DenseSet<Operation *> visited;
+      auto inventoryOperation = [&](Operation *op) -> LogicalResult {
+        if (!charge(budget, prepared.original, 1)) {
+          return failure();
+        }
+        bool cloned = operations.contains(op);
+        visited.insert(op);
+        if (!cloned &&
+            !charge(budget, prepared.original,
+                    8 + 4 * op->getNumResults() + op->getNumRegions())) {
+          return failure();
+        }
+        operations.insert(op);
+        if (failed(indexCandidateTerminal(op)))
+          return failure();
+        for (auto result : op->getResults())
+          values.insert(result);
+        for (Region &region : op->getRegions())
+          for (Block &block : region) {
+            if (!blocks.contains(&block) &&
+                !charge(budget, prepared.original,
+                        4 + 4 * block.getNumArguments())) {
+              return failure();
+            }
+            blocks.insert(&block);
+            for (auto argument : block.getArguments())
+              values.insert(argument);
           }
+        return success();
+      };
+      if (failed(inventoryOperation(staged)))
+        return failure();
+      // Each top-level declaration is an independently replayable inventory
+      // owner. Keep the live sets package-wide, but do not make unrelated
+      // definitions consume one another's bounded traversal allowance. A large
+      // definition can itself contain many independently authenticated records;
+      // each record owns its bounded work while the package-wide sets retain
+      // the complete-coverage proof.
+      for (Operation &declaration : staged.getBody()->getOperations()) {
+        SourceCheckBudget::LocalScope declarationBudget(budget);
+        bool paid = true;
+        declaration.walk([&](Operation *op) {
+          if (paid) {
+            SourceCheckBudget::LocalScope operationBudget(budget);
+            if (failed(inventoryOperation(op)))
+              paid = false;
+          }
+        });
+        if (!paid)
+          return failure();
+      }
+      for (const auto &entry : candidate.packageMap.getOperationMap())
+        if (!entry.second || !visited.contains(entry.second))
+          return reject("package mapping contains an erased operation");
+      bool transportedAvailability = prepared.valueAvailability;
+      for (auto definition : prepared.definitions) {
+        if (!charge(budget, staged, 1))
+          return failure();
+        transportedAvailability |= bool(definition.expectedReturns);
+      }
+      // Authenticate return-fire transport independently of source callable
+      // totality, including every actual availability companion connection.
+      if (transportedAvailability) {
+        auto proved = ac::detail::getVerifiedValueAvailabilityUses(
+            ac::HardwareAnalysis(staged));
+        if (failed(proved))
+          return failure();
+        availabilityUses = std::move(*proved);
+      }
+      for (const auto &entry : candidate.packageMap.getOperationMap())
+        if (!operations.contains(entry.second))
+          return reject("package mapping contains an erased operation");
+      for (const auto &entry : candidate.packageMap.getBlockMap())
+        if (!blocks.contains(entry.second))
+          return reject("package mapping contains an erased block");
+      for (const auto &entry : candidate.packageMap.getValueMap())
+        if (!values.contains(entry.second))
+          return reject("package mapping contains an erased value");
+      if (candidate.transactions.size() != prepared.transactions.size() ||
+          staged.getBody()->getOperations().size() !=
+              prepared.original->getRegion(0).front().getOperations().size())
+        return reject("original transaction/declaration inventory differs");
+      // Validate closed payload placement before rebuilding callable order. A
+      // source object may have changed after preparation; newly injected
+      // effects inside a pure nested region must retain their owning-layer
+      // diagnostic.
+      for (Operation &declaration :
+           prepared.original->getRegion(0).front().getOperations()) {
+        SourceCheckBudget::LocalScope declarationBudget(budget);
+        SmallVector<Operation *, 0> sourcePending{&declaration};
+        while (!sourcePending.empty()) {
+          Operation *source = sourcePending.pop_back_val();
+          SourceCheckBudget::LocalScope operationBudget(budget);
+          if (!charge(budget, source))
+            return failure();
+          if (isa<ac::SourceExpectOp, ac::SourceObserveOp>(source) &&
+              !isa_and_nonnull<ac::ModuleOp, ac::SourceMethodOp,
+                               ac::SourceTransactionOp, ac::SourceBranchOp>(
+                  source->getParentOp()))
+            return source->emitOpError()
+                   << "transaction body checks/observations require sampled "
+                      "effect lowering";
+          for (Region &region : source->getRegions())
+            for (Block &block : region)
+              for (Operation &child : block) {
+                if (!prepayAppend(budget, source, sourcePending))
+                  return failure();
+                sourcePending.push_back(&child);
+              }
+        }
+      }
     }
     budget.setPhase("transaction source occurrence proof");
-    if (failed(orderProof())) return failure();
+    {
+      SourceCheckBudget::LocalScope occurrenceBudget(budget);
+      if (failed(orderProof()))
+        return failure();
+    }
+    // orderProof independently rebuilt and verified every original occurrence
+    // from the unchanged source package. Publish only the immutable direct
+    // Module/Method inventories established by that proof so replayed calls
+    // validate their receiver path and bindings as deltas instead of cloning
+    // the same large definition for every occurrence. No call verdict or
+    // binding conclusion is shared.
+    budget.setPhase("transaction source receiver facts");
+    auto publishWorkStorage = [&](Operation *site, uint64_t work,
+                                  uint64_t bytes) {
+      return success(charge(budget, site, work) &&
+                     charge(budget, site, SourceCheckBudget::bytes(bytes)));
+    };
+    for (Operation &definition :
+         prepared.original->getRegion(0).front().getOperations()) {
+      if (!isa<ac::ModuleOp, ac::ModuleImportOp>(definition))
+        continue;
+      SourceCheckBudget::LocalScope definitionBudget(budget);
+      if (failed(receiverProof.publishVerifiedModule(
+              &definition, prepared.original, &definition, publishWorkStorage)))
+        return failure();
+    }
+    budget.setPhase("transaction source definition inventory");
+    if (failed(buildReplayDefinitionInventory()))
+      return failure();
     budget.setPhase("transaction source definition proof");
-    for (const auto &definition : prepared.definitions)
+    for (const auto &definition : prepared.definitions) {
+      SourceCheckBudget::LocalScope definitionBudget(budget);
       if (failed(definitionProof(definition)))
         return failure();
+    }
     budget.setPhase("transaction source replay");
-    for (auto [index, transaction] : llvm::enumerate(prepared.transactions))
+    for (auto [index, transaction] : llvm::enumerate(prepared.transactions)) {
+      SourceCheckBudget::LocalScope transactionBudget(budget);
       if (failed(transactionProof(transaction, candidate.transactions[index])))
         return failure();
+    }
     // Package declarations other than module bodies retain their entire shape.
     for (Operation &op :
          prepared.original->getRegion(0).front().getOperations()) {
@@ -4460,59 +5134,86 @@ public:
         return failure();
     }
     budget.setPhase("transaction source routing proof");
-    if (failed(routingProof())) return failure();
+    {
+      SourceCheckBudget::LocalScope routingBudget(budget);
+      if (failed(routingProof()))
+        return failure();
+    }
     budget.setPhase("transaction queue wiring proof");
-    if (failed(queueWiringProof())) return failure();
+    {
+      SourceCheckBudget::LocalScope queueBudget(budget);
+      if (failed(queueWiringProof()))
+        return failure();
+    }
     budget.setPhase("transaction memory wiring proof");
-    if (failed(memoryPinsProof())) return failure();
+    {
+      SourceCheckBudget::LocalScope memoryBudget(budget);
+      if (failed(memoryPinsProof()))
+        return failure();
+    }
     budget.setPhase("transaction availability graph proof");
     if (prepared.valueAvailability) {
       SmallVector<Value> pending;
       DenseSet<Value> seen;
       DenseSet<Operation *> reachable, generated;
       for (Operation *operation : candidate.availabilityOperations) {
-        if (!charge(budget, prepared.original)) return failure();
+        if (!charge(budget, prepared.original))
+          return failure();
         generated.insert(operation);
       }
       ac::HardwareAnalysis finalHardware(staged);
       for (auto module : finalHardware.getDefinitions()) {
         auto layout = ac::getModulePortLayout(module);
-        if (failed(layout)) return failure();
-        auto yield = cast<ac::YieldOp>(module.getBody().front().getTerminator());
+        if (failed(layout))
+          return failure();
+        auto yield =
+            cast<ac::YieldOp>(module.getBody().front().getTerminator());
         for (int64_t ordinal : layout->outputValidity)
-          if (ordinal >= 0) pending.push_back(yield->getOperand(ordinal));
+          if (ordinal >= 0)
+            pending.push_back(yield->getOperand(ordinal));
         for (auto [payload, validity] : layout->routedOutputValidity)
           pending.push_back(yield->getOperand(validity));
         for (auto rule : module.getBody().front().getOps<ac::RuleOp>())
-          for (auto requirement : rule.getBody().front().getOps<ac::ValueRequireOp>())
+          for (auto requirement :
+               rule.getBody().front().getOps<ac::ValueRequireOp>())
             pending.push_back(requirement.getAvailability());
-        for (auto instance : module.getBody().front().getOps<ac::InstanceOp>()) {
-          auto child = dyn_cast_or_null<ac::ModuleOp>(finalHardware.resolveCallee(instance));
-          if (!child) continue;
+        for (auto instance :
+             module.getBody().front().getOps<ac::InstanceOp>()) {
+          auto child = dyn_cast_or_null<ac::ModuleOp>(
+              finalHardware.resolveCallee(instance));
+          if (!child)
+            continue;
           auto inputs = ac::getModulePortLayout(child);
-          if (failed(inputs)) return failure();
+          if (failed(inputs))
+            return failure();
           for (int64_t ordinal : inputs->inputValidity)
-            if (ordinal >= 0) pending.push_back(instance->getOperand(ordinal));
+            if (ordinal >= 0)
+              pending.push_back(instance->getOperand(ordinal));
         }
       }
       while (!pending.empty()) {
         Value value = pending.pop_back_val();
-        if (!charge(budget, prepared.original)) return failure();
-        if (!seen.insert(value).second) continue;
+        if (!charge(budget, prepared.original))
+          return failure();
+        if (!seen.insert(value).second)
+          continue;
         if (auto argument = dyn_cast<BlockArgument>(value)) {
-          if (auto rule = dyn_cast<ac::RuleOp>(argument.getOwner()->getParentOp()))
+          if (auto rule =
+                  dyn_cast<ac::RuleOp>(argument.getOwner()->getParentOp()))
             pending.push_back(rule->getOperand(argument.getArgNumber()));
           continue;
         }
         auto *operation = value.getDefiningOp();
-        if (!operation) return failure();
+        if (!operation)
+          return failure();
         reachable.insert(operation);
         if (auto rule = dyn_cast<ac::RuleOp>(operation)) {
           pending.push_back(rule.getBody().front().getTerminator()->getOperand(
               cast<OpResult>(value).getResultNumber()));
           continue;
         }
-        if (isa<ac::InstanceOp, ac::CollectionOp>(operation)) continue;
+        if (isa<ac::InstanceOp, ac::CollectionOp>(operation))
+          continue;
         if (auto require = dyn_cast<ac::ValueRequireOp>(operation)) {
           pending.push_back(require.getAvailability());
           pending.push_back(require.getPath());
@@ -4525,47 +5226,56 @@ public:
           // Payload maps retain their separate exact source-clone proof.
           SmallVector<Operation *> nested;
           for (Operation &child : map.getBody().front()) {
-            if (!prepayAppend(budget, prepared.original, nested)) return failure();
+            if (!prepayAppend(budget, prepared.original, nested))
+              return failure();
             nested.push_back(&child);
           }
           while (!nested.empty()) {
             Operation *child = nested.pop_back_val();
-            if (!charge(budget, prepared.original)) return failure();
+            if (!charge(budget, prepared.original))
+              return failure();
             reachable.insert(child);
             for (Value operand : child->getOperands()) {
-              if (!prepayAppend(budget, prepared.original, pending)) return failure();
+              if (!prepayAppend(budget, prepared.original, pending))
+                return failure();
               pending.push_back(operand);
             }
             if (child->getNumRegions())
-              return reject("generated availability has unsupported nested regions");
+              return reject(
+                  "generated availability has unsupported nested regions");
           }
         }
         for (Value operand : operation->getOperands()) {
-          if (!prepayAppend(budget, prepared.original, pending)) return failure();
+          if (!prepayAppend(budget, prepared.original, pending))
+            return failure();
           pending.push_back(operand);
         }
       }
       for (auto *operation : candidate.availabilityOperations) {
         if (!operations.contains(operation) || !reachable.contains(operation))
-          return reject("original generated availability graph has extra operations");
+          return reject(
+              "original generated availability graph has extra operations");
         // The independent availability verifier authenticates this exact
         // constant, in-range Boolean row transport and all of its users.
         // Merely being a pure TableGet does not authorize a private-data route.
-        bool companionRead = isa<ac::TableGetOp>(operation) &&
+        bool companionRead =
+            isa<ac::TableGetOp>(operation) &&
             availabilityUses.contains(&operation->getOpOperand(0));
         if ((!companionRead &&
              !isa<ac::BitsConstantOp, ac::BitsConstant4Op, ac::BitsUnaryOp,
-                 ac::BitsBinaryOp, ac::BitsCompareOp, ac::BitsSelectOp,
-                 ac::BitsConcatOp, ac::BitsExtractOp, ac::BitsResizeOp,
-                 ac::StructGetOp, ac::StructCreateOp, ac::ValueMergeOp,
-                 ac::EnumCreateOp, ac::TableCreateOp, ac::TableSplatOp,
-                 ac::TableViewOp, ac::TableMapOp, ac::TableFoldOp,
-                 ac::YieldOp>(operation)) ||
+                  ac::BitsBinaryOp, ac::BitsCompareOp, ac::BitsSelectOp,
+                  ac::BitsConcatOp, ac::BitsExtractOp, ac::BitsResizeOp,
+                  ac::StructGetOp, ac::StructCreateOp, ac::ValueMergeOp,
+                  ac::EnumCreateOp, ac::TableCreateOp, ac::TableSplatOp,
+                  ac::TableViewOp, ac::TableMapOp, ac::TableFoldOp,
+                  ac::YieldOp>(operation)) ||
             failed(cover(operation)))
-          return reject("original generated availability graph has extra operations");
+          return reject(
+              "original generated availability graph has extra operations");
       }
     } else if (!candidate.availabilityOperations.empty()) {
-      return reject("original total package has invented availability operations");
+      return reject(
+          "original total package has invented availability operations");
     }
     if (failed(cover(staged)))
       return failure();
@@ -4581,6 +5291,45 @@ public:
   }
 
 private:
+  struct CandidateTerminal {
+    Operation *operation = nullptr;
+    uint64_t count = 0;
+  };
+  using CandidateTerminalIndex =
+      DenseMap<std::pair<Operation *, Attribute>, CandidateTerminal>;
+
+  /// Freeze only candidate terminal identity during the already-required
+  /// package inventory. Replay still proves the selected operation's complete
+  /// shape, operands, ordering and source identity independently.
+  LogicalResult indexCandidateTerminal(Operation *operation) {
+    auto module = dyn_cast_or_null<ac::ModuleOp>(operation->getParentOp());
+    CandidateTerminalIndex *index = nullptr;
+    Attribute id;
+    if (module && isa<ac::SourceExpectOp>(operation)) {
+      index = &candidateChecks;
+      id = operation->getAttr("ac.check_id");
+    } else if (module && isa<ac::SourceObserveOp>(operation)) {
+      index = &candidateObservations;
+      id = operation->getAttr("ac.observation_id");
+    }
+    if (!index || !id)
+      return success();
+    auto [found, inserted] =
+        index->try_emplace({module.operator->(), id}, CandidateTerminal{});
+    if (inserted && failed(budget.debitPersistent(
+                        SourceCheckBudget::bytes(
+                            sizeof(CandidateTerminalIndex::value_type) +
+                            4 * sizeof(void *)),
+                        operation)))
+      return failure();
+    if (found->second.count == std::numeric_limits<uint64_t>::max())
+      return failure();
+    if (!found->second.operation)
+      found->second.operation = operation;
+    ++found->second.count;
+    return success();
+  }
+
   LogicalResult reject(StringRef message) {
     return prepared.original->emitError()
            << "transaction original-source proof failed: " << message;
@@ -4596,22 +5345,109 @@ private:
   LogicalResult orderProof() {
     SmallVector<const ac::TransactionStatePlan *, 0> occurrences;
     for (auto [index, preparation] : llvm::enumerate(prepared.transactions)) {
-      if (!prepayAppend(budget, prepared.original, occurrences)) return failure();
-      occurrences.push_back(preparation.plan);
+      if (!prepayAppend(budget, prepared.original, occurrences))
+        return failure();
+      occurrences.push_back(preparation.plan.get());
       if (index >= prepared.transactionSchedule.size() ||
           prepared.transactionSchedule[index] != index)
-        return reject("original registration inventory differs from prepared schedule");
+        return reject(
+            "original registration inventory differs from prepared schedule");
     }
     if (occurrences.size() != prepared.transactionSchedule.size())
-      return reject("original registration inventory differs from prepared schedule");
+      return reject(
+          "original registration inventory differs from prepared schedule");
     auto work = ac::SourceTransactionStateAnalysis::verifyOccurrences(
         prepared.original, occurrences);
-    if (failed(work) || !charge(budget, prepared.original, *work)) return failure();
+    if (failed(work) || !charge(budget, prepared.original, *work))
+      return failure();
     return success();
   }
 
-#include "TransactionQueueWiringProof.inc"
+  /// Reconstruct source-only lookup facts once per immutable definition. These
+  /// indices carry no occurrence binding, availability fact or proof verdict;
+  /// transaction replay still authenticates every actual use independently.
+  LogicalResult buildReplayDefinitionInventory() {
+    struct Pending {
+      Operation *operation;
+      unsigned depth;
+    };
+    for (const auto &definition : prepared.definitions) {
+      auto module = definition.module;
+      DenseMap<StringAttr, Operation *> states;
+      for (Operation &operation : module.getBody().front()) {
+        if (!charge(budget, &operation))
+          return failure();
+        if (auto state = dyn_cast<ac::SourceStateOp>(operation)) {
+          auto [found, inserted] =
+              states.try_emplace(state.getInstanceNameAttr(), state);
+          if (!inserted)
+            found->second = nullptr;
+          if (failed(budget.debitPersistent(SourceCheckBudget::bytes(sizeof(
+                                                decltype(states)::value_type)),
+                                            state)))
+            return failure();
+        }
+        if (!isa<ac::SourceTransactionOp, ac::SourceMethodOp>(operation))
+          continue;
+        SmallVector<Pending, 0> pending;
+        if (!prepayAppend(budget, &operation, pending))
+          return failure();
+        pending.push_back({&operation, 0});
+        while (!pending.empty()) {
+          auto [nested, depth] = pending.pop_back_val();
+          if (depth > 128 || !charge(budget, nested))
+            return failure();
+          if (auto branch = dyn_cast<ac::SourceBranchOp>(nested)) {
+            if (!sourceBranchEffects.try_emplace(branch, false).second)
+              return reject(
+                  "original branch definition inventory is duplicated");
+            if (failed(budget.debitPersistent(
+                    SourceCheckBudget::bytes(
+                        sizeof(decltype(sourceBranchEffects)::value_type)),
+                    branch)))
+              return failure();
+          }
+          bool effectful =
+              isa<ac::SourceMethodCallOp, ac::SourceExpectOp,
+                  ac::SourceObserveOp, ac::SourceQueuePopOp,
+                  ac::SourceQueuePeekOp, ac::SourceQueuePushOp>(nested) ||
+              nested->hasAttr("ac.loop_continuation");
+          if (effectful) {
+            Operation *ancestor = nested;
+            while ((ancestor = ancestor->getParentOp()) &&
+                   ancestor != &operation) {
+              if (!charge(budget, nested))
+                return failure();
+              if (isa<ac::SourceBranchOp>(ancestor)) {
+                auto found = sourceBranchEffects.find(ancestor);
+                if (found == sourceBranchEffects.end())
+                  return reject(
+                      "original branch definition ancestry is absent");
+                found->second = true;
+              }
+            }
+          }
+          for (Region &region : llvm::reverse(nested->getRegions()))
+            for (Block &block : llvm::reverse(region))
+              for (Operation &child : llvm::reverse(block)) {
+                if (!prepayAppend(budget, nested, pending))
+                  return failure();
+                pending.push_back({&child, depth + 1});
+              }
+        }
+      }
+      if (failed(budget.debitPersistent(
+              SourceCheckBudget::bytes(
+                  sizeof(decltype(sourceStateDeclarations)::value_type)),
+              module)))
+        return failure();
+      sourceStateDeclarations.try_emplace(module, std::move(states));
+    }
+    return success();
+  }
+
 #include "TransactionMemoryPinsProof.inc"
+#include "TransactionQueueWiringProof.inc"
 
   LogicalResult cover(Operation *op) {
     if (!charge(budget, prepared.original, 4))
@@ -4653,13 +5489,11 @@ private:
 
 #include "TransactionSelectedWriteProof.inc"
 
-  LogicalResult localBranchProof(Operation *branch, Type resolvedRoot,
-                                 const ac::HardwareBindings &bindings,
-                                 Value condition, Value whenTrue,
-                                 Value whenFalse,
-                                 const MaterializedBranchResult &record,
-                                 Block *parent, Operation *&last,
-                                 BranchTypeAdmissionCache *typeCache = nullptr) {
+  LogicalResult localBranchProof(
+      Operation *branch, Type resolvedRoot,
+      const ac::HardwareBindings &bindings, Value condition, Value whenTrue,
+      Value whenFalse, const MaterializedBranchResult &record, Block *parent,
+      Operation *&last, BranchTypeAdmissionCache *typeCache = nullptr) {
     auto &admissionCache = typeCache ? *typeCache : branchTypes;
     if (!record.value || !values.contains(record.value) ||
         !values.contains(condition) || !values.contains(whenTrue) ||
@@ -4674,7 +5508,8 @@ private:
       return reject("original local branch input type differs");
 
     if (isa<ac::EnumType, ac::StructType, ac::TableType>(resolvedRoot)) {
-      auto admitted = admissionCache.admit(resolvedRoot, hardware, bindings, branch, budget);
+      auto admitted = admissionCache.admit(resolvedRoot, hardware, bindings,
+                                           branch, budget);
       if (failed(admitted) || *admitted != resolvedRoot)
         return reject("original aggregate branch root admission differs");
     }
@@ -4696,13 +5531,15 @@ private:
           result.getOwner() != op || result.getResultNumber() != 0)
         return reject("original compact branch result ordinal differs");
       Builder b(branch->getContext());
-      auto attributes = b.getDictionaryAttr({
-          b.getNamedAttr("paths", b.getArrayAttr({b.getArrayAttr({})})),
-          b.getNamedAttr("operandSegmentSizes", b.getDenseI32ArrayAttr({1, 1, 1}))});
+      auto attributes = b.getDictionaryAttr(
+          {b.getNamedAttr("paths", b.getArrayAttr({b.getArrayAttr({})})),
+           b.getNamedAttr("operandSegmentSizes",
+                          b.getDenseI32ArrayAttr({1, 1, 1}))});
       if (failed(generatedProof(op, ac::ValueMergeOp::getOperationName(),
-              {whenFalse, condition, whenTrue},
-              {resolvedRoot, condition.getType()}, attributes, branch->getLoc(),
-              parent)) || (last && !last->isBeforeInBlock(op)))
+                                {whenFalse, condition, whenTrue},
+                                {resolvedRoot, condition.getType()}, attributes,
+                                branch->getLoc(), parent)) ||
+          (last && !last->isBeforeInBlock(op)))
         return reject("original compact branch operation order differs");
       Value enable = op->getResult(1);
       if (!values.contains(enable) || !enable.use_empty())
@@ -4735,12 +5572,14 @@ private:
         expectedCount = SourceCheckBudget::add(expectedCount, 4);
       } else if (auto table = dyn_cast<ac::TableType>(next.type)) {
         auto count = hardware.getTableSize(table, bindings, branch);
-        if (failed(count) || !product(budget, branch, *count, sizeof(CountFrame)))
+        if (failed(count) ||
+            !product(budget, branch, *count, sizeof(CountFrame)))
           return failure();
-        expectedCount = SourceCheckBudget::add(expectedCount,
-                                               SourceCheckBudget::add(1, 3 * *count));
+        expectedCount = SourceCheckBudget::add(
+            expectedCount, SourceCheckBudget::add(1, 3 * *count));
         for (uint64_t i = 0; i < *count; ++i) {
-          if (!prepayAppend(budget, branch, counting)) return failure();
+          if (!prepayAppend(budget, branch, counting))
+            return failure();
           counting.push_back({table.getElementType(), next.depth + 1});
         }
       } else if (auto structure = dyn_cast<ac::StructType>(next.type)) {
@@ -4750,7 +5589,8 @@ private:
             SourceCheckBudget::add(
                 1, SourceCheckBudget::multiply(fields.size(), 2)));
         for (Attribute raw : fields) {
-          if (!charge(budget, branch, 2)) return failure();
+          if (!charge(budget, branch, 2))
+            return failure();
           auto field = cast<DictionaryAttr>(raw);
           Type declared = field.getAs<TypeAttr>("type").getValue();
           // Reuse only this proof's independently admitted nominal closure.
@@ -4758,7 +5598,8 @@ private:
           if (isa<ac::StructType, ac::EnumType>(declared))
             resolved = declared;
           else if (isa<ac::BitsType, ac::TableType>(declared))
-            resolved = admittedBranchField(declared, hardware, bindings, branch, budget, &admissionCache);
+            resolved = admittedBranchField(declared, hardware, bindings, branch,
+                                           budget, &admissionCache);
           else
             return reject("original local branch field type is unsupported");
           if (failed(resolved) || !prepayAppend(budget, branch, counting))
@@ -4863,32 +5704,43 @@ private:
       Frame &frame = stack.back();
       if (auto table = dyn_cast<ac::TableType>(frame.type);
           table && frame.next < frame.tableSize) {
-        auto number = ac::MathIntAttr::get(branch->getContext(),
+        auto number = ac::MathIntAttr::get(
+            branch->getContext(),
             llvm::APSInt(llvm::APInt(64, frame.next++), true));
-        auto expression = b.getDictionaryAttr({
-            b.getNamedAttr("kind", b.getStringAttr("literal")),
-            b.getNamedAttr("value", b.getDictionaryAttr({
-                b.getNamedAttr("kind", b.getStringAttr("integer")),
-                b.getNamedAttr("value", number)})),
-            b.getNamedAttr("origin", branch->getAttrOfType<DictionaryAttr>("occurrence")),
-            b.getNamedAttr("location", selectionSourceLocation(branch))});
-        auto index = take(ac::BitsConstantOp::getOperationName(), {}, {widthType(64)},
-            b.getDictionaryAttr({b.getNamedAttr("value", ac::StaticExprAttr::get(
-                branch->getContext(), expression))}));
-        if (failed(index)) return failure();
+        auto expression = b.getDictionaryAttr(
+            {b.getNamedAttr("kind", b.getStringAttr("literal")),
+             b.getNamedAttr(
+                 "value",
+                 b.getDictionaryAttr(
+                     {b.getNamedAttr("kind", b.getStringAttr("integer")),
+                      b.getNamedAttr("value", number)})),
+             b.getNamedAttr(
+                 "origin", branch->getAttrOfType<DictionaryAttr>("occurrence")),
+             b.getNamedAttr("location", selectionSourceLocation(branch))});
+        auto index =
+            take(ac::BitsConstantOp::getOperationName(), {}, {widthType(64)},
+                 b.getDictionaryAttr({b.getNamedAttr(
+                     "value", ac::StaticExprAttr::get(branch->getContext(),
+                                                      expression))}));
+        if (failed(index))
+          return failure();
         Type element = table.getElementType();
-        auto trueElement = take(ac::TableGetOp::getOperationName(),
-            {frame.whenTrue, *index}, {element, widthType(1)}, b.getDictionaryAttr({}));
-        auto falseElement = take(ac::TableGetOp::getOperationName(),
-            {frame.whenFalse, *index}, {element, widthType(1)}, b.getDictionaryAttr({}));
+        auto trueElement =
+            take(ac::TableGetOp::getOperationName(), {frame.whenTrue, *index},
+                 {element, widthType(1)}, b.getDictionaryAttr({}));
+        auto falseElement =
+            take(ac::TableGetOp::getOperationName(), {frame.whenFalse, *index},
+                 {element, widthType(1)}, b.getDictionaryAttr({}));
         if (failed(trueElement) || failed(falseElement) ||
             !record.generated[cursor - 1]->getResult(1).use_empty() ||
             !record.generated[cursor - 2]->getResult(1).use_empty() ||
-            failed(push(element, *trueElement, *falseElement))) return failure();
+            failed(push(element, *trueElement, *falseElement)))
+          return failure();
         continue;
       }
       if (frame.fields && frame.next != frame.fields.size()) {
-        if (!charge(budget, branch, 2)) return failure();
+        if (!charge(budget, branch, 2))
+          return failure();
         auto field = cast<DictionaryAttr>(frame.fields[frame.next++]);
         Type declared = field.getAs<TypeAttr>("type").getValue();
         // The original declarations and bindings have not changed since root
@@ -4897,7 +5749,8 @@ private:
         if (isa<ac::StructType, ac::EnumType>(declared))
           fieldType = declared;
         else if (isa<ac::BitsType, ac::TableType>(declared))
-          fieldType = admittedBranchField(declared, hardware, bindings, branch, budget, &admissionCache);
+          fieldType = admittedBranchField(declared, hardware, bindings, branch,
+                                          budget, &admissionCache);
         else
           return reject("original local branch field type is unsupported");
         if (failed(fieldType))
@@ -4949,9 +5802,10 @@ private:
           return reject("original local Enum join membership result is used");
       } else {
         joined =
-            take(isa<ac::TableType>(frame.type) ? ac::TableCreateOp::getOperationName()
-                                                   : ac::StructCreateOp::getOperationName(), frame.joinedFields,
-                 {frame.type}, b.getDictionaryAttr({}));
+            take(isa<ac::TableType>(frame.type)
+                     ? ac::TableCreateOp::getOperationName()
+                     : ac::StructCreateOp::getOperationName(),
+                 frame.joinedFields, {frame.type}, b.getDictionaryAttr({}));
       }
       if (failed(joined))
         return failure();
@@ -4988,7 +5842,8 @@ private:
                                    ArrayRef<ac::InstanceOp> path, Value state,
                                    Value data, std::optional<Value> enable,
                                    Type dataType, Type enableType,
-                                   DictionaryAttr occurrence, Location location) {
+                                   DictionaryAttr occurrence,
+                                   Location location) {
     if (!charge(budget, originalModule, 16 + 8 * path.size()))
       return failure();
     const auto &definition =
@@ -5002,8 +5857,11 @@ private:
       for (uint64_t index : definition.transactionIndices) {
         const auto &plan = *prepared.transactions[index].plan;
         if (plan.transaction != source ||
-            routingKey(anchorPath(plan, plan.lexicalAnchor), state) != key) continue;
-        if (expected) return reject("original public result has multiple occurrence producers");
+            routingKey(anchorPath(plan, plan.lexicalAnchor), state) != key)
+          continue;
+        if (expected)
+          return reject(
+              "original public result has multiple occurrence producers");
         auto rule = candidate.transactions[index].rule;
         expected = {rule->getResult(cast<OpResult>(state).getResultNumber()),
                     rule->getResult(prepared.transactions[index].fireResult)};
@@ -5011,7 +5869,8 @@ private:
       if (!expected) {
         auto incoming = definition.downwardIndex.find(key);
         if (incoming == definition.downwardIndex.end())
-          return reject("original public result route has no producer or incoming lane");
+          return reject(
+              "original public result route has no producer or incoming lane");
         unsigned ordinal = definition.sourceInputs + 2 * incoming->second;
         expected = {module.getBody().front().getArgument(ordinal),
                     module.getBody().front().getArgument(ordinal + 1)};
@@ -5025,12 +5884,17 @@ private:
     for (uint64_t index : prepared.transactionSchedule) {
       const auto &transaction = prepared.transactions[index];
       const auto &plan = *transaction.plan;
-      if (plan.routingModule != originalModule) continue;
+      if (plan.routingModule != originalModule)
+        continue;
       for (auto [ordinal, output] : llvm::enumerate(transaction.outputs)) {
-        if (!charge(budget, originalModule)) return failure();
+        if (!charge(budget, originalModule))
+          return failure();
         const auto &owner = plan.owners[output.binding.owner];
-        if (routingKey(anchorPath(plan, owner.anchor), owner.declaration->getResult(0)) != key) continue;
-        if (!prepayAppend(budget, originalModule, matching)) return failure();
+        if (routingKey(anchorPath(plan, owner.anchor),
+                       owner.declaration->getResult(0)) != key)
+          continue;
+        if (!prepayAppend(budget, originalModule, matching))
+          return failure();
         matching.push_back({index, ordinal});
       }
     }
@@ -5045,30 +5909,41 @@ private:
     SmallVector<ac::InstanceOp> prefix;
     ac::ModuleOp lexical = originalModule;
     for (uint64_t depth = 0; depth <= path.size(); ++depth) {
-      if (!charge(budget, originalModule, 4 + prefix.size())) return failure();
+      if (!charge(budget, originalModule, 4 + prefix.size()))
+        return failure();
       for (const auto &transaction : prepared.transactions) {
         const auto &plan = *transaction.plan;
-        if (!charge(budget, originalModule)) return failure();
-        if (plan.routingModule != lexical) continue;
+        if (!charge(budget, originalModule))
+          return failure();
+        if (plan.routingModule != lexical)
+          continue;
         for (const auto &output : transaction.outputs) {
           const auto &owner = plan.owners[output.binding.owner];
           auto suffix = anchorPath(plan, owner.anchor);
           if (!product(budget, originalModule, prefix.size() + suffix.size(),
-                       1 + SourceCheckBudget::bytes(sizeof(ac::InstanceOp)))) return failure();
+                       1 + SourceCheckBudget::bytes(sizeof(ac::InstanceOp))))
+            return failure();
           SmallVector<ac::InstanceOp> ownerPath(prefix);
           llvm::append_range(ownerPath, suffix);
-          if (routingKey(ownerPath, owner.declaration->getResult(0)) != key) continue;
-          if (!prepayAppend(budget, originalModule, scoped)) return failure();
+          if (routingKey(ownerPath, owner.declaration->getResult(0)) != key)
+            continue;
+          if (!prepayAppend(budget, originalModule, scoped))
+            return failure();
           if (!product(budget, originalModule, prefix.size(),
-                       1 + SourceCheckBudget::bytes(sizeof(ac::InstanceOp)))) return failure();
+                       1 + SourceCheckBudget::bytes(sizeof(ac::InstanceOp))))
+            return failure();
           scoped.push_back({&transaction, output.binding.owner, prefix});
         }
       }
-      if (depth == path.size()) break;
-      auto child = dyn_cast_or_null<ac::ModuleOp>(hardware.resolveCallee(path[depth]));
+      if (depth == path.size())
+        break;
+      auto child =
+          dyn_cast_or_null<ac::ModuleOp>(hardware.resolveCallee(path[depth]));
       if (!child || path[depth]->getParentOfType<ac::ModuleOp>() != lexical)
-        return reject("original contributor owner path is not an actual allocation");
-      if (!prepayAppend(budget, originalModule, prefix)) return failure();
+        return reject(
+            "original contributor owner path is not an actual allocation");
+      if (!prepayAppend(budget, originalModule, prefix))
+        return failure();
       prefix.push_back(path[depth]);
       lexical = child;
     }
@@ -5076,20 +5951,31 @@ private:
     for (size_t i = 0; i < scoped.size(); ++i)
       for (size_t j = 0; j < i; ++j) {
         const auto &first = scoped[i], &second = scoped[j];
-        const auto &a = *first.transaction->plan, &b = *second.transaction->plan;
+        const auto &a = *first.transaction->plan,
+                   &b = *second.transaction->plan;
         if (!scopedGrant) {
-          if (!charge(budget, originalModule, 1 + SourceCheckBudget::bytes(sizeof(SourceWriteGrantProof)))) return failure();
-          scopedGrant = std::make_unique<SourceWriteGrantProof>(originalModule, hardware, budget);
+          if (!charge(
+                  budget, originalModule,
+                  1 + SourceCheckBudget::bytes(sizeof(SourceWriteGrantProof))))
+            return failure();
+          scopedGrant = std::make_unique<SourceWriteGrantProof>(
+              originalModule, hardware, budget);
         }
         for (auto [wa, left] : llvm::enumerate(a.writes)) {
-          if (!charge(budget, originalModule)) return failure();
-          if (left.owner != first.owner || left.forwardedProposal) continue;
+          if (!charge(budget, originalModule))
+            return failure();
+          if (left.owner != first.owner || left.forwardedProposal)
+            continue;
           for (auto [wb, right] : llvm::enumerate(b.writes)) {
-            if (!charge(budget, originalModule)) return failure();
-            if (right.owner != second.owner || right.forwardedProposal) continue;
-            auto disjoint = scopedGrant->disjoint(a, first.scope, wa, b, second.scope, wb);
+            if (!charge(budget, originalModule))
+              return failure();
+            if (right.owner != second.owner || right.forwardedProposal)
+              continue;
+            auto disjoint =
+                scopedGrant->disjoint(a, first.scope, wa, b, second.scope, wb);
             if (failed(disjoint) || !*disjoint)
-              return reject("original scoped writers are not independently disjoint");
+              return reject(
+                  "original scoped writers are not independently disjoint");
           }
         }
       }
@@ -5099,24 +5985,31 @@ private:
     if (incoming != definition.downwardIndex.end()) {
       const detail::MaterializedIncomingCommit *closed = nullptr;
       for (const auto &entry : candidate.incomingCommits) {
-        if (!charge(budget, originalModule)) return failure();
-        if (entry.module != originalModule || entry.key != key) continue;
-        if (closed) return reject("original incoming closure is duplicated");
+        if (!charge(budget, originalModule))
+          return failure();
+        if (entry.module != originalModule || entry.key != key)
+          continue;
+        if (closed)
+          return reject("original incoming closure is duplicated");
         closed = &entry;
       }
-      if (!closed) return reject("original incoming closure is missing");
+      if (!closed)
+        return reject("original incoming closure is missing");
       unsigned input = definition.sourceInputs + 2 * incoming->second;
       Value rawData = module.getBody().front().getArgument(input);
       expectedEnable = module.getBody().front().getArgument(input + 1);
       auto oldQ = routed(originalModule, path, state);
-      if (failed(oldQ)) return failure();
+      if (failed(oldQ))
+        return failure();
       ac::HardwareBindings bindings;
       bindings.owner = originalModule;
       auto declaration = state.getDefiningOp<ac::SourceStateOp>();
       Operation *last = nullptr;
-      if (failed(domainCommitProof(declaration, declaration.getOccurrence(), dataType,
-          bindings, rawData, expectedEnable, {}, closed->data, *oldQ,
-          &module.getBody().front(), last))) return failure();
+      if (failed(domainCommitProof(declaration, declaration.getOccurrence(),
+                                   dataType, bindings, rawData, expectedEnable,
+                                   {}, closed->data, *oldQ,
+                                   &module.getBody().front(), last)))
+        return failure();
       expectedData = closed->data.value;
     }
     for (auto [index, ordinal] : matching) {
@@ -5129,38 +6022,59 @@ private:
       Value currentData = rule->getResult(output.dataResult);
       Value currentEnable = rule->getResult(output.enableResult);
       const auto &commit = record.commits[ordinal];
-      bool crossScopeDomains = !path.empty() && llvm::any_of(
-          transaction.writeDomains,
-          [&](const auto &domain) { return domain.candidate == ordinal; });
+      bool crossScopeDomains =
+          !path.empty() &&
+          llvm::any_of(transaction.writeDomains, [&](const auto &domain) {
+            return domain.candidate == ordinal;
+          });
       if (multipleWriters || incoming != definition.downwardIndex.end() ||
           (!expectedData && crossScopeDomains)) {
         Value base = expectedData;
-        if (!base) { auto oldQ = routed(originalModule, path, state); if (failed(oldQ)) return failure(); base = *oldQ; }
+        if (!base) {
+          auto oldQ = routed(originalModule, path, state);
+          if (failed(oldQ))
+            return failure();
+          base = *oldQ;
+        }
         Operation *last = rule;
-        if (failed(domainCommitProof(transaction, ordinal, record, base, &module.getBody().front(), last))) return failure();
+        if (failed(domainCommitProof(transaction, ordinal, record, base,
+                                     &module.getBody().front(), last)))
+          return failure();
         if (!expectedEnable) {
           if (commit.enable != currentEnable || !commit.enableGenerated.empty())
-            return reject("original first unordered enable differs from its actual writer");
+            return reject("original first unordered enable differs from its "
+                          "actual writer");
           expectedEnable = currentEnable;
         } else {
-          if (commit.enableGenerated.size() != 5) return reject("original unordered poison enable inventory differs");
+          if (commit.enableGenerated.size() != 5)
+            return reject("original unordered poison enable inventory differs");
           unsigned cursor = 0;
           Builder b(originalModule.getContext());
-          auto gate = [&](Value first, Value second, StringRef opcode) -> FailureOr<Value> {
+          auto gate = [&](Value first, Value second,
+                          StringRef opcode) -> FailureOr<Value> {
             Operation *operation = commit.enableGenerated[cursor++];
-            if (failed(generatedProof(operation, ac::BitsBinaryOp::getOperationName(), {first, second},
-                {first.getType()}, b.getDictionaryAttr({b.getNamedAttr("opcode", b.getStringAttr(opcode))}),
-                plan.transaction->getLoc(), &module.getBody().front())) ||
-                (last && !last->isBeforeInBlock(operation))) return failure();
-            last = operation; return operation->getResult(0);
+            if (failed(generatedProof(
+                    operation, ac::BitsBinaryOp::getOperationName(),
+                    {first, second}, {first.getType()},
+                    b.getDictionaryAttr(
+                        {b.getNamedAttr("opcode", b.getStringAttr(opcode))}),
+                    plan.transaction->getLoc(), &module.getBody().front())) ||
+                (last && !last->isBeforeInBlock(operation)))
+              return failure();
+            last = operation;
+            return operation->getResult(0);
           };
           auto active = gate(expectedEnable, currentEnable, "or");
           auto priorPoison = gate(expectedEnable, expectedEnable, "xor");
           auto currentPoison = gate(currentEnable, currentEnable, "xor");
-          if (failed(active) || failed(priorPoison) || failed(currentPoison)) return failure();
-          auto poison = gate(*priorPoison, *currentPoison, "or"); if (failed(poison)) return failure();
+          if (failed(active) || failed(priorPoison) || failed(currentPoison))
+            return failure();
+          auto poison = gate(*priorPoison, *currentPoison, "or");
+          if (failed(poison))
+            return failure();
           auto combined = gate(*active, *poison, "xor");
-          if (failed(combined) || commit.enable != *combined) return reject("original unordered poison enable differs");
+          if (failed(combined) || commit.enable != *combined)
+            return reject("original unordered poison enable differs");
           expectedEnable = *combined;
         }
         expectedData = commit.data.value;
@@ -5180,7 +6094,8 @@ private:
         // commit enable independently and require an exact constant-one truth,
         // not the materializer's own record.
         if (!expectedEnable || !knownTrue(expectedEnable, hardware, budget))
-          return reject("original DFF storage lacks a constant-true commit enable");
+          return reject(
+              "original DFF storage lacks a constant-true commit enable");
         return success();
       }
       if (*enable != expectedEnable)
@@ -5192,7 +6107,8 @@ private:
         return reject("original unwritten state hold data differs");
     } else if (isa<ac::BitsType>(dataType)) {
       if (failed(literalProof(data, dataType, occurrence, location, false,
-                              &module.getBody().front()))) return failure();
+                              &module.getBody().front())))
+        return failure();
     } else {
       auto oldQ = routed(originalModule, path, state);
       if (failed(oldQ) || data != *oldQ)
@@ -5207,25 +6123,28 @@ private:
   LogicalResult routingProof() {
     uint64_t incomingCount = 0;
     for (const auto &definition : prepared.definitions) {
-      if (!charge(budget, definition.module)) return failure();
+      if (!charge(budget, definition.module))
+        return failure();
       for (const auto &route : definition.downward)
         incomingCount += bool(route.value.getDefiningOp<ac::SourceStateOp>());
     }
     if (candidate.incomingCommits.size() != incomingCount)
       return reject("original incoming closure inventory differs");
     for (const auto &entry : candidate.incomingCommits) {
-      if (!charge(budget, prepared.original)) return failure();
+      if (!charge(budget, prepared.original))
+        return failure();
       auto found = prepared.definitionIndex.find(entry.module.operator->());
       if (found == prepared.definitionIndex.end() ||
-          !prepared.definitions[found->second].downwardIndex.contains(entry.key))
+          !prepared.definitions[found->second].downwardIndex.contains(
+              entry.key))
         return reject("original incoming closure has no source owner route");
     }
     for (auto state : prepared.states) {
       auto module = state->getParentOfType<ac::ModuleOp>();
       // The candidate side carries the gfir replacement; authentication
       // proves the exact cross-operation correspondence after the fact.
-      auto declaration = cast<gfir::StateOp>(
-          candidate.packageMap.lookup(state.operator->()));
+      auto declaration =
+          cast<gfir::StateOp>(candidate.packageMap.lookup(state.operator->()));
       gfir::StateUpdateOp update;
       for (auto user : declaration.getQ().getUsers())
         if (auto actual = dyn_cast<gfir::StateUpdateOp>(user);
@@ -5238,13 +6157,13 @@ private:
         return reject("original logical state update is missing");
       if (failed(generatedProof(
               update, gfir::StateUpdateOp::getOperationName(),
-              {declaration.getQ(), update.getCandidate(), update.getIntent()}, {},
-              DictionaryAttr::get(state.getContext()), state.getLoc(),
+              {declaration.getQ(), update.getCandidate(), update.getIntent()},
+              {}, DictionaryAttr::get(state.getContext()), state.getLoc(),
               declaration->getBlock())) ||
           failed(candidatePairProof(
-              module, {}, state.getQ(), update.getCandidate(), update.getIntent(),
-              state.getQ().getType(), state.getClk().getType(),
-              state.getOccurrence(), state.getLoc())))
+              module, {}, state.getQ(), update.getCandidate(),
+              update.getIntent(), state.getQ().getType(),
+              state.getClk().getType(), state.getOccurrence(), state.getLoc())))
         return failure();
     }
     for (const auto &parent : prepared.definitions) {
@@ -5290,21 +6209,28 @@ private:
   /// Names, properties, all attributes, result ordinals, operands and complete
   /// nested block/region shape are compared. A map is only an object locator.
   LogicalResult exactClone(Operation *source, Operation *target,
-                           IRMapping &authenticated,
-                           const IRMapping &locators,
+                           IRMapping &authenticated, const IRMapping &locators,
                            const ac::HardwareBindings *logical = nullptr) {
-    if (logical && logical->integers.empty() && logical->types.empty()) logical = nullptr;
-    auto expectedAttrs = logical ? routedPayloadAttribute(source->getAttrDictionary(), hardware, *logical, source)
-                                 : FailureOr<Attribute>(source->getAttrDictionary());
-    auto expectedProperties = logical ? routedPayloadAttribute(source->getPropertiesAsAttribute(), hardware, *logical, source)
-                                      : FailureOr<Attribute>(source->getPropertiesAsAttribute());
+    if (logical && logical->integers.empty() && logical->types.empty())
+      logical = nullptr;
+    auto expectedAttrs =
+        logical ? routedPayloadAttribute(source->getAttrDictionary(), hardware,
+                                         *logical, source)
+                : FailureOr<Attribute>(source->getAttrDictionary());
+    auto expectedProperties =
+        logical ? routedPayloadAttribute(source->getPropertiesAsAttribute(),
+                                         hardware, *logical, source)
+                : FailureOr<Attribute>(source->getPropertiesAsAttribute());
     SmallVector<Type> expectedTypes;
     for (Type original : source->getResultTypes()) {
-      auto type = logical ? hardware.resolveType(original, *logical, source) : FailureOr<Type>(original);
-      if (failed(type)) return failure();
+      auto type = logical ? hardware.resolveType(original, *logical, source)
+                          : FailureOr<Type>(original);
+      if (failed(type))
+        return failure();
       expectedTypes.push_back(*type);
     }
-    if (failed(expectedAttrs) || failed(expectedProperties)) return failure();
+    if (failed(expectedAttrs) || failed(expectedProperties))
+      return failure();
     if (!charge(
             budget, source,
             16 + 4 * source->getNumOperands() + 4 * source->getNumResults() +
@@ -5345,8 +6271,10 @@ private:
           return failure();
         SmallVector<Type> argumentTypes;
         for (Type original : sourceBlock.getArgumentTypes()) {
-          auto type = logical ? hardware.resolveType(original, *logical, source) : FailureOr<Type>(original);
-          if (failed(type)) return failure();
+          auto type = logical ? hardware.resolveType(original, *logical, source)
+                              : FailureOr<Type>(original);
+          if (failed(type))
+            return failure();
           argumentTypes.push_back(*type);
         }
         if (locators.lookupOrNull(&sourceBlock) != &targetBlock ||
@@ -5363,7 +6291,8 @@ private:
         for (auto [original, actual] : llvm::zip(sourceBlock.getOperations(),
                                                  targetBlock.getOperations())) {
           if (locators.lookupOrNull(&original) != &actual ||
-              failed(exactClone(&original, &actual, authenticated, locators, logical)))
+              failed(exactClone(&original, &actual, authenticated, locators,
+                                logical)))
             return failure();
         }
       }
@@ -5399,9 +6328,56 @@ private:
     return allocation->getResult(definition.sourceOutputs + found->second);
   }
 
+  FailureOr<Value> memoryReadValue(const TransactionPreparation &preparation,
+                                   ac::RuleOp rule, uint64_t channelId) {
+    if (channelId >= prepared.memoryReadChannels.size() ||
+        channelId >= candidate.memoryReadInstances.size())
+      return reject("original Memory read channel is absent");
+    auto found = llvm::find(preparation.memoryReadCaptures, channelId);
+    if (found == preparation.memoryReadCaptures.end())
+      return reject("original Memory read Rule capture is absent");
+    uint64_t ordinal = preparation.liveIns.size() +
+                       preparation.externalPops.size() +
+                       std::distance(preparation.memoryReadCaptures.begin(),
+                                     found);
+    if (ordinal >= rule.getBody().front().getNumArguments())
+      return reject("original Memory read Rule capture ordinal differs");
+    return rule.getBody().front().getArgument(ordinal);
+  }
+
+  FailureOr<Value>
+  memoryReadRouteValue(const detail::AsyncMemoryReadRoute &route) {
+    if (route.channel >= candidate.memoryReadInstances.size())
+      return reject("original Memory read channel route is absent");
+    if (route.path.empty()) {
+      auto instance = candidate.memoryReadInstances[route.channel];
+      if (!instance || !operations.contains(instance.operator->()) ||
+          instance->getNumResults() == 0)
+        return reject("original Memory read channel instance is absent");
+      return instance->getResult(0);
+    }
+    auto child = dyn_cast_or_null<ac::ModuleOp>(
+        hardware.resolveCallee(route.path.front()));
+    auto allocation = dyn_cast_or_null<ac::InstanceOp>(
+        candidate.packageMap.lookupOrNull(route.path.front().operator->()));
+    if (!child || !allocation || !operations.contains(allocation.operator->()))
+      return reject("original Memory read channel child route is absent");
+    const auto &definition = prepared.definitions[
+        prepared.definitionIndex.lookup(child.operator->())];
+    auto found = definition.memoryReadOutputIndex.find(route.channel);
+    if (found == definition.memoryReadOutputIndex.end())
+      return reject("original Memory read channel child output is absent");
+    uint64_t ordinal = definition.sourceOutputs + definition.upward.size() +
+                       definition.queuePopSummaries.size() + found->second;
+    if (ordinal >= allocation->getNumResults())
+      return reject("original Memory read channel child ordinal differs");
+    return allocation->getResult(ordinal);
+  }
+
   uint64_t queueInputCount(const DefinitionRouting &definition) const {
     uint64_t count = 0;
-    for (const auto &route : definition.queueIncoming) count += route.push ? 2 : 1;
+    for (const auto &route : definition.queueIncoming)
+      count += route.push ? 2 : 1;
     return count;
   }
 
@@ -5421,27 +6397,38 @@ private:
     auto sourceType = original.getFunctionType(),
          targetType = module.getFunctionType();
     auto availability = ac::getModulePortLayout(module);
-    if (failed(availability) || availability->sourceInputCount != definition.sourceInputs ||
-        availability->sourceOutputCount != definition.sourceOutputs) return failure();
+    if (failed(availability) ||
+        availability->sourceInputCount != definition.sourceInputs ||
+        availability->sourceOutputCount != definition.sourceOutputs)
+      return failure();
     uint64_t validityInputs = llvm::count_if(availability->inputValidity,
-                                           [](int64_t i) { return i >= 0; });
+                                             [](int64_t i) { return i >= 0; });
     uint64_t validityOutputs = llvm::count_if(availability->outputValidity,
-                                            [](int64_t i) { return i >= 0; });
+                                              [](int64_t i) { return i >= 0; });
     validityOutputs += availability->routedOutputValidity.size();
     if (!prepared.valueAvailability && (validityInputs || validityOutputs))
       return reject("original total package has invented validity ports");
     uint64_t routedBase = definition.sourceOutputs + definition.upward.size();
-    uint64_t availabilityBase = routedBase + definition.queuePopSummaries.size();
-    uint64_t publicValidityCount = llvm::count_if(availability->outputValidity,
-                                                 [](int64_t i) { return i >= 0; });
-    for (auto [ordinal, pair] : llvm::enumerate(availability->routedOutputValidity))
+    uint64_t availabilityBase =
+        routedBase + definition.queuePopSummaries.size() +
+        definition.memoryReadOutputs.size();
+    uint64_t publicValidityCount = llvm::count_if(
+        availability->outputValidity, [](int64_t i) { return i >= 0; });
+    for (auto [ordinal, pair] :
+         llvm::enumerate(availability->routedOutputValidity))
       if (pair.first < definition.sourceOutputs || pair.first >= routedBase ||
           pair.second != availabilityBase + publicValidityCount + ordinal)
-        return reject("original routed capture validity does not follow its exported payload");
+        return reject("original routed capture validity does not follow its "
+                      "exported payload");
     if (targetType.getNumInputs() !=
-            definition.sourceInputs + 2 * definition.downward.size() + queueInputCount(definition) + 2 * definition.memoryIncoming.size() + validityInputs ||
+            definition.sourceInputs + 2 * definition.downward.size() +
+                2 * definition.memoryReadOutputs.size() +
+                queueInputCount(definition) +
+                2 * definition.memoryIncoming.size() + validityInputs ||
         targetType.getNumResults() !=
-            definition.sourceOutputs + definition.upward.size() + definition.queuePopSummaries.size() + validityOutputs ||
+            definition.sourceOutputs + definition.upward.size() +
+                definition.queuePopSummaries.size() +
+                definition.memoryReadOutputs.size() + validityOutputs ||
         targetType.getInputs().take_front(definition.sourceInputs) !=
             sourceType.getInputs() ||
         targetType.getResults().take_front(definition.sourceOutputs) !=
@@ -5459,9 +6446,21 @@ private:
           targetType.getInput(definition.sourceInputs + 2 * ordinal + 1) !=
               route.enableType)
         return reject("original appended incoming route types differ");
+    for (auto [ordinal, route] :
+         llvm::enumerate(definition.memoryReadOutputs)) {
+      uint64_t input = definition.sourceInputs +
+                       2 * definition.downward.size() + 2 * ordinal;
+      if (targetType.getInput(input) != route.predicateType ||
+          targetType.getInput(input + 1) != route.addressType)
+        return reject("original appended Memory read input types differ");
+    }
     for (auto [ordinal, route] : llvm::enumerate(definition.memoryIncoming)) {
-      uint64_t input = definition.sourceInputs + 2 * definition.downward.size() + queueInputCount(definition) + 2 * ordinal;
-      if (targetType.getInput(input) != route.predicateType || targetType.getInput(input + 1) != route.type)
+      uint64_t input = definition.sourceInputs +
+                       2 * definition.downward.size() +
+                       2 * definition.memoryReadOutputs.size() +
+                       queueInputCount(definition) + 2 * ordinal;
+      if (targetType.getInput(input) != route.predicateType ||
+          targetType.getInput(input + 1) != route.type)
         return reject("original appended Memory pin route types differ");
     }
     for (auto [ordinal, route] : llvm::enumerate(definition.upward))
@@ -5469,18 +6468,30 @@ private:
           route.type)
         return reject("original appended upward route type differs");
     for (auto [ordinal, route] : llvm::enumerate(definition.queuePopSummaries))
-      if (targetType.getResult(definition.sourceOutputs + definition.upward.size() + ordinal) !=
+      if (targetType.getResult(definition.sourceOutputs +
+                               definition.upward.size() + ordinal) !=
           route.predicateType)
         return reject("original appended queue summary type differs");
-    if (definition.upward.empty() && definition.downward.empty() && definition.queueIncoming.empty() &&
-        definition.memoryIncoming.empty() && definition.queuePopSummaries.empty() &&
-        !validityInputs && !validityOutputs) {
+    for (auto [ordinal, route] : llvm::enumerate(definition.memoryReadOutputs))
+      if (targetType.getResult(definition.sourceOutputs +
+                               definition.upward.size() +
+                               definition.queuePopSummaries.size() + ordinal) !=
+          route.payloadType)
+        return reject("original appended Memory read route type differs");
+    if (definition.upward.empty() && definition.downward.empty() &&
+        definition.queueIncoming.empty() && definition.memoryIncoming.empty() &&
+        definition.queuePopSummaries.empty() &&
+        definition.memoryReadOutputs.empty() && !validityInputs &&
+        !validityOutputs) {
       if (module->getAttr("ac.internal_ports") !=
           original->getAttr("ac.internal_ports"))
         return reject("original unextended internal port metadata differs");
     } else {
       Builder b(original.getContext());
-      SmallVector<Attribute> defaults(2 * definition.downward.size() + queueInputCount(definition) + 2 * definition.memoryIncoming.size(),
+      SmallVector<Attribute> defaults(2 * definition.downward.size() +
+                                          2 * definition.memoryReadOutputs.size() +
+                                          queueInputCount(definition) +
+                                          2 * definition.memoryIncoming.size(),
                                       b.getI64IntegerAttr(0));
       defaults.append(validityInputs, b.getI64IntegerAttr(1));
       auto internal = b.getDictionaryAttr(
@@ -5496,10 +6507,11 @@ private:
     expected.erase("ac.reference_parameters");
     if (module->getAttr("ac.transaction_returns") != definition.expectedReturns)
       return reject("original public return route metadata differs");
-    for (StringRef name : {"function_type", "input_names", "output_names",
-                           "ac.internal_ports", "ac.transaction_wiring", "ac.queue_wiring",
-                           "ac.input_validity", "ac.output_validity",
-                           "ac.routed_output_validity", "ac.transaction_returns"}) {
+    for (StringRef name :
+         {"function_type", "input_names", "output_names", "ac.internal_ports",
+          "ac.transaction_wiring", "ac.queue_wiring", "ac.input_validity",
+          "ac.output_validity", "ac.routed_output_validity",
+          "ac.transaction_returns"}) {
       expected.erase(name);
       actual.erase(name);
     }
@@ -5517,16 +6529,21 @@ private:
       authenticated.map(argument, candidate.packageMap.lookup(argument));
     // Public transaction results are graph values too. Declaration scheduling
     // may place a consumer instance before its registration operation, so prove
-    // every public result's exact Rule ordinal or incoming route before checking
-    // any ordinary operation's operands. The full transaction proof below still
-    // authenticates that Rule's body, captures and public result prefix.
-    for (auto source : original.getBody().front().getOps<ac::SourceTransactionOp>()) {
+    // every public result's exact Rule ordinal or incoming route before
+    // checking any ordinary operation's operands. The full transaction proof
+    // below still authenticates that Rule's body, captures and public result
+    // prefix.
+    for (auto source :
+         original.getBody().front().getOps<ac::SourceTransactionOp>()) {
       std::optional<uint64_t> local;
       for (uint64_t index : definition.transactionIndices) {
-        if (!charge(budget, source)) return failure();
+        if (!charge(budget, source))
+          return failure();
         const auto &plan = *prepared.transactions[index].plan;
-        if (plan.transaction != source || !plan.registrationPath.empty()) continue;
-        if (local) return reject("original public result has multiple local producers");
+        if (plan.transaction != source || !plan.registrationPath.empty())
+          continue;
+        if (local)
+          return reject("original public result has multiple local producers");
         local = index;
       }
       ac::RuleOp rule;
@@ -5537,7 +6554,8 @@ private:
             rule->getNumResults() < source->getNumResults())
           return reject("original public result Rule locator differs");
       }
-      if (!product(budget, source, source->getNumResults(), 2)) return failure();
+      if (!product(budget, source, source->getNumResults(), 2))
+        return failure();
       for (auto [ordinal, result] : llvm::enumerate(source->getResults())) {
         Value expected;
         if (local) {
@@ -5545,13 +6563,16 @@ private:
         } else {
           auto found = definition.downwardIndex.find(routingKey({}, result));
           if (found == definition.downwardIndex.end())
-            return reject("original lexical public result has no incoming occurrence route");
+            return reject("original lexical public result has no incoming "
+                          "occurrence route");
           expected = module.getBody().front().getArgument(
               definition.sourceInputs + 2 * found->second);
         }
-        if (!values.contains(expected) || expected.getType() != result.getType() ||
+        if (!values.contains(expected) ||
+            expected.getType() != result.getType() ||
             candidate.packageMap.lookupOrNull(result) != expected)
-          return reject("original public result ordinal/type/occurrence route differs");
+          return reject(
+              "original public result ordinal/type/occurrence route differs");
         authenticated.map(result, expected);
       }
     }
@@ -5600,26 +6621,26 @@ private:
         // and property dictionaries, exact one-result arity and Q type,
         // then the authenticated clock/reset/initial operand mapping. The
         // source declaration class cannot remain in the candidate.
-        if (!charge(budget, &op,
-                    16 + 4 * op.getNumOperands() + 4 * op.getNumResults() +
-                        op.getRawDictionaryAttrs().size() +
-                        SourceCheckBudget::bytes(op.getPropertiesStorageSize())))
+        if (!charge(
+                budget, &op,
+                16 + 4 * op.getNumOperands() + 4 * op.getNumResults() +
+                    op.getRawDictionaryAttrs().size() +
+                    SourceCheckBudget::bytes(op.getPropertiesStorageSize())))
           return failure();
-        if (!isa<gfir::StateOp>(target) ||
-            target->getLoc() != op.getLoc() ||
-            target->getNumResults() != 1 ||
-            target->getNumRegions() != 0 ||
+        if (!isa<gfir::StateOp>(target) || target->getLoc() != op.getLoc() ||
+            target->getNumResults() != 1 || target->getNumRegions() != 0 ||
             target->getResultTypes() != op.getResultTypes() ||
             target->getNumOperands() != 3 ||
             target->getAttrDictionary() != op.getAttrDictionary() ||
-            target->getPropertiesAsAttribute() !=
-                op.getPropertiesAsAttribute())
-          return reject("original logical state owner/Q/type/domain/initial differs");
+            target->getPropertiesAsAttribute() != op.getPropertiesAsAttribute())
+          return reject(
+              "original logical state owner/Q/type/domain/initial differs");
         for (auto [original, actual] :
              llvm::zip(op.getOperands(), target->getOperands())) {
           auto expected = authenticated.lookupOrNull(original);
           if (!expected || actual != expected)
-            return reject("original logical state domain/initial binding differs");
+            return reject(
+                "original logical state domain/initial binding differs");
         }
         // Cover registers the authenticated replacement in the clone
         // inventory exactly as exactClone registers an unchanged clone.
@@ -5628,17 +6649,24 @@ private:
       } else if (auto memory = dyn_cast<ac::InstanceOp>(op);
                  memory && memory->hasAttr("ac.source_memory")) {
         NamedAttrList expected(memory->getAttrs());
-        expected.erase("ac.source_memory"); expected.erase("ac.payload_constraint");
-        if (!isa<ac::InstanceOp>(target) || target->getAttrs() != expected.getAttrs() ||
-            target->getPropertiesAsAttribute() != memory->getPropertiesAsAttribute() ||
-            target->getLoc() != memory.getLoc() || target->getNumOperands() != memory->getNumOperands() ||
+        expected.erase("ac.source_memory");
+        expected.erase("ac.payload_constraint");
+        if (!isa<ac::InstanceOp>(target) ||
+            target->getAttrs() != expected.getAttrs() ||
+            target->getPropertiesAsAttribute() !=
+                memory->getPropertiesAsAttribute() ||
+            target->getLoc() != memory.getLoc() ||
+            target->getNumOperands() != memory->getNumOperands() ||
             target->getNumResults() != memory->getNumResults() ||
-            target->getResultTypes() != memory->getResultTypes() || failed(cover(target)))
+            target->getResultTypes() != memory->getResultTypes() ||
+            failed(cover(target)))
           return reject("original Memory allocation identity differs");
         for (unsigned operand = 0; operand < 2; ++operand)
-          if (target->getOperand(operand) != authenticated.lookupOrNull(memory.getInputs()[operand]))
+          if (target->getOperand(operand) !=
+              authenticated.lookupOrNull(memory.getInputs()[operand]))
             return reject("original Memory clock/reset domain binding differs");
-        for (auto [source, result] : llvm::zip(memory.getOutputs(), target->getResults())) {
+        for (auto [source, result] :
+             llvm::zip(memory.getOutputs(), target->getResults())) {
           if (candidate.packageMap.lookupOrNull(source) != result)
             return reject("original Memory data/live result ordinal differs");
           authenticated.map(source, result);
@@ -5646,18 +6674,25 @@ private:
       } else if (auto queue = dyn_cast<ac::InstanceOp>(op);
                  queue && ac::isQueueInstance(queue)) {
         NamedAttrList expected(queue->getAttrs());
-        for (StringRef attr : {"ac.source_unbound_push", "ac.source_unbound_pop", "ac.payload_constraint"})
+        for (StringRef attr :
+             {"ac.source_unbound_push", "ac.source_unbound_pop",
+              "ac.payload_constraint"})
           expected.erase(attr);
         if (!isa<ac::InstanceOp>(target) ||
             target->getAttrs() != expected.getAttrs() ||
-            target->getPropertiesAsAttribute() != queue->getPropertiesAsAttribute() ||
-            target->getLoc() != queue->getLoc() || target->getNumOperands() != queue->getNumOperands() ||
-            target->getNumResults() != queue->getNumResults() || failed(cover(target)))
+            target->getPropertiesAsAttribute() !=
+                queue->getPropertiesAsAttribute() ||
+            target->getLoc() != queue->getLoc() ||
+            target->getNumOperands() != queue->getNumOperands() ||
+            target->getNumResults() != queue->getNumResults() ||
+            failed(cover(target)))
           return reject("original queue allocation identity differs");
         for (auto [ordinal, operand] : llvm::enumerate(queue->getOperands())) {
-          bool controlled = queue->hasAttr("ac.source_unbound_push") && (ordinal == 2 || ordinal == 3);
+          bool controlled = queue->hasAttr("ac.source_unbound_push") &&
+                            (ordinal == 2 || ordinal == 3);
           controlled |= queue->hasAttr("ac.source_unbound_pop") && ordinal == 4;
-          if (!controlled && target->getOperand(ordinal) != authenticated.lookupOrNull(operand))
+          if (!controlled && target->getOperand(ordinal) !=
+                                 authenticated.lookupOrNull(operand))
             return reject("original raw queue binding differs");
         }
       } else if (auto allocation = dyn_cast<ac::InstanceOp>(op)) {
@@ -5668,13 +6703,21 @@ private:
           const auto &routing =
               prepared.definitions[prepared.definitionIndex.lookup(
                   child.operator->())];
-          extraInputs = 2 * routing.downward.size() + queueInputCount(routing) + 2 * routing.memoryIncoming.size();
-          extraOutputs = routing.upward.size() + routing.queuePopSummaries.size();
-          auto rebuilt = cast<ac::ModuleOp>(candidate.packageMap.lookup(child.operator->()));
+          extraInputs = 2 * routing.downward.size() + queueInputCount(routing) +
+                        2 * routing.memoryIncoming.size() +
+                        2 * routing.memoryReadOutputs.size();
+          extraOutputs =
+              routing.upward.size() + routing.queuePopSummaries.size() +
+              routing.memoryReadOutputs.size();
+          auto rebuilt = cast<ac::ModuleOp>(
+              candidate.packageMap.lookup(child.operator->()));
           auto layout = ac::getModulePortLayout(rebuilt);
-          if (failed(layout)) return failure();
-          extraInputs += llvm::count_if(layout->inputValidity, [](int64_t i) { return i >= 0; });
-          extraOutputs += llvm::count_if(layout->outputValidity, [](int64_t i) { return i >= 0; });
+          if (failed(layout))
+            return failure();
+          extraInputs += llvm::count_if(layout->inputValidity,
+                                        [](int64_t i) { return i >= 0; });
+          extraOutputs += llvm::count_if(layout->outputValidity,
+                                         [](int64_t i) { return i >= 0; });
           extraOutputs += layout->routedOutputValidity.size();
         }
         NamedAttrList expectedInstance(op.getAttrs());
@@ -5688,8 +6731,9 @@ private:
             target->getNumOperands() != op.getNumOperands() + extraInputs ||
             target->getNumResults() != op.getNumResults() + extraOutputs ||
             target->getResults().take_front(op.getNumResults()).getTypes() !=
-                op.getResultTypes())
+                op.getResultTypes()) {
           return reject("original instance identity/port prefix differs");
+        }
         if (failed(cover(target)))
           return failure();
         for (auto [source, value] :
@@ -5711,7 +6755,9 @@ private:
             target->getLoc() != op.getLoc() || target->getNumRegions() ||
             target->getNumResults() ||
             target->getNumOperands() !=
-                definition.sourceOutputs + definition.upward.size() + definition.queuePopSummaries.size() + validityOutputs)
+                definition.sourceOutputs + definition.upward.size() +
+                    definition.queuePopSummaries.size() +
+                    definition.memoryReadOutputs.size() + validityOutputs)
           return reject("original module yield prefix/route layout differs");
         if (failed(cover(target)))
           return failure();
@@ -5725,6 +6771,15 @@ private:
           if (failed(value) ||
               target->getOperand(definition.sourceOutputs + ordinal) != *value)
             return reject("original upward route endpoint differs");
+        }
+        for (auto [ordinal, route] :
+             llvm::enumerate(definition.memoryReadOutputs)) {
+          auto value = memoryReadRouteValue(route);
+          uint64_t output = definition.sourceOutputs +
+                            definition.upward.size() +
+                            definition.queuePopSummaries.size() + ordinal;
+          if (failed(value) || target->getOperand(output) != *value)
+            return reject("original Memory read route endpoint differs");
         }
       } else if (failed(exactClone(&op, target, authenticated,
                                    candidate.packageMap))) {
@@ -5742,9 +6797,12 @@ private:
     auto transaction = plan.transaction;
     auto rule = record.rule;
     auto registration = ac::getSourceRegistrationEntry(transaction);
-    if (failed(registration)) return failure();
-    auto entryMethod = *registration ? (**registration).method : ac::SourceMethodOp();
-    auto entryCall = *registration ? (**registration).call : ac::SourceMethodCallOp();
+    if (failed(registration))
+      return failure();
+    auto entryMethod =
+        *registration ? (**registration).method : ac::SourceMethodOp();
+    auto entryCall =
+        *registration ? (**registration).call : ac::SourceMethodCallOp();
     if (plan.rootFrame != 0 || plan.frames.empty() || plan.instances.empty() ||
         plan.guard != plan.frames[0].guard || plan.frames[0].parent ||
         plan.frames[0].method != entryMethod || plan.frames[0].call ||
@@ -5755,7 +6813,8 @@ private:
         plan.instances[0].definition != plan.routingModule ||
         plan.lexicalAnchor >= plan.instances.size() ||
         plan.instances[plan.lexicalAnchor].definition != plan.lexicalModule ||
-        plan.instances[plan.lexicalAnchor].occurrencePath != plan.registrationPath ||
+        plan.instances[plan.lexicalAnchor].occurrencePath !=
+            plan.registrationPath ||
         plan.instances[0].parent || plan.instances[0].allocation ||
         !plan.instances[0].occurrencePath.empty() ||
         plan.frames[0].callOccurrence || plan.frames[0].receiver)
@@ -5764,15 +6823,18 @@ private:
     rootBindings.owner = plan.routingModule;
     if (llvm::hasSingleElement(hardware.getPackage().getOps<ac::SystemOp>())) {
       auto selected = ac::detail::resolveHardwareRootBindings(hardware);
-      if (failed(selected)) return failure();
-      if (selected->owner == plan.routingModule) rootBindings = *selected;
+      if (failed(selected))
+        return failure();
+      if (selected->owner == plan.routingModule)
+        rootBindings = *selected;
     }
     ac::HardwareBindings logicalRoot;
     logicalRoot.owner = plan.routingModule;
     if (!sameBindings(plan.instances[0].logicalBindings, logicalRoot))
       return reject("original root logical bindings differ");
     if (!sameBindings(plan.instances[0].bindings, rootBindings) ||
-        !sameBindings(plan.frames[0].bindings, plan.instances[plan.lexicalAnchor].bindings))
+        !sameBindings(plan.frames[0].bindings,
+                      plan.instances[plan.lexicalAnchor].bindings))
       return reject("original root bindings differ");
     for (auto [id, instance] : llvm::enumerate(plan.instances)) {
       if (!charge(budget, transaction,
@@ -5792,7 +6854,8 @@ private:
           instance.allocation, plan.instances[*instance.parent].bindings);
       if (failed(bindings) || !sameBindings(instance.bindings, *bindings))
         return reject("original lexical instance bindings differ");
-      auto logical = hardware.bindInstance(instance.allocation,
+      auto logical = hardware.bindInstance(
+          instance.allocation,
           plan.instances[*instance.parent].logicalBindings);
       if (failed(logical) || !sameBindings(instance.logicalBindings, *logical))
         return reject("original lexical instance logical bindings differ");
@@ -5814,9 +6877,13 @@ private:
         return reject("original lexical occurrence path differs");
     }
     uint64_t expectedCaptures = preparation.liveIns.size();
-    auto expectedExternalPops = originalQueueExternalPops(preparation, expectedCaptures);
-    if (failed(expectedExternalPops)) return failure();
+    auto expectedExternalPops =
+        originalQueueExternalPops(preparation, expectedCaptures);
+    if (failed(expectedExternalPops))
+      return failure();
     expectedCaptures += expectedExternalPops->size();
+    uint64_t memoryReadCaptureBase = expectedCaptures;
+    expectedCaptures += preparation.memoryReadCaptures.size();
     uint64_t expectedFire = SourceCheckBudget::add(
         transaction->getNumResults(),
         SourceCheckBudget::multiply(2, preparation.outputs.size()));
@@ -5835,17 +6902,20 @@ private:
                                               plan.bodyChecks.size())));
     uint64_t expectedTotal = legacyTotal;
     for (const auto &proposal : preparation.queueProposals) {
-      if (proposal.rawResult != expectedTotal || proposal.pathResult != expectedTotal + 1 ||
+      if (proposal.rawResult != expectedTotal ||
+          proposal.pathResult != expectedTotal + 1 ||
           (proposal.dataResult && *proposal.dataResult != expectedTotal + 2))
         return reject("original queue proposal layout differs");
       expectedTotal += proposal.dataResult ? 3 : 2;
     }
     for (const auto &proposal : preparation.memoryProposals) {
-      if (proposal.rawResult != expectedTotal || proposal.pathResult != expectedTotal + 1)
+      if (proposal.rawResult != expectedTotal ||
+          proposal.pathResult != expectedTotal + 1)
         return reject("original Memory proposal layout differs");
       expectedTotal += 2;
       for (uint64_t argument : proposal.argumentResults)
-        if (argument != expectedTotal++) return reject("original Memory argument layout differs");
+        if (argument != expectedTotal++)
+          return reject("original Memory argument layout differs");
     }
     SmallVector<Attribute> expectedDomains;
     uint64_t domainCursor = 0;
@@ -5853,29 +6923,35 @@ private:
       return !write.selectors.empty();
     });
     for (auto [id, write] : llvm::enumerate(plan.writes)) {
-      if (!charge(budget, transaction)) return failure();
-      if (!partialWrites || write.forwardedProposal) continue;
+      if (!charge(budget, transaction))
+        return failure();
+      if (!partialWrites || write.forwardedProposal)
+        continue;
       if (domainCursor == preparation.writeDomains.size())
         return reject("original write domain inventory is missing");
       const auto &domain = preparation.writeDomains[domainCursor++];
-      auto candidate = llvm::find_if(preparation.outputs, [&](const auto &output) {
-        return output.binding.owner == write.owner;
-      });
+      auto candidate =
+          llvm::find_if(preparation.outputs, [&](const auto &output) {
+            return output.binding.owner == write.owner;
+          });
       if (candidate == preparation.outputs.end() || domain.write != id ||
-          domain.candidate != uint64_t(candidate - preparation.outputs.begin()) ||
+          domain.candidate !=
+              uint64_t(candidate - preparation.outputs.begin()) ||
           domain.selectors != write.selectors || domain.result != expectedTotal)
         return reject("original write domain owner/selector/result differs");
       Builder b(transaction.getContext());
-      expectedDomains.push_back(b.getDictionaryAttr({
-          b.getNamedAttr("candidate", b.getI64IntegerAttr(domain.candidate)),
-          b.getNamedAttr("selectors", write.selectors),
-          b.getNamedAttr("mask", b.getI64IntegerAttr(expectedTotal))}));
+      expectedDomains.push_back(b.getDictionaryAttr(
+          {b.getNamedAttr("candidate", b.getI64IntegerAttr(domain.candidate)),
+           b.getNamedAttr("selectors", write.selectors),
+           b.getNamedAttr("mask", b.getI64IntegerAttr(expectedTotal))}));
       ++expectedTotal;
     }
     if (domainCursor != preparation.writeDomains.size() ||
-        (expectedDomains.empty() ? bool(preparation.expectedAdmission.get("write_domains"))
-          : preparation.expectedAdmission.get("write_domains") !=
-                Builder(transaction.getContext()).getArrayAttr(expectedDomains)))
+        (expectedDomains.empty()
+             ? bool(preparation.expectedAdmission.get("write_domains"))
+             : preparation.expectedAdmission.get("write_domains") !=
+                   Builder(transaction.getContext())
+                       .getArrayAttr(expectedDomains)))
       return reject("original write domain metadata differs");
     if (preparation.expectedAdmission.get("ehr_entries"))
       return reject("retired EHR entry forwarding metadata");
@@ -5888,18 +6964,23 @@ private:
     uint64_t baseCaptures = expectedCaptures;
     uint64_t availabilityPayloadCaptures = preparation.liveIns.size();
     for (auto [ordinal, pair] : llvm::enumerate(record.validityCaptures)) {
-      if (!prepared.valueAvailability || pair.first >= availabilityPayloadCaptures ||
+      if (!prepared.valueAvailability ||
+          pair.first >= availabilityPayloadCaptures ||
           pair.second != baseCaptures + ordinal ||
           pair.second >= rule->getNumOperands() ||
           rule.getBody().front().getArgument(pair.second).use_empty())
         return reject("original validity capture inventory differs");
-      captureRows.push_back(captureAttributes.getDictionaryAttr({
-          captureAttributes.getNamedAttr("payload", captureAttributes.getI64IntegerAttr(pair.first)),
-          captureAttributes.getNamedAttr("validity", captureAttributes.getI64IntegerAttr(pair.second))}));
+      captureRows.push_back(captureAttributes.getDictionaryAttr(
+          {captureAttributes.getNamedAttr(
+               "payload", captureAttributes.getI64IntegerAttr(pair.first)),
+           captureAttributes.getNamedAttr(
+               "validity", captureAttributes.getI64IntegerAttr(pair.second))}));
     }
     expectedCaptures += record.validityCaptures.size();
-    if ((captureRows.empty() && rule->hasAttr("ac.value_availability_captures")) ||
-        (!captureRows.empty() && rule->getAttr("ac.value_availability_captures") !=
+    if ((captureRows.empty() &&
+         rule->hasAttr("ac.value_availability_captures")) ||
+        (!captureRows.empty() &&
+         rule->getAttr("ac.value_availability_captures") !=
              captureAttributes.getArrayAttr(captureRows)))
       return reject("original validity capture metadata differs");
     if (preparation.clockCapture != expectedClock ||
@@ -5909,8 +6990,9 @@ private:
         preparation.totalResults != expectedTotal ||
         preparation.expectedAdmission.size() !=
             (6 + !preparation.requirements.empty() +
-             !preparation.resources.empty() + !preparation.queueProposals.empty() + !preparation.memoryProposals.empty() +
-             !expectedDomains.empty()) ||
+             !preparation.resources.empty() +
+             !preparation.queueProposals.empty() +
+             !preparation.memoryProposals.empty() + !expectedDomains.empty()) ||
         preparation.expectedAdmission.getAs<IntegerAttr>("clock_capture") !=
             Builder(transaction.getContext())
                 .getI64IntegerAttr(expectedClock) ||
@@ -5923,8 +7005,10 @@ private:
     if (!operations.contains(rule.operator->()) ||
         !isa<ac::RuleOp>(rule.operator->()) ||
         (plan.registrationPath.empty()
-             ? candidate.packageMap.lookupOrNull(transaction.operator->()) != rule.operator->()
-             : candidate.packageMap.lookupOrNull(transaction.operator->()) != nullptr) ||
+             ? candidate.packageMap.lookupOrNull(transaction.operator->()) !=
+                   rule.operator->()
+             : candidate.packageMap.lookupOrNull(transaction.operator->()) !=
+                   nullptr) ||
         rule->getParentOp() != candidate.packageMap.lookupOrNull(
                                    plan.routingModule.operator->()) ||
         rule->getNumRegions() != 1 || !rule.getBody().hasOneBlock() ||
@@ -5937,13 +7021,15 @@ private:
             preparation.expectedAdmission ||
         rule->getAttr("ac.required_checks") !=
             preparation.expectedRequiredChecks ||
-        rule->hasAttr("ac.guard_location") || rule->hasAttr("ac.registration_entry") ||
+        rule->hasAttr("ac.guard_location") ||
+        rule->hasAttr("ac.registration_entry") ||
         record.boundValues.size() != plan.values.size() ||
         record.versions.size() != plan.versions.size() ||
         record.branchResults.size() != plan.branchResults.size() ||
         record.stateJoins.size() != plan.joins.size() ||
         record.conditionalWrites.size() != plan.writes.size() ||
-        record.selectedWrites.size() != (preparation.writeDomains.empty() ? 0 : plan.writes.size()) ||
+        record.selectedWrites.size() !=
+            (preparation.writeDomains.empty() ? 0 : plan.writes.size()) ||
         record.frames.size() != plan.frames.size() ||
         record.prefixes.size() != preparation.controls.size() + 1 ||
         record.controls.size() != preparation.controls.size() ||
@@ -5968,9 +7054,14 @@ private:
       expected.set("occurrence", routedOccurrence(plan));
       expected.set("ac.lexical_registration", transaction.getOccurrence());
       expected.set("ac.registration_path", plan.registrationPath);
-      expected.set("ac.registration_owner", FlatSymbolRefAttr::get(transaction.getContext(), plan.lexicalModule->getAttrOfType<StringAttr>("sym_name").getValue()));
+      expected.set("ac.registration_owner",
+                   FlatSymbolRefAttr::get(
+                       transaction.getContext(),
+                       plan.lexicalModule->getAttrOfType<StringAttr>("sym_name")
+                           .getValue()));
       auto name = routedRuleName(plan, budget);
-      if (failed(name)) return failure();
+      if (failed(name))
+        return failure();
       expected.set("name", *name);
     }
     actual.erase("ac.required_checks");
@@ -6022,6 +7113,20 @@ private:
       Value argument = rule.getBody().front().getArgument(ordinal);
       lexical.try_emplace({ref.anchor, ref.value}, argument);
     }
+    for (auto [ordinal, channel] :
+         llvm::enumerate(preparation.memoryReadCaptures)) {
+      auto physical = memoryReadRouteValue(
+          {channel, prepared.memoryReadChannels[channel].path,
+           prepared.memoryReadChannels[channel].payloadType,
+           prepared.memoryReadChannels[channel].addressType,
+           prepared.memoryReadChannels[channel].predicateType});
+      uint64_t capture = memoryReadCaptureBase + ordinal;
+      if (failed(physical) || capture >= rule->getNumOperands() ||
+          rule->getOperand(capture) != *physical ||
+          rule.getBody().front().getArgument(capture).getType() !=
+              physical->getType())
+        return reject("original Memory read capture/route differs");
+    }
     SmallVector<Value> visibleEntries(plan.owners.size());
     for (auto [ownerIndex, owner] : llvm::enumerate(plan.owners)) {
       const auto &ref = plan.values[owner.oldQ];
@@ -6048,8 +7153,10 @@ private:
     };
     SourceReplayValues replay(plan, budget);
     if (failed(replay.initialize()) ||
-        failed(replay.identify(plan.clockValue, transaction.getClk(), plan.lexicalAnchor, 0)) ||
-        failed(replay.identify(plan.resetValue, transaction.getRst(), plan.lexicalAnchor, 0)))
+        failed(replay.identify(plan.clockValue, transaction.getClk(),
+                               plan.lexicalAnchor, 0)) ||
+        failed(replay.identify(plan.resetValue, transaction.getRst(),
+                               plan.lexicalAnchor, 0)))
       return failure();
     auto originalClock = replay.endpoint(plan.clockValue, {});
     auto originalReset = replay.endpoint(plan.resetValue, {});
@@ -6069,7 +7176,8 @@ private:
           return reject("original old-Q version shape differs");
         if (failed(replay.requireVersionAvailable(id, {}, {})))
           return failure();
-        versions[id] = {visibleEntries[version.owner], record.versions[id].rawIntent};
+        versions[id] = {visibleEntries[version.owner],
+                        record.versions[id].rawIntent};
         environment[version.owner] = id;
         if (!versions[id].data ||
             failed(literalProof(
@@ -6135,17 +7243,37 @@ private:
     Type bit = rule->getOperand(preparation.clockCapture).getType();
     uint64_t formalIndex = 0;
     std::unique_ptr<ac::detail::SourceFormalProposalProof> replayFormalProof;
-    if (!product(budget, transaction, plan.frames.size(),
-                 2 + SourceCheckBudget::bytes(sizeof(SmallVector<std::optional<ac::StateOwnerId>, 0>) +
-                                              sizeof(SmallVector<ac::BoundValueId, 0>)))) return failure();
+    if (!product(
+            budget, transaction, plan.frames.size(),
+            2 + SourceCheckBudget::bytes(
+                    sizeof(SmallVector<std::optional<ac::StateOwnerId>, 0>) +
+                    sizeof(SmallVector<ac::BoundValueId, 0>))))
+      return failure();
     SmallVector<SmallVector<std::optional<ac::StateOwnerId>, 0>, 0>
         replayFormalOwners(plan.frames.size());
-    SmallVector<SmallVector<ac::BoundValueId, 0>, 0> replayFormalValues(plan.frames.size());
-    if (!product(budget, transaction, plan.frames.size(),
-                 1 + SourceCheckBudget::bytes(sizeof(SmallVector<uint64_t, 0>)))) return failure();
-    SmallVector<SmallVector<uint64_t, 0>, 0> replayFormalIntents(plan.frames.size());
+    SmallVector<SmallVector<ac::BoundValueId, 0>, 0> replayFormalValues(
+        plan.frames.size());
+    if (!product(
+            budget, transaction, plan.frames.size(),
+            1 + SourceCheckBudget::bytes(sizeof(SmallVector<uint64_t, 0>))))
+      return failure();
+    SmallVector<SmallVector<uint64_t, 0>, 0> replayFormalIntents(
+        plan.frames.size());
     uint64_t eventIndex = 0, readIndex = 0, writeIndex = 0, callIndex = 0,
-             branchIndex = 0, joinIndex = 0, resultIndex = 0, guardIndex = 0, queueIndex = 0, memoryIndex = 0;
+             branchIndex = 0, joinIndex = 0, resultIndex = 0, guardIndex = 0,
+             queueIndex = 0, memoryIndex = 0;
+    using ReplayedCallKey = std::pair<Operation *, ac::InvocationFrameId>;
+    DenseMap<ReplayedCallKey, const ac::TransactionCallDelta *> replayedCalls;
+    SmallVector<std::optional<uint64_t>, 0> memoryProposalByAccess(
+        plan.memoryAccesses.size());
+    for (auto [proposalIndex, proposal] :
+         llvm::enumerate(preparation.memoryProposals)) {
+      if (!charge(budget, transaction) ||
+          proposal.access >= memoryProposalByAccess.size() ||
+          memoryProposalByAccess[proposal.access])
+        return reject("original Memory proposal access index differs");
+      memoryProposalByAccess[proposal.access] = proposalIndex;
+    }
     ac::AdmissionPrefix admission = 0;
     ac::TransactionSourcePath sourcePath;
     auto point = [&] { return ac::TransactionPoint{admission, sourcePath}; };
@@ -6161,71 +7289,10 @@ private:
       expected.kind = kind;
       expected.frame = frame;
       expected.point = point();
-      using K = ac::TransactionStateEventKind;
-      switch (kind) {
-      case K::QueueAccess:
-        expected.queueAccess = id;
-        break;
-      case K::MemoryAccess:
-        expected.memoryAccess = id;
-        break;
-      case K::Read:
-        expected.read = id;
-        break;
-      case K::Write:
-        expected.write = id;
-        break;
-      case K::FormalWrite:
-        expected.formalWrite = id;
-        break;
-      case K::GuardEnter:
-      case K::GuardExit:
-        expected.guard = id;
-        break;
-      case K::SelectionEnter:
-      case K::SelectionExit:
-        expected.selection = id;
-        break;
-      case K::CallEnter:
-      case K::CallExit:
-        expected.call = id;
-        break;
-      case K::BodyCheck:
-        expected.bodyCheck = id;
-        break;
-      case K::Observe:
-        expected.observation = id;
-        break;
-      case K::StateJoin:
-        expected.join = id;
-        break;
-      case K::BranchResult:
-        expected.branchResult = id;
-        break;
-      case K::BranchEnter:
-      case K::ThenEnter:
-      case K::ThenExit:
-      case K::ElseEnter:
-      case K::ElseExit:
-      case K::BranchExit:
-        expected.branch = id;
-        break;
-      case K::TransactionEnter:
-      case K::TransactionExit:
-        break;
-      }
+      expected.record = id;
       if (actual.kind != expected.kind || actual.frame != expected.frame ||
           !sameSourcePoint(actual.point, expected.point) ||
-          actual.read != expected.read || actual.queueAccess != expected.queueAccess ||
-          actual.memoryAccess != expected.memoryAccess ||
-          actual.selection != expected.selection ||
-          actual.write != expected.write || actual.formalWrite != expected.formalWrite ||
-          actual.guard != expected.guard ||
-          actual.call != expected.call ||
-          actual.bodyCheck != expected.bodyCheck ||
-          actual.observation != expected.observation ||
-          actual.branch != expected.branch || actual.join != expected.join ||
-          actual.branchResult != expected.branchResult)
+          actual.record != expected.record)
         return reject("original event order/reference/prefix differs");
       return success();
     };
@@ -6238,17 +7305,21 @@ private:
       const auto &owner = plan.owners[id];
       auto anchor = plan.frames[frame].anchor;
       auto module = plan.instances[anchor].definition;
-      ac::SourceStateOp declaration;
-      for (Operation &op : module.getBody().front()) {
-        if (!charge(budget, effect))
-          return failure();
-        auto state = dyn_cast<ac::SourceStateOp>(op);
-        if (state && state.getInstanceNameAttr() == effect->getAttr("state")) {
-          if (declaration)
-            return reject("original state access owner is ambiguous");
-          declaration = state;
-        }
+      auto definition = sourceStateDeclarations.find(module);
+      auto stateName = effect->getAttrOfType<StringAttr>("state");
+      if (!charge(budget, effect,
+                  SourceCheckBudget::orderedLookupCost(
+                      definition == sourceStateDeclarations.end()
+                          ? 0
+                          : definition->second.size())))
+        return failure();
+      Operation *declarationOp = nullptr;
+      if (definition != sourceStateDeclarations.end() && stateName) {
+        auto indexed = definition->second.find(stateName);
+        if (indexed != definition->second.end())
+          declarationOp = indexed->second;
       }
+      auto declaration = dyn_cast_or_null<ac::SourceStateOp>(declarationOp);
       if (!declaration || owner.anchor != anchor ||
           owner.declaration != declaration ||
           effect->getAttr("occurrence") != occurrence)
@@ -6268,56 +7339,72 @@ private:
       if (failed(domainClock) || failed(domainReset) ||
           !(plan.domain == ac::TransactionDomain{*domainClock, *domainReset}))
         return reject("original owner physical domain differs");
-      auto type = hardware.resolveType(payload.getType(),
-                                       plan.instances[anchor].logicalBindings, effect);
-      auto expected =
-          hardware.resolveType(declaration.getQ().getType(),
-                               plan.instances[owner.anchor].logicalBindings, effect);
+      auto type = hardware.resolveType(
+          payload.getType(), plan.instances[anchor].logicalBindings, effect);
+      auto expected = hardware.resolveType(
+          declaration.getQ().getType(),
+          plan.instances[owner.anchor].logicalBindings, effect);
       if (failed(type) || failed(expected) ||
           !ac::areEquivalentHardwareTypes(*expected, owner.payloadType))
         return reject("original state access owner payload type differs");
       Type selected = *expected;
       unsigned indexOrdinal = 0;
       for (Attribute raw : selectors) {
-        if (!charge(budget, effect, 4)) return failure();
+        if (!charge(budget, effect, 4))
+          return failure();
         auto selector = cast<DictionaryAttr>(raw);
         if (auto field = selector.getAs<StringAttr>("field")) {
           auto structure = dyn_cast<ac::StructType>(selected);
-          auto declaration = structure ? hardware.lookupStruct(structure) : ac::StructOp();
+          auto declaration =
+              structure ? hardware.lookupStruct(structure) : ac::StructOp();
           Type next;
-          if (declaration) for (Attribute rawField : declaration.getFields()) {
-            if (!charge(budget, effect)) return failure();
-            auto item = cast<DictionaryAttr>(rawField);
-            if (item.getAs<StringAttr>("name") == field) {
-              auto resolved = hardware.resolveType(item.getAs<TypeAttr>("type").getValue(),
-                                                    plan.instances[anchor].logicalBindings, effect);
-              if (failed(resolved)) return failure();
-              next = *resolved; break;
+          if (declaration)
+            for (Attribute rawField : declaration.getFields()) {
+              if (!charge(budget, effect))
+                return failure();
+              auto item = cast<DictionaryAttr>(rawField);
+              if (item.getAs<StringAttr>("name") == field) {
+                auto resolved = hardware.resolveType(
+                    item.getAs<TypeAttr>("type").getValue(),
+                    plan.instances[anchor].logicalBindings, effect);
+                if (failed(resolved))
+                  return failure();
+                next = *resolved;
+                break;
+              }
             }
-          }
-          if (!next) return reject("original state field selector differs");
+          if (!next)
+            return reject("original state field selector differs");
           selected = next;
         } else {
           auto ordinal = selector.getAs<IntegerAttr>("index");
           auto table = dyn_cast<ac::TableType>(selected);
-          if (!ordinal || ordinal.getInt() != indexOrdinal || indexOrdinal >= indices.size() ||
-              !table || table.getShape().empty())
+          if (!ordinal || ordinal.getInt() != indexOrdinal ||
+              indexOrdinal >= indices.size() || !table ||
+              table.getShape().empty())
             return reject("original state index selector differs");
           ++indexOrdinal;
-          selected = table.getShape().size() == 1 ? table.getElementType()
-              : Type(ac::TableType::get(effect->getContext(),
-                  ArrayAttr::get(effect->getContext(), table.getShape().getValue().drop_front()),
-                  table.getElementType()));
+          selected = table.getShape().size() == 1
+                         ? table.getElementType()
+                         : Type(ac::TableType::get(
+                               effect->getContext(),
+                               ArrayAttr::get(
+                                   effect->getContext(),
+                                   table.getShape().getValue().drop_front()),
+                               table.getElementType()));
         }
       }
-      if (indexOrdinal != indices.size() || !ac::areEquivalentHardwareTypes(*type, selected))
+      if (indexOrdinal != indices.size() ||
+          !ac::areEquivalentHardwareTypes(*type, selected))
         return reject("original selected state payload/index count differs");
       if (isa<ac::SourceStateWriteOp>(effect) && !indices.empty()) {
         auto table = dyn_cast<ac::TableType>(declaration.getQ().getType());
         if (table) {
-          if (!charge(budget, effect, 32 + indices.size()) || indices.size() != 1 ||
+          if (!charge(budget, effect, 32 + indices.size()) ||
+              indices.size() != 1 ||
               failed(hardware.verifySourceIndex(indices.front(), table,
-                                                plan.instances[anchor].bindings, effect)))
+                                                plan.instances[anchor].bindings,
+                                                effect)))
             return failure();
         }
       }
@@ -6344,130 +7431,151 @@ private:
       last = actual;
       return success();
     };
-    auto physicalWrite = [&](Operation *operation, ac::InvocationFrameId frame,
-                             Value sourcePath, Value sourceValue,
-                             ArrayAttr selectors, ValueRange indices, bool formal,
-                             llvm::function_ref<LogicalResult(ac::StateOwnerId)> markTouched)
-                             -> LogicalResult {
-          if (writeIndex == plan.writes.size())
-            return reject("original write inventory differs");
-          auto found = plan.writes.begin() + writeIndex++;
-          if (found->frame != frame || found->operation != operation)
-            return reject("original write intent is absent");
-          Value rhs = bound(found->value);
-          Value selectedSource = formal ? cast<ac::SourceFormalWriteOp>(operation).getPayload() : sourceValue;
-          if (!found->selectedPayload || found->indices.size() != indices.size() ||
-              failed(replay.identify(*found->selectedPayload, selectedSource,
-                                     plan.frames[frame].anchor, frame)))
-            return reject("original selected RHS/index inventory differs");
-          for (auto [ordinal, index] : llvm::enumerate(indices))
-            if (failed(replay.identify(found->indices[ordinal], index,
-                                       plan.frames[frame].anchor, frame)) ||
-                failed(replay.requireAvailable(found->indices[ordinal], point())))
-              return reject("original statement-time selected index differs");
-          bool forwarded = formal && bool(cast<ac::SourceFormalWriteOp>(operation).getPrevious());
-          if (!formal) {
-            auto data = dyn_cast<OpResult>(sourceValue);
-            auto call = data ? dyn_cast<ac::SourceMethodCallOp>(data.getOwner()) : ac::SourceMethodCallOp();
-            if (call) for (uint64_t prior = 0; prior < callIndex; ++prior) {
-              if (!charge(budget, operation)) return failure();
-              const auto &binding = plan.calls[prior];
-              if (binding.operation != call || binding.caller != frame) continue;
-              const auto &callee = plan.frames[binding.callee];
-              ac::SourceMethodView view{plan.instances[callee.anchor].definition, callee.method, {}};
-              auto proposals = view.getFormalProposals();
-              auto mappings = call->getAttrOfType<ArrayAttr>("ac.formal_owner_bindings");
-              if (proposals && mappings) for (auto [ordinal, argument] : llvm::enumerate(proposals)) {
+    auto physicalWrite =
+        [&](Operation *operation, ac::InvocationFrameId frame, Value sourcePath,
+            Value sourceValue, ArrayAttr selectors, ValueRange indices,
+            bool formal,
+            llvm::function_ref<LogicalResult(ac::StateOwnerId)> markTouched)
+        -> LogicalResult {
+      if (writeIndex == plan.writes.size())
+        return reject("original write inventory differs");
+      auto found = plan.writes.begin() + writeIndex++;
+      if (found->frame != frame || found->operation != operation)
+        return reject("original write intent is absent");
+      Value rhs = bound(found->value);
+      Value selectedSource =
+          formal ? cast<ac::SourceFormalWriteOp>(operation).getPayload()
+                 : sourceValue;
+      if (!found->selectedPayload || found->indices.size() != indices.size() ||
+          failed(replay.identify(*found->selectedPayload, selectedSource,
+                                 plan.frames[frame].anchor, frame)))
+        return reject("original selected RHS/index inventory differs");
+      for (auto [ordinal, index] : llvm::enumerate(indices))
+        if (failed(replay.identify(found->indices[ordinal], index,
+                                   plan.frames[frame].anchor, frame)) ||
+            failed(replay.requireAvailable(found->indices[ordinal], point())))
+          return reject("original statement-time selected index differs");
+      bool forwarded =
+          formal &&
+          bool(cast<ac::SourceFormalWriteOp>(operation).getPrevious());
+      if (!formal) {
+        auto data = dyn_cast<OpResult>(sourceValue);
+        auto call = data ? dyn_cast<ac::SourceMethodCallOp>(data.getOwner())
+                         : ac::SourceMethodCallOp();
+        if (call) {
+          if (!charge(budget, operation))
+            return failure();
+          auto replayed = replayedCalls.find({call, frame});
+          if (replayed != replayedCalls.end()) {
+            const auto &binding = *replayed->second;
+            const auto &callee = plan.frames[binding.callee];
+            ac::SourceMethodView view{
+                plan.instances[callee.anchor].definition, callee.method, {}};
+            auto proposals = view.getFormalProposals();
+            auto mappings =
+                call->getAttrOfType<ArrayAttr>("ac.formal_owner_bindings");
+            if (proposals && mappings)
+              for (auto [ordinal, argument] : llvm::enumerate(proposals)) {
                 unsigned base = view.getNumPublicResults() + 2 * ordinal;
-                if (!charge(budget, operation, 4)) return failure();
-                if (data.getResultNumber() != base || call->getResult(base + 1) != sourcePath) continue;
+                if (!charge(budget, operation, 4))
+                  return failure();
+                if (data.getResultNumber() != base ||
+                    call->getResult(base + 1) != sourcePath)
+                  continue;
                 for (Attribute raw : mappings) {
-                  if (!charge(budget, operation)) return failure();
+                  if (!charge(budget, operation))
+                    return failure();
                   auto mapping = cast<DictionaryAttr>(raw);
-                  if (mapping.get("formal") == argument && mapping.get("state") == operation->getAttr("state"))
+                  if (mapping.get("formal") == argument &&
+                      mapping.get("state") == operation->getAttr("state"))
                     forwarded = true;
                 }
               }
-            }
           }
-          if (found->forwardedProposal != forwarded)
-            return reject("original forwarded physical proposal mode differs");
-          const auto &version = plan.versions[found->version];
-          if (!rhs || found->owner >= environment.size() ||
-              version.transaction != transaction ||
-              version.kind != ac::StateVersionKind::Write || version.join ||
-              version.write != writeIndex - 1 ||
-              version.owner != found->owner ||
-              found->predecessor != environment[found->owner] ||
-              version.predecessor != found->predecessor ||
-              version.value != found->value ||
-              version.ordinal != ++ordinals[found->owner] ||
-              found->selectors != selectors ||
-              bound(found->authoredPath) !=
-                  authenticated[frame].lookupOrNull(sourcePath) ||
-              (!formal && failed(ownerProof(operation, frame, found->owner, sourcePath,
-                                sourceValue, selectors,
-                                indices, found->occurrence))) ||
-              rhs != authenticated[frame].lookupOrNull(sourceValue) ||
-              (!formal && failed(event(ac::TransactionStateEventKind::Write, frame,
-                           writeIndex - 1))))
-            return reject("original write owner/predecessor/RHS differs");
-          if (failed(replay.identify(found->authoredPath, sourcePath,
-                                     plan.frames[frame].anchor, frame)) ||
-              failed(replay.requireAvailable(found->authoredPath, point())) ||
-              failed(replay.identify(found->value, sourceValue,
-                                     plan.frames[frame].anchor, frame)) ||
-              failed(replay.requireAvailable(found->value, point())) ||
-              failed(replay.requireVersionAvailable(
-                  found->predecessor, versionValidity[found->predecessor],
-                  point())) ||
-              !sameSourcePoint(version.validity, point()))
-            return failure();
-          versionValidity[found->version] = point();
-          Value intent = record.versions[found->version].rawIntent;
-          auto pathFact = replay.fact(found->authoredPath, point());
-          if (failed(pathFact) || *pathFact != found->pathFact)
-            return reject("original write path fact differs");
-          Value selectedRhs = rhs;
-          if (failed(selectedWriteProof(preparation, record, writeIndex - 1,
-                                        versions[found->predecessor].data,
-                                        bound(*found->selectedPayload), bound,
-                                        &rule.getBody().front(), last))) return failure();
-          if (!formal && !selectors.empty()) selectedRhs = record.selectedWrites[writeIndex - 1].data;
-          Value data = selectedRhs;
-          if (*pathFact && pathFact->getValue()) {
-            if (record.conditionalWrites[writeIndex - 1].value ||
-                !record.conditionalWrites[writeIndex - 1].generated.empty() ||
-                record.versions[found->version].data != selectedRhs ||
-                failed(literalProof(intent, bit, transaction.getOccurrence(),
-                                    operation->getLoc(), true, &rule.getBody().front())))
-              return failure();
-          } else {
-            Value path = bound(found->authoredPath);
-            const auto &prior = versions[found->predecessor];
-            const auto &selection = record.conditionalWrites[writeIndex - 1];
-            if (record.versions[found->version].data != selection.value ||
-                failed(localBranchProof(operation, plan.owners[found->owner].payloadType,
-                    plan.instances[0].bindings, path, selectedRhs, prior.data,
-                    selection, &rule.getBody().front(), last)))
-              return failure();
-            auto result = dyn_cast_or_null<OpResult>(intent);
-            Builder b(operation->getContext());
-            if (!result || result.getResultNumber() != 0 ||
-                failed(generatedProof(result.getOwner(),
-                    ac::BitsBinaryOp::getOperationName(),
-                    {prior.rawIntent, path}, {bit},
-                    b.getDictionaryAttr(
-                        {b.getNamedAttr("opcode", b.getStringAttr("or"))}),
-                    operation->getLoc(), &rule.getBody().front())))
-              return failure();
-            data = selection.value;
-          }
-          versions[found->version] = {data, intent};
-          environment[found->owner] = found->version;
-          originalWriters[found->owner] = true;
-          if (failed(markTouched(found->owner))) return failure();
-          return success();
+        }
+      }
+      if (found->forwardedProposal != forwarded)
+        return reject("original forwarded physical proposal mode differs");
+      const auto &version = plan.versions[found->version];
+      if (!rhs || found->owner >= environment.size() ||
+          version.transaction != transaction ||
+          version.kind != ac::StateVersionKind::Write || version.join ||
+          version.write != writeIndex - 1 || version.owner != found->owner ||
+          found->predecessor != environment[found->owner] ||
+          version.predecessor != found->predecessor ||
+          version.value != found->value ||
+          version.ordinal != ++ordinals[found->owner] ||
+          found->selectors != selectors ||
+          bound(found->authoredPath) !=
+              authenticated[frame].lookupOrNull(sourcePath) ||
+          (!formal && failed(ownerProof(operation, frame, found->owner,
+                                        sourcePath, sourceValue, selectors,
+                                        indices, found->occurrence))) ||
+          rhs != authenticated[frame].lookupOrNull(sourceValue) ||
+          (!formal && failed(event(ac::TransactionStateEventKind::Write, frame,
+                                   writeIndex - 1))))
+        return reject("original write owner/predecessor/RHS differs");
+      if (failed(replay.identify(found->authoredPath, sourcePath,
+                                 plan.frames[frame].anchor, frame)) ||
+          failed(replay.requireAvailable(found->authoredPath, point())) ||
+          failed(replay.identify(found->value, sourceValue,
+                                 plan.frames[frame].anchor, frame)) ||
+          failed(replay.requireAvailable(found->value, point())) ||
+          failed(replay.requireVersionAvailable(
+              found->predecessor, versionValidity[found->predecessor],
+              point())) ||
+          !sameSourcePoint(version.validity, point()))
+        return failure();
+      versionValidity[found->version] = point();
+      Value intent = record.versions[found->version].rawIntent;
+      auto pathFact = replay.fact(found->authoredPath, point());
+      if (failed(pathFact) || *pathFact != found->pathFact)
+        return reject("original write path fact differs");
+      Value selectedRhs = rhs;
+      if (failed(selectedWriteProof(preparation, record, writeIndex - 1,
+                                    versions[found->predecessor].data,
+                                    bound(*found->selectedPayload), bound,
+                                    &rule.getBody().front(), last)))
+        return failure();
+      if (!formal && !selectors.empty())
+        selectedRhs = record.selectedWrites[writeIndex - 1].data;
+      Value data = selectedRhs;
+      if (*pathFact && pathFact->getValue()) {
+        if (record.conditionalWrites[writeIndex - 1].value ||
+            !record.conditionalWrites[writeIndex - 1].generated.empty() ||
+            record.versions[found->version].data != selectedRhs ||
+            failed(literalProof(intent, bit, transaction.getOccurrence(),
+                                operation->getLoc(), true,
+                                &rule.getBody().front())))
+          return failure();
+      } else {
+        Value path = bound(found->authoredPath);
+        const auto &prior = versions[found->predecessor];
+        const auto &selection = record.conditionalWrites[writeIndex - 1];
+        if (record.versions[found->version].data != selection.value ||
+            failed(localBranchProof(
+                operation, plan.owners[found->owner].payloadType,
+                plan.instances[0].bindings, path, selectedRhs, prior.data,
+                selection, &rule.getBody().front(), last)))
+          return failure();
+        auto result = dyn_cast_or_null<OpResult>(intent);
+        Builder b(operation->getContext());
+        if (!result || result.getResultNumber() != 0 ||
+            failed(generatedProof(
+                result.getOwner(), ac::BitsBinaryOp::getOperationName(),
+                {prior.rawIntent, path}, {bit},
+                b.getDictionaryAttr(
+                    {b.getNamedAttr("opcode", b.getStringAttr("or"))}),
+                operation->getLoc(), &rule.getBody().front())))
+          return failure();
+        data = selection.value;
+      }
+      versions[found->version] = {data, intent};
+      environment[found->owner] = found->version;
+      originalWriters[found->owner] = true;
+      if (failed(markTouched(found->owner)))
+        return failure();
+      return success();
     };
     std::function<LogicalResult(Block &, ac::InvocationFrameId,
                                 SmallVectorImpl<bool> &,
@@ -6505,13 +7613,19 @@ private:
       };
       auto isNativeMemoryCallee = [](ac::SourceMethodCallOp call) {
         auto symbol = call.getCalleeAttr();
-        if (!symbol || symbol.getNestedReferences().size() != 1) return false;
+        if (!symbol || symbol.getNestedReferences().size() != 1)
+          return false;
         auto root = symbol.getRootReference().getValue();
         return root == "pycircuit.__builtins__.sync_mem" ||
                root == "pycircuit.__builtins__.sync_mem_dp" ||
                root == "pycircuit.__builtins__.byte_mem";
       };
       for (Operation &op : source.without_terminator()) {
+        // Statement replay is independently reproducible from the frozen
+        // frame state. Preserve the evolving semantic environment, but bound
+        // the proof work of each source statement instead of accumulating a
+        // large callable body's unrelated statements into one allowance.
+        SourceCheckBudget::LocalScope statementBudget(budget);
         if (!charge(budget, &op, 8))
           return failure();
         if (isa<ac::SourceQueuePopOp, ac::SourceQueuePeekOp,
@@ -6519,29 +7633,34 @@ private:
           return op.emitOpError()
                  << "retired dedicated queue effects are not admitted";
         } else if (auto call = dyn_cast<ac::SourceMethodCallOp>(op);
-                   call && (isNativeQueueCallee(call) || isNativeMemoryCallee(call))) {
+                   call &&
+                   (isNativeQueueCallee(call) || isNativeMemoryCallee(call))) {
           auto payModule = [&](Operation *module, Operation *) {
             return prepayClone(module, budget);
           };
           auto payMethod = [&](ac::SourceMethodOp method, Operation *) {
             return prepayClone(method, budget);
           };
-          auto payWorkStorage = [&](Operation *site, uint64_t work, uint64_t bytes) {
-            return success(charge(budget, site, work) &&
-                           charge(budget, site, SourceCheckBudget::bytes(bytes)));
+          auto payWorkStorage = [&](Operation *site, uint64_t work,
+                                    uint64_t bytes) {
+            return success(
+                charge(budget, site, work) &&
+                charge(budget, site, SourceCheckBudget::bytes(bytes)));
           };
           auto payInstanceBinding = [&](Operation *owner, Operation *allocation,
                                         Operation *target, Operation *) {
-            return success(succeeded(prepayClone(allocation ? allocation : owner, budget)) &&
+            return success(succeeded(prepayClone(
+                               allocation ? allocation : owner, budget)) &&
                            prepayOperationHeader(target, budget));
           };
           ac::SourceReceiverProofFees fees{payModule, payMethod, payWorkStorage,
-                                          payInstanceBinding};
+                                           payInstanceBinding};
           auto resolved = ac::resolveSourceMethodCall(
               call, plan.frames[frame].bindings,
               [&](FlatSymbolRefAttr symbol) -> Operation * {
                 return hardware.lookupDefinition(symbol.getValue());
-              }, &receiverProof, &fees);
+              },
+              &receiverProof, &fees);
           if (failed(resolved) ||
               !charge(budget, call,
                       32 + resolved->bindings.integers.size() +
@@ -6586,23 +7705,33 @@ private:
           authenticated[frame].map(read.getValue(),
                                    versions[found->version].data);
         } else if (auto write = dyn_cast<ac::SourceStateWriteOp>(op)) {
-          if (failed(physicalWrite(write, frame, write.getPath(), write.getValue(),
-                                   write.getSelectors(), write.getIndices(), false, touch)))
+          if (failed(physicalWrite(write, frame, write.getPath(),
+                                   write.getValue(), write.getSelectors(),
+                                   write.getIndices(), false, touch)))
             return failure();
         } else if (auto formal = dyn_cast<ac::SourceFormalWriteOp>(op)) {
-          if (formalIndex == plan.formalWrites.size()) return reject("original formal marker inventory differs");
+          if (formalIndex == plan.formalWrites.size())
+            return reject("original formal marker inventory differs");
           const auto &recorded = plan.formalWrites[formalIndex];
           unsigned ordinal = formal.getFormalAttr().getInt();
           auto anchor = plan.frames[frame].anchor;
-          if (ordinal >= replayFormalValues[frame].size()) return failure();
-          if (failed(ac::detail::verifySourceFormalCandidateSelection(formal, hardware,
-                plan.frames[frame].bindings,
-                [&](Value previous) -> FailureOr<bool> {
-                  auto bound = replay.find(previous, anchor, frame);
-                  if (failed(bound)) return failure();
-                  return replayFormalProof->equal(*bound, replayFormalValues[frame][ordinal], point());
-                }, [&](uint64_t work) { return success(charge(budget, formal, work)); }))) return failure();
-          if (recorded.operation != formal || recorded.frame != frame || recorded.formal != ordinal ||
+          if (ordinal >= replayFormalValues[frame].size())
+            return failure();
+          if (failed(ac::detail::verifySourceFormalCandidateSelection(
+                  formal, hardware, plan.frames[frame].bindings,
+                  [&](Value previous) -> FailureOr<bool> {
+                    auto bound = replay.find(previous, anchor, frame);
+                    if (failed(bound))
+                      return failure();
+                    return replayFormalProof->equal(
+                        *bound, replayFormalValues[frame][ordinal], point());
+                  },
+                  [&](uint64_t work) {
+                    return success(charge(budget, formal, work));
+                  })))
+            return failure();
+          if (recorded.operation != formal || recorded.frame != frame ||
+              recorded.formal != ordinal ||
               ordinal >= replayFormalOwners[frame].size() ||
               recorded.owner != replayFormalOwners[frame][ordinal] ||
               !sameSourcePoint(recorded.point, point()) ||
@@ -6610,79 +7739,113 @@ private:
               recorded.location != formal.getSourceLocation() ||
               recorded.selectors != formal.getSelectors() ||
               recorded.indices.size() != formal.getIndices().size() ||
-              failed(replay.identify(recorded.payload, formal.getPayload(), anchor, frame)) ||
-              failed(replay.identify(recorded.authoredPath, formal.getPath(), anchor, frame)) ||
-              failed(replay.identify(recorded.candidate, formal.getCandidate(), anchor, frame)) ||
+              failed(replay.identify(recorded.payload, formal.getPayload(),
+                                     anchor, frame)) ||
+              failed(replay.identify(recorded.authoredPath, formal.getPath(),
+                                     anchor, frame)) ||
+              failed(replay.identify(recorded.candidate, formal.getCandidate(),
+                                     anchor, frame)) ||
               failed(replay.requireAvailable(recorded.payload, point())) ||
               failed(replay.requireAvailable(recorded.authoredPath, point())) ||
               failed(replay.requireAvailable(recorded.candidate, point())))
             return reject("original formal payload/mode/provenance differs");
           for (auto [index, actual] : llvm::enumerate(formal.getIndices()))
-            if (failed(replay.identify(recorded.indices[index], actual, anchor, frame)) ||
-                failed(replay.requireAvailable(recorded.indices[index], point())))
+            if (failed(replay.identify(recorded.indices[index], actual, anchor,
+                                       frame)) ||
+                failed(
+                    replay.requireAvailable(recorded.indices[index], point())))
               return reject("original formal selected index differs");
           if (recorded.owner) {
             if (!recorded.write || *recorded.write != writeIndex ||
                 plan.writes[*recorded.write].owner != *recorded.owner ||
-                failed(physicalWrite(formal, frame, formal.getPath(), formal.getCandidate(),
-                                     formal.getSelectors(), formal.getIndices(), true, touch)))
-              return reject("original formal physical candidate advance differs");
-          } else if (recorded.write) return reject("by-value formal acquired a physical candidate");
+                failed(physicalWrite(
+                    formal, frame, formal.getPath(), formal.getCandidate(),
+                    formal.getSelectors(), formal.getIndices(), true, touch)))
+              return reject(
+                  "original formal physical candidate advance differs");
+          } else if (recorded.write)
+            return reject("by-value formal acquired a physical candidate");
           if (Value previous = formal.getPrevious()) {
-            auto proposal = formal.getPayload().getDefiningOp<ac::SourceMethodCallOp>();
+            auto proposal =
+                formal.getPayload().getDefiningOp<ac::SourceMethodCallOp>();
             bool matchedProposal = false;
             if (proposal && proposal->getBlock() == formal->getBlock()) {
-              const ac::TransactionCallBinding *priorCall = nullptr;
-              for (uint64_t call = 0; call < callIndex; ++call) {
-                if (!charge(budget, formal)) return failure();
-                if (plan.calls[call].operation == proposal && plan.calls[call].caller == frame)
-                  priorCall = &plan.calls[call];
-              }
+              if (!charge(budget, formal))
+                return failure();
+              auto replayed = replayedCalls.find({proposal, frame});
+              const ac::TransactionCallDelta *priorCall =
+                  replayed == replayedCalls.end() ? nullptr : replayed->second;
               if (priorCall) {
                 const auto &callee = plan.frames[priorCall->callee];
-                ac::SourceMethodView view{plan.instances[callee.anchor].definition, callee.method, {}};
-                auto mappings = proposal->getAttrOfType<ArrayAttr>("ac.formal_owner_bindings");
+                ac::SourceMethodView view{
+                    plan.instances[callee.anchor].definition,
+                    callee.method,
+                    {}};
+                auto mappings = proposal->getAttrOfType<ArrayAttr>(
+                    "ac.formal_owner_bindings");
                 auto proposals = view.getFormalProposals();
-                if (mappings && proposals) for (Attribute raw : mappings) {
-                  if (!charge(budget, formal)) return failure();
-                  auto mapping = cast<DictionaryAttr>(raw);
-                  if (mapping.get("caller_formal") != formal.getFormalAttr()) continue;
-                  auto found = llvm::find(proposals, mapping.get("formal"));
-                  if (found == proposals.end()) return failure();
-                  unsigned base = view.getNumPublicResults() + 2 * std::distance(proposals.begin(), found);
-                  matchedProposal = proposal->getResult(base) == formal.getPayload() &&
-                                    proposal->getResult(base + 1) == formal.getPath();
-                }
+                if (mappings && proposals)
+                  for (Attribute raw : mappings) {
+                    if (!charge(budget, formal))
+                      return failure();
+                    auto mapping = cast<DictionaryAttr>(raw);
+                    if (mapping.get("caller_formal") != formal.getFormalAttr())
+                      continue;
+                    auto found = llvm::find(proposals, mapping.get("formal"));
+                    if (found == proposals.end())
+                      return failure();
+                    unsigned base = view.getNumPublicResults() +
+                                    2 * std::distance(proposals.begin(), found);
+                    matchedProposal =
+                        proposal->getResult(base) == formal.getPayload() &&
+                        proposal->getResult(base + 1) == formal.getPath();
+                  }
               }
             }
-            if (!matchedProposal) return reject("original forwarded formal is not its bound callee proposal");
+            if (!matchedProposal)
+              return reject(
+                  "original forwarded formal is not its bound callee proposal");
             if (!recorded.previous || !recorded.snapshot ||
-                failed(replay.identify(*recorded.previous, previous, anchor, frame)) ||
-                failed(replay.identify(*recorded.snapshot, formal.getSnapshot(), anchor, frame)))
-              return reject("original forwarded formal snapshot identity differs");
-            auto samePrevious = replayFormalProof->equal(*recorded.previous,
-                replayFormalValues[frame][ordinal], point());
+                failed(replay.identify(*recorded.previous, previous, anchor,
+                                       frame)) ||
+                failed(replay.identify(*recorded.snapshot, formal.getSnapshot(),
+                                       anchor, frame)))
+              return reject(
+                  "original forwarded formal snapshot identity differs");
+            auto samePrevious = replayFormalProof->equal(
+                *recorded.previous, replayFormalValues[frame][ordinal],
+                point());
             if (failed(samePrevious) || !*samePrevious)
-              return reject("original forwarded formal previous candidate differs");
-            auto selected = recorded.owner ? recorded.candidate : *recorded.previous;
+              return reject(
+                  "original forwarded formal previous candidate differs");
+            auto selected =
+                recorded.owner ? recorded.candidate : *recorded.previous;
             Value mapped = bound(selected);
-            if (!mapped || record.frames[frame].lookupOrNull(formal.getSnapshot()) != mapped ||
+            if (!mapped ||
+                record.frames[frame].lookupOrNull(formal.getSnapshot()) !=
+                    mapped ||
                 failed(replay.snapshot(*recorded.snapshot, selected, point())))
               return reject("original formal snapshot static mode differs");
             authenticated[frame].map(formal.getSnapshot(), mapped);
             replayFormalValues[frame][ordinal] = *recorded.snapshot;
           } else {
-            if (recorded.previous || recorded.snapshot) return reject("original direct formal acquired a snapshot");
+            if (recorded.previous || recorded.snapshot)
+              return reject("original direct formal acquired a snapshot");
             replayFormalValues[frame][ordinal] = recorded.candidate;
           }
           auto pathFact = replay.fact(recorded.authoredPath, point());
-          if (failed(pathFact) || !replayFormalProof || ordinal >= replayFormalIntents[frame].size())
+          if (failed(pathFact) || !replayFormalProof ||
+              ordinal >= replayFormalIntents[frame].size())
             return failure();
-          auto intent = replayFormalProof->write(replayFormalIntents[frame][ordinal],
-              recorded.authoredPath, *pathFact, bool(formal.getPrevious()));
-          if (failed(intent)) return failure();
+          auto intent = replayFormalProof->write(
+              replayFormalIntents[frame][ordinal], recorded.authoredPath,
+              *pathFact, bool(formal.getPrevious()));
+          if (failed(intent))
+            return failure();
           replayFormalIntents[frame][ordinal] = *intent;
-          if (failed(event(ac::TransactionStateEventKind::FormalWrite, frame, formalIndex++))) return failure();
+          if (failed(event(ac::TransactionStateEventKind::FormalWrite, frame,
+                           formalIndex++)))
+            return failure();
         } else if (auto split = dyn_cast<ac::SourceBranchOp>(op)) {
           if (branchIndex == plan.branches.size() ||
               split->getNumRegions() != 2 ||
@@ -6725,27 +7888,10 @@ private:
           auto conditionFact = replay.fact(branch.condition, point());
           if (failed(conditionFact) || *conditionFact != branch.conditionFact)
             return reject("original branch predicate fact differs");
-          bool effectful = false;
-          SmallVector<Operation *, 0> pending;
-          if (!prepayAppend(budget, split, pending))
+          auto effect = sourceBranchEffects.find(split);
+          if (!charge(budget, split) || effect == sourceBranchEffects.end())
             return failure();
-          pending.push_back(split);
-          while (!pending.empty()) {
-            Operation *nested = pending.pop_back_val();
-            if (!charge(budget, split))
-              return failure();
-            effectful |= isa<ac::SourceMethodCallOp, ac::SourceExpectOp,
-                             ac::SourceObserveOp, ac::SourceQueuePopOp,
-                             ac::SourceQueuePeekOp, ac::SourceQueuePushOp>(nested) ||
-                         nested->hasAttr("ac.loop_continuation");
-            for (Region &region : nested->getRegions())
-              for (Block &block : region)
-                for (Operation &child : block) {
-                  if (!prepayAppend(budget, split, pending))
-                    return failure();
-                  pending.push_back(&child);
-                }
-          }
+          bool effectful = effect->second;
           if (bool(branch.selection) != effectful)
             return reject("original branch effect classification differs");
           if (effectful) {
@@ -6780,11 +7926,15 @@ private:
                            1 + SourceCheckBudget::bytes(sizeof(bool))))
             return failure();
           SmallVector<ac::StateVersionId, 0> entry(environment);
-          if (!product(budget, split, replayFormalValues[frame].size(),
-                       3 * (1 + SourceCheckBudget::bytes(sizeof(ac::BoundValueId))))) return failure();
-          SmallVector<ac::BoundValueId, 0> formalEntry(replayFormalValues[frame]);
+          if (!product(
+                  budget, split, replayFormalValues[frame].size(),
+                  3 * (1 + SourceCheckBudget::bytes(sizeof(ac::BoundValueId)))))
+            return failure();
+          SmallVector<ac::BoundValueId, 0> formalEntry(
+              replayFormalValues[frame]);
           if (!product(budget, split, replayFormalIntents[frame].size(),
-                       3 * (1 + SourceCheckBudget::bytes(sizeof(uint64_t))))) return failure();
+                       3 * (1 + SourceCheckBudget::bytes(sizeof(uint64_t)))))
+            return failure();
           SmallVector<uint64_t, 0> intentEntry(replayFormalIntents[frame]);
           SmallVector<bool, 0> armTouched(environment.size(), false);
           SmallVector<ac::StateOwnerId, 0> armOrder;
@@ -6795,7 +7945,8 @@ private:
           if (branch.thenExitPrefix != admission)
             return reject("original then exit prefix differs");
           SmallVector<ac::StateVersionId, 0> whenTrue(environment);
-          SmallVector<ac::BoundValueId, 0> formalTrue(replayFormalValues[frame]);
+          SmallVector<ac::BoundValueId, 0> formalTrue(
+              replayFormalValues[frame]);
           SmallVector<uint64_t, 0> intentTrue(replayFormalIntents[frame]);
           replayFormalValues[frame] = formalEntry;
           replayFormalIntents[frame] = intentEntry;
@@ -6874,9 +8025,11 @@ private:
             const auto &actual = record.versions[join.result];
             if (record.stateJoins[joinIndex].value != actual.data ||
                 failed(localBranchProof(split, plan.owners[owner].payloadType,
-                    plan.instances[0].bindings, condition,
-                    versions[join.whenTrue].data, versions[join.whenFalse].data,
-                    record.stateJoins[joinIndex], &rule.getBody().front(), last)) ||
+                                        plan.instances[0].bindings, condition,
+                                        versions[join.whenTrue].data,
+                                        versions[join.whenFalse].data,
+                                        record.stateJoins[joinIndex],
+                                        &rule.getBody().front(), last)) ||
                 failed(selectProof(actual.rawIntent, condition,
                                    versions[join.whenTrue].rawIntent,
                                    versions[join.whenFalse].rawIntent, bit,
@@ -6916,8 +8069,10 @@ private:
             auto type = branchTypes.admit(
                 original.getType(), hardware,
                 plan.instances[resultRef.anchor].bindings, split, budget);
-            if (succeeded(type)) type = hardware.resolveType(original.getType(),
-                plan.instances[resultRef.anchor].logicalBindings, split);
+            if (succeeded(type))
+              type = hardware.resolveType(
+                  original.getType(),
+                  plan.instances[resultRef.anchor].logicalBindings, split);
             if (result.branch != id || result.frame != frame ||
                 result.ordinal != ordinal ||
                 plan.values[result.result].value != original ||
@@ -6928,11 +8083,10 @@ private:
                 falseValue != bound(result.whenFalse) ||
                 actual.value.getType() != result.payloadType ||
                 record.frames[frame].lookupOrNull(original) != actual.value ||
-                failed(
-                    localBranchProof(split, *type,
-                                     plan.instances[0].bindings,
-                                     condition, trueValue, falseValue, actual,
-                                     &rule.getBody().front(), last)) ||
+                failed(localBranchProof(split, *type,
+                                        plan.instances[0].bindings, condition,
+                                        trueValue, falseValue, actual,
+                                        &rule.getBody().front(), last)) ||
                 failed(event(ac::TransactionStateEventKind::BranchResult, frame,
                              resultIndex)))
               return reject("original branch yielded-result binding differs");
@@ -6957,25 +8111,36 @@ private:
             ++resultIndex;
           }
           for (unsigned formal = 0; formal < intentEntry.size(); ++formal) {
-            auto joined = replayFormalProof->join(id, intentTrue[formal], replayFormalIntents[frame][formal]);
-            if (failed(joined)) return failure();
+            auto joined = replayFormalProof->join(
+                id, intentTrue[formal], replayFormalIntents[frame][formal]);
+            if (failed(joined))
+              return failure();
             replayFormalIntents[frame][formal] = *joined;
           }
           for (unsigned formal = 0; formal < formalEntry.size(); ++formal) {
-            auto trueId = formalTrue[formal], falseId = replayFormalValues[frame][formal];
-            if (trueId == falseId) { replayFormalValues[frame][formal] = trueId; continue; }
+            auto trueId = formalTrue[formal],
+                 falseId = replayFormalValues[frame][formal];
+            if (trueId == falseId) {
+              replayFormalValues[frame][formal] = trueId;
+              continue;
+            }
             std::optional<ac::BoundValueId> joined;
             for (auto resultId : branch.results) {
-              if (!charge(budget, split)) return failure();
+              if (!charge(budget, split))
+                return failure();
               const auto &result = plan.branchResults[resultId];
-              auto trueArm = replayFormalProof->equal(result.whenTrue, trueId,
-                  {branch.thenExitPrefix, {id, true}});
-              auto falseArm = replayFormalProof->equal(result.whenFalse, falseId,
+              auto trueArm = replayFormalProof->equal(
+                  result.whenTrue, trueId, {branch.thenExitPrefix, {id, true}});
+              auto falseArm = replayFormalProof->equal(
+                  result.whenFalse, falseId,
                   {branch.elseExitPrefix, {id, false}});
-              if (failed(trueArm) || failed(falseArm)) return failure();
-              if (*trueArm && *falseArm && !joined) joined = result.result;
+              if (failed(trueArm) || failed(falseArm))
+                return failure();
+              if (*trueArm && *falseArm && !joined)
+                joined = result.result;
             }
-            if (!joined) return reject("original current formal branch join is absent");
+            if (!joined)
+              return reject("original current formal branch join is absent");
             replayFormalValues[frame][formal] = *joined;
           }
           if (failed(
@@ -6989,6 +8154,7 @@ private:
               found->callee != nextFrame++ ||
               found->callee >= plan.frames.size())
             return reject("original call frame order differs");
+          replayedCalls[{call, frame}] = &*found;
           const auto &calleeFrame = plan.frames[found->callee];
           auto calleeMethod = calleeFrame.method;
           auto callerAnchor = plan.frames[frame].anchor;
@@ -6998,22 +8164,26 @@ private:
           auto payMethod = [&](ac::SourceMethodOp method, Operation *) {
             return prepayClone(method, budget);
           };
-          auto payWorkStorage = [&](Operation *site, uint64_t work, uint64_t bytes) {
-            return success(charge(budget, site, work) &&
-                           charge(budget, site, SourceCheckBudget::bytes(bytes)));
+          auto payWorkStorage = [&](Operation *site, uint64_t work,
+                                    uint64_t bytes) {
+            return success(
+                charge(budget, site, work) &&
+                charge(budget, site, SourceCheckBudget::bytes(bytes)));
           };
           auto payInstanceBinding = [&](Operation *owner, Operation *allocation,
                                         Operation *target, Operation *) {
-            return success(succeeded(prepayClone(allocation ? allocation : owner, budget)) &&
+            return success(succeeded(prepayClone(
+                               allocation ? allocation : owner, budget)) &&
                            prepayOperationHeader(target, budget));
           };
           ac::SourceReceiverProofFees fees{payModule, payMethod, payWorkStorage,
-                                          payInstanceBinding};
+                                           payInstanceBinding};
           auto resolved = ac::resolveSourceMethodCall(
               call, plan.frames[frame].bindings,
               [&](FlatSymbolRefAttr symbol) -> Operation * {
                 return hardware.lookupDefinition(symbol.getValue());
-              }, &receiverProof, &fees);
+              },
+              &receiverProof, &fees);
           if (failed(resolved) ||
               !charge(budget, call,
                       32 + resolved->bindings.integers.size() +
@@ -7025,15 +8195,17 @@ private:
               calleeFrame.registrationEntry ||
               calleeFrame.callOccurrence != call.getOccurrence() ||
               calleeFrame.anchor >= plan.instances.size() ||
-              !sameBindings(calleeFrame.bindings, plan.instances[calleeFrame.anchor].bindings) ||
+              !sameBindings(calleeFrame.bindings,
+                            plan.instances[calleeFrame.anchor].bindings) ||
               plan.instances[calleeFrame.anchor].definition.operator->() !=
                   resolved->method.module)
             return reject("original resolved Method frame differs");
-          auto actualAnchor = sourceActualReceiver(plan, callerAnchor,
-              resolved->receiver, call, budget);
+          auto actualAnchor = sourceActualReceiver(
+              plan, callerAnchor, resolved->receiver, call, budget);
           if (failed(actualAnchor) || *actualAnchor != calleeFrame.anchor)
             return reject("original bound reference receiver differs");
-          if (call->hasAttr("receiver_kind") || call->hasAttr("ancestor_depth")) {
+          if (call->hasAttr("receiver_kind") ||
+              call->hasAttr("ancestor_depth")) {
             const auto &instance = plan.instances[*actualAnchor];
             ac::HardwareBindings actualBindings = rootBindings;
             if (instance.parent) {
@@ -7042,11 +8214,14 @@ private:
                       instance.allocation, instance.definition, call)))
                 return failure();
               auto bound = hardware.bindInstance(
-                  instance.allocation, plan.instances[*instance.parent].bindings);
-              if (failed(bound)) return failure();
+                  instance.allocation,
+                  plan.instances[*instance.parent].bindings);
+              if (failed(bound))
+                return failure();
               actualBindings = std::move(*bound);
             }
-            auto actualMethod = receiverProof.method(instance.definition,
+            auto actualMethod = receiverProof.method(
+                instance.definition,
                 call.getCalleeAttr().getNestedReferences().front().getValue(),
                 call, fees);
             if (failed(actualMethod) ||
@@ -7056,9 +8231,12 @@ private:
                 !sameBindings(actualBindings, calleeFrame.bindings))
               return reject("original bound relative Method contract differs");
           }
-          auto receiver = Builder(transaction.getContext()).getDictionaryAttr({
-              NamedAttribute(StringAttr::get(transaction.getContext(), "instance_path"),
-                             plan.instances[*actualAnchor].occurrencePath)});
+          auto receiver =
+              Builder(transaction.getContext())
+                  .getDictionaryAttr({NamedAttribute(
+                      StringAttr::get(transaction.getContext(),
+                                      "instance_path"),
+                      plan.instances[*actualAnchor].occurrencePath)});
           if (calleeFrame.receiver != receiver)
             return reject("original Method receiver identity differs");
           if (failed(replay.identify(found->authoredPath, call.getPath(),
@@ -7126,77 +8304,74 @@ private:
                            std::distance(plan.calls.begin(), found))))
             return failure();
         } else if (auto check = dyn_cast<ac::SourceExpectOp>(op)) {
-          if (!charge(budget, check, plan.bodyChecks.size()))
-            return failure();
-          auto found = llvm::find_if(plan.bodyChecks, [&](const auto &item) {
-            return item.frame == frame && item.operation.operator->() == &op;
-          });
-          if (found == plan.bodyChecks.end() ||
-              nextEffectEvent == effectEvents.size())
+          if (nextEffectEvent == effectEvents.size())
             return reject("original body-check plan/event is absent");
-          auto id = std::distance(plan.bodyChecks.begin(), found);
           const auto *effectEvent = effectEvents[nextEffectEvent++];
-          Value condition = bound(found->condition),
-                path = bound(found->authoredPath);
+          if (!effectEvent->record ||
+              *effectEvent->record >= plan.bodyChecks.size())
+            return reject("original body-check plan/event is absent");
+          auto id = *effectEvent->record;
+          const auto &found = plan.bodyChecks[id];
+          Value condition = bound(found.condition),
+                path = bound(found.authoredPath);
           if (effectEvent->kind != ac::TransactionStateEventKind::BodyCheck ||
-              effectEvent->frame != frame || effectEvent->bodyCheck != id ||
-              !condition || !path || check.getKind() != "assert" ||
+              effectEvent->frame != frame || effectEvent->record != id ||
+              found.frame != frame || found.operation != check || !condition ||
+              !path || check.getKind() != "assert" ||
               !check.getSampling().empty() ||
-              check->getAttr("occurrence") != found->occurrence ||
-              check.getLocationAttr() != found->location ||
+              check->getAttr("occurrence") != found.occurrence ||
+              check.getLocationAttr() != found.location ||
               check->getAttrOfType<StringAttr>("ac.message") !=
-                  found->message ||
+                  found.message ||
               check->hasAttr("ac.check_id") ||
               check->hasAttr("ac.observation_id") ||
-              check.getCondition() != plan.values[found->condition].value ||
-              check.getPath() != plan.values[found->authoredPath].value)
+              check.getCondition() != plan.values[found.condition].value ||
+              check.getPath() != plan.values[found.authoredPath].value)
             return reject("original body-check operation/frame/inputs differ");
-          if (!sameSourcePoint(found->point, point()) ||
+          if (!sameSourcePoint(found.point, point()) ||
               failed(
                   event(ac::TransactionStateEventKind::BodyCheck, frame, id)))
             return reject("original body-check placement/event differs");
-          if (failed(replay.identify(found->condition, check.getCondition(),
+          if (failed(replay.identify(found.condition, check.getCondition(),
                                      plan.frames[frame].anchor, frame)) ||
-              failed(replay.requireAvailable(found->condition, point())) ||
-              failed(replay.identify(found->authoredPath, check.getPath(),
+              failed(replay.requireAvailable(found.condition, point())) ||
+              failed(replay.identify(found.authoredPath, check.getPath(),
                                      plan.frames[frame].anchor, frame)) ||
-              failed(replay.authoredTrue(found->authoredPath, point())))
+              failed(replay.authoredTrue(found.authoredPath, point())))
             return failure();
           sourceChecks[id] = {condition, path};
         } else if (auto observation = dyn_cast<ac::SourceObserveOp>(op)) {
-          if (!charge(budget, observation, plan.observations.size()))
-            return failure();
-          auto found = llvm::find_if(plan.observations, [&](const auto &item) {
-            return item.frame == frame && item.operation.operator->() == &op;
-          });
-          if (found == plan.observations.end() ||
-              nextEffectEvent == effectEvents.size())
+          if (nextEffectEvent == effectEvents.size())
             return reject("original observation plan/event is absent");
-          auto id = std::distance(plan.observations.begin(), found);
           const auto *effectEvent = effectEvents[nextEffectEvent++];
-          Value path = bound(found->authoredPath);
+          if (!effectEvent->record ||
+              *effectEvent->record >= plan.observations.size())
+            return reject("original observation plan/event is absent");
+          auto id = *effectEvent->record;
+          const auto &found = plan.observations[id];
+          Value path = bound(found.authoredPath);
           if (effectEvent->kind != ac::TransactionStateEventKind::Observe ||
-              effectEvent->frame != frame || effectEvent->observation != id ||
-              !path ||
-              observation->getAttr("occurrence") != found->occurrence ||
-              observation->getAttr("ac.location") != found->location ||
-              observation.getKindAttr() != found->kind ||
-              observation.getSpec() != found->spec ||
+              effectEvent->frame != frame || effectEvent->record != id ||
+              found.frame != frame || found.operation != observation || !path ||
+              observation->getAttr("occurrence") != found.occurrence ||
+              observation->getAttr("ac.location") != found.location ||
+              observation.getKindAttr() != found.kind ||
+              observation.getSpec() != found.spec ||
               observation->hasAttr("ac.check_id") ||
               observation->hasAttr("ac.observation_id") ||
-              observation.getPath() != plan.values[found->authoredPath].value ||
-              observation.getValues().size() != found->values.size())
+              observation.getPath() != plan.values[found.authoredPath].value ||
+              observation.getValues().size() != found.values.size())
             return reject("original observation operation/frame/path differ");
-          if (!sameSourcePoint(found->point, point()) ||
+          if (!sameSourcePoint(found.point, point()) ||
               failed(event(ac::TransactionStateEventKind::Observe, frame, id)))
             return reject("original observation placement/event differs");
-          if (failed(replay.identify(found->authoredPath, observation.getPath(),
+          if (failed(replay.identify(found.authoredPath, observation.getPath(),
                                      plan.frames[frame].anchor, frame)) ||
-              failed(replay.authoredTrue(found->authoredPath, point())))
+              failed(replay.authoredTrue(found.authoredPath, point())))
             return failure();
           sourceObservations[id].path = path;
-          sourceObservations[id].values.reserve(found->values.size());
-          for (auto [ordinal, value] : llvm::enumerate(found->values)) {
+          sourceObservations[id].values.reserve(found.values.size());
+          for (auto [ordinal, value] : llvm::enumerate(found.values)) {
             Value mapped = bound(value);
             if (!mapped ||
                 observation.getValues()[ordinal] != plan.values[value].value)
@@ -7226,11 +8401,13 @@ private:
             // without a second traversal of the same original regions.
             if (isa<ac::SourceExpectOp, ac::SourceObserveOp>(nested))
               return nested->emitOpError()
-                     << "transaction body checks/observations require sampled effect lowering";
+                     << "transaction body checks/observations require sampled "
+                        "effect lowering";
             if (!ac::detail::isCombinationalHardwareOperation(nested) &&
                 !(nested != &op && isa<ac::YieldOp>(nested)))
               return nested->emitOpError()
-                     << "transaction source proof requires closed pure payload operations";
+                     << "transaction source proof requires closed pure payload "
+                        "operations";
             for (Value operand : nested->getOperands()) {
               auto id = replay.find(operand, plan.frames[frame].anchor, frame);
               if (failed(id) || failed(replay.requireAvailable(*id, point())))
@@ -7256,9 +8433,9 @@ private:
                 }
               }
           }
-          if (failed(exactClone(&op, actual, authenticated[frame],
-                                record.frames[frame],
-                                &plan.instances[plan.frames[frame].anchor].logicalBindings)))
+          if (failed(exactClone(
+                  &op, actual, authenticated[frame], record.frames[frame],
+                  &plan.instances[plan.frames[frame].anchor].logicalBindings)))
             return failure();
           last = actual;
         }
@@ -7268,51 +8445,71 @@ private:
     invocation =
         [&](ac::InvocationFrameId frame,
             SmallVectorImpl<ac::StateOwnerId> &touchOrder) -> LogicalResult {
+      SourceCheckBudget::LocalScope invocationBudget(budget);
       const auto &binding = plan.frames[frame];
       auto method = binding.method;
       Operation *function =
           method ? method.operator->() : transaction.operator->();
-      const ac::TransactionCallBinding *callBinding = nullptr;
-      ac::TransactionCallBinding registrationBinding;
+      const ac::TransactionCallDelta *callBinding = nullptr;
+      ac::TransactionCallDelta registrationBinding;
       bool registrationRoot = frame == plan.rootFrame && bool(entryMethod);
       if (registrationRoot) {
         registrationBinding.operation = entryCall;
         registrationBinding.caller = plan.rootFrame;
         registrationBinding.callee = plan.rootFrame;
-        if (!product(budget, transaction, (**registration).argumentCaptureOrdinals.size(),
-                     2 + SourceCheckBudget::bytes(sizeof(ac::BoundValueId)))) return failure();
+        if (!product(budget, transaction,
+                     (**registration).argumentCaptureOrdinals.size(),
+                     2 + SourceCheckBudget::bytes(sizeof(ac::BoundValueId))))
+          return failure();
         for (unsigned ordinal : (**registration).argumentCaptureOrdinals) {
-          auto actual = replay.find(transaction.getCaptures()[ordinal], plan.lexicalAnchor, plan.rootFrame);
-          if (failed(actual) || failed(replay.requireAvailable(*actual, {}))) return failure();
+          auto actual = replay.find(transaction.getCaptures()[ordinal],
+                                    plan.lexicalAnchor, plan.rootFrame);
+          if (failed(actual) || failed(replay.requireAvailable(*actual, {})))
+            return failure();
           registrationBinding.arguments.push_back(*actual);
         }
         callBinding = &registrationBinding;
       } else if (frame) {
-        if (!charge(budget, transaction, plan.calls.size()))
-          return failure();
-        auto found = llvm::find_if(
-            plan.calls, [&](const auto &call) { return call.callee == frame; });
-        if (found == plan.calls.end())
+        // Frames are appended in call-entry order and every non-root frame has
+        // exactly one call delta.  Use that frozen occurrence identity instead
+        // of linearly searching all call occurrences on every invocation.
+        if (frame > plan.calls.size())
           return reject("original frame has no call");
-        callBinding = &*found;
+        const auto &found = plan.calls[frame - 1];
+        if (found.callee != frame)
+          return reject("original frame has no call");
+        callBinding = &found;
       }
-      auto proposalOrdinals = function->getAttrOfType<ArrayAttr>("ac.formal_proposals");
+      auto proposalOrdinals =
+          function->getAttrOfType<ArrayAttr>("ac.formal_proposals");
       if (proposalOrdinals && !proposalOrdinals.empty()) {
         if (!replayFormalProof) {
-          if (!charge(budget, function, 1 + SourceCheckBudget::bytes(
-                  sizeof(ac::detail::SourceFormalProposalProof)))) return failure();
-          replayFormalProof = std::make_unique<ac::detail::SourceFormalProposalProof>(plan, hardware,
-              [&](ac::BoundValueId id, ac::TransactionPoint context) { return replay.identity(id, context); },
-              [&](Value source, ac::LexicalInstanceId anchor, ac::InvocationFrameId invocation) {
-                return replay.find(source, anchor, invocation);
-              }, [&](uint64_t work) { return charge(budget, transaction, work); });
+          if (!charge(budget, function,
+                      1 + SourceCheckBudget::bytes(
+                              sizeof(ac::detail::SourceFormalProposalProof))))
+            return failure();
+          replayFormalProof =
+              std::make_unique<ac::detail::SourceFormalProposalProof>(
+                  plan, hardware,
+                  [&](ac::BoundValueId id, ac::TransactionPoint context) {
+                    return replay.identity(id, context);
+                  },
+                  [&](Value source, ac::LexicalInstanceId anchor,
+                      ac::InvocationFrameId invocation) {
+                    return replay.find(source, anchor, invocation);
+                  },
+                  [&](uint64_t work) {
+                    return charge(budget, transaction, work);
+                  });
         }
       }
 #include "TransactionFormalBindingProof.inc"
       if (proposalOrdinals && !proposalOrdinals.empty()) {
         auto zero = replayFormalProof->zero();
-        if (failed(zero) || !product(budget, function, explicitCount,
-              1 + SourceCheckBudget::bytes(sizeof(uint64_t)))) return failure();
+        if (failed(zero) ||
+            !product(budget, function, explicitCount,
+                     1 + SourceCheckBudget::bytes(sizeof(uint64_t))))
+          return failure();
         replayFormalIntents[frame].assign(explicitCount, *zero);
       }
       for (unsigned region : {0u, 1u}) {
@@ -7334,9 +8531,11 @@ private:
           auto actualAnchor = binding.anchor;
           if (ordinal < explicitCount) {
             auto originalCall = callBinding->operation;
-            originalActual = registrationRoot
-                ? transaction.getCaptures()[(**registration).argumentCaptureOrdinals[ordinal]]
-                : originalCall.getArguments()[ordinal];
+            originalActual =
+                registrationRoot
+                    ? transaction.getCaptures()
+                          [(**registration).argumentCaptureOrdinals[ordinal]]
+                    : originalCall.getArguments()[ordinal];
             actualFrame = callBinding->caller;
             actualAnchor = plan.frames[actualFrame].anchor;
           } else
@@ -7452,20 +8651,30 @@ private:
         }
       }
       if (proposalOrdinals) {
-        ac::SourceMethodView view{plan.instances[binding.anchor].definition, method, {}};
-        auto yield = cast<ac::YieldOp>(function->getRegion(1).front().getTerminator());
+        ac::SourceMethodView view{
+            plan.instances[binding.anchor].definition, method, {}};
+        auto yield =
+            cast<ac::YieldOp>(function->getRegion(1).front().getTerminator());
         for (auto [ordinal, raw] : llvm::enumerate(proposalOrdinals)) {
           unsigned formal = cast<IntegerAttr>(raw).getInt();
           unsigned suffix = view.getNumPublicResults() + 2 * ordinal;
-          if (!replayFormalProof || formal >= replayFormalIntents[frame].size() ||
-              suffix + 1 >= yield.getNumOperands()) return failure();
-          auto data = replay.find(yield.getOperand(suffix), binding.anchor, frame);
-          auto intent = replay.find(yield.getOperand(suffix + 1), binding.anchor, frame);
-          if (failed(data) || failed(intent)) return failure();
-          auto same = replayFormalProof->equal(*data, replayFormalValues[frame][formal], point());
+          if (!replayFormalProof ||
+              formal >= replayFormalIntents[frame].size() ||
+              suffix + 1 >= yield.getNumOperands())
+            return failure();
+          auto data =
+              replay.find(yield.getOperand(suffix), binding.anchor, frame);
+          auto intent =
+              replay.find(yield.getOperand(suffix + 1), binding.anchor, frame);
+          if (failed(data) || failed(intent))
+            return failure();
+          auto same = replayFormalProof->equal(
+              *data, replayFormalValues[frame][formal], point());
           if (failed(same) || !*same ||
-              failed(replayFormalProof->check(*intent, replayFormalIntents[frame][formal], point())))
-            return reject("original private formal proposal suffix differs from statement history");
+              failed(replayFormalProof->check(
+                  *intent, replayFormalIntents[frame][formal], point())))
+            return reject("original private formal proposal suffix differs "
+                          "from statement history");
         }
       }
       if (!sameSourcePoint(binding.exit, point()))
@@ -7477,8 +8686,10 @@ private:
                      plan.rootFrame)) ||
         failed(invocation(plan.rootFrame, rootTouched)))
       return failure();
-    Operation *rootCallable = entryMethod ? entryMethod.operator->() : transaction.operator->();
-    auto originalYield = cast<ac::YieldOp>(rootCallable->getRegion(1).front().getTerminator());
+    Operation *rootCallable =
+        entryMethod ? entryMethod.operator->() : transaction.operator->();
+    auto originalYield =
+        cast<ac::YieldOp>(rootCallable->getRegion(1).front().getTerminator());
     if (plan.results.size() != transaction->getNumResults() ||
         (entryMethod ? plan.results.size() > originalYield.getNumOperands()
                      : plan.results.size() != originalYield.getNumOperands()))
@@ -7487,7 +8698,8 @@ private:
       if (failed(replay.identify(result.result, transaction->getResult(ordinal),
                                  plan.lexicalAnchor, 0)) ||
           failed(replay.identify(result.yielded,
-                                 originalYield.getOperand(ordinal), plan.lexicalAnchor, 0)) ||
+                                 originalYield.getOperand(ordinal),
+                                 plan.lexicalAnchor, 0)) ||
           failed(replay.result(result.result, result.yielded, point())))
         return failure();
     if (failed(event(ac::TransactionStateEventKind::TransactionExit,
@@ -7496,8 +8708,10 @@ private:
         failed(requireStaticTotality(plan, budget, prepared.valueAvailability)))
       return failure();
     if (eventIndex != plan.events.size() || readIndex != plan.reads.size() ||
-        writeIndex != plan.writes.size() || formalIndex != plan.formalWrites.size() ||
-        callIndex != plan.calls.size() || queueIndex != plan.queueAccesses.size() ||
+        writeIndex != plan.writes.size() ||
+        formalIndex != plan.formalWrites.size() ||
+        callIndex != plan.calls.size() ||
+        queueIndex != plan.queueAccesses.size() ||
         memoryIndex != plan.memoryAccesses.size() ||
         branchIndex != plan.branches.size() || joinIndex != plan.joins.size() ||
         resultIndex != plan.branchResults.size() ||
@@ -7538,9 +8752,11 @@ private:
            original.write && plan.writes[*original.write].pathFact &&
            plan.writes[*original.write].pathFact.getValue() &&
            versions[id].data !=
-             (isa<ac::SourceStateWriteOp>(plan.writes[*original.write].operation) &&
-                      !plan.writes[*original.write].selectors.empty()
-                  ? record.selectedWrites[*original.write].data : bound(*original.value))))
+               (isa<ac::SourceStateWriteOp>(
+                    plan.writes[*original.write].operation) &&
+                        !plan.writes[*original.write].selectors.empty()
+                    ? record.selectedWrites[*original.write].data
+                    : bound(*original.value))))
         return reject("saved state-version map differs from original RHS");
     auto yield = cast<ac::YieldOp>(rule.getBody().front().getTerminator());
     Builder yieldAttributes(transaction.getContext());
@@ -7557,7 +8773,8 @@ private:
       return reject("original Rule yield arity differs");
     for (const auto &domain : preparation.writeDomains)
       if (domain.write >= record.selectedWrites.size() ||
-          yield->getOperand(domain.result) != record.selectedWrites[domain.write].mask ||
+          yield->getOperand(domain.result) !=
+              record.selectedWrites[domain.write].mask ||
           yield->getOperand(domain.result).getType() != domain.maskType)
         return reject("original private write domain mask yield differs");
     auto sourceYield = originalYield;
@@ -7568,13 +8785,17 @@ private:
       Value publicResult = rule->getResult(ordinal);
       auto sourceResult = plan.values[result.result].value;
       if (!plan.registrationPath.empty()) {
-        const auto &lexical = prepared.definitions[prepared.definitionIndex.lookup(
-            plan.lexicalModule.operator->())];
-        auto incoming = lexical.downwardIndex.find(routingKey({}, sourceResult));
+        const auto &lexical =
+            prepared.definitions[prepared.definitionIndex.lookup(
+                plan.lexicalModule.operator->())];
+        auto incoming =
+            lexical.downwardIndex.find(routingKey({}, sourceResult));
         if (incoming == lexical.downwardIndex.end())
           return reject("original ordinary result has no lexical return input");
-        auto module = cast<ac::ModuleOp>(candidate.packageMap.lookup(plan.lexicalModule.operator->()));
-        publicResult = module.getBody().front().getArgument(lexical.sourceInputs + 2 * incoming->second);
+        auto module = cast<ac::ModuleOp>(
+            candidate.packageMap.lookup(plan.lexicalModule.operator->()));
+        publicResult = module.getBody().front().getArgument(
+            lexical.sourceInputs + 2 * incoming->second);
       }
       if (bound(result.yielded) != authenticated[plan.rootFrame].lookupOrNull(
                                        sourceYield.getOperand(ordinal)) ||
@@ -7650,8 +8871,10 @@ private:
     auto requireUse = [&](Operation *site, ac::InvocationFrameId frame,
                           ac::BoundValueId payload, StringRef kind,
                           uint64_t operand, ac::TransactionPoint point,
-                          std::optional<ac::BoundValueId> rawPath = std::nullopt) -> LogicalResult {
-      if (!prepared.valueAvailability) return success();
+                          std::optional<ac::BoundValueId> rawPath =
+                              std::nullopt) -> LogicalResult {
+      if (!prepared.valueAvailability)
+        return success();
       if (requiredIndex >= preparation.requirements.size() ||
           requiredIndex >= record.requirements.size() ||
           scheduledControl >= preparation.controls.size())
@@ -7660,40 +8883,51 @@ private:
       const auto &scheduled = preparation.controls[scheduledControl];
       if (requirement.site != site || requirement.frame != frame ||
           requirement.payload != payload || requirement.rawPath != rawPath ||
-          requirement.kind.getValue() != kind || requirement.operand != operand ||
+          requirement.kind.getValue() != kind ||
+          requirement.operand != operand ||
           !sameSourcePoint(requirement.point, point) ||
           requirement.control != scheduledControl || scheduled.source ||
           scheduled.requirement != requiredIndex)
         return reject("original required-use source root/order differs");
       Operation *function = plan.frames[frame].method
-          ? plan.frames[frame].method.operator->() : transaction.operator->();
+                                ? plan.frames[frame].method.operator->()
+                                : transaction.operator->();
       auto occurrence = site->getAttrOfType<DictionaryAttr>("occurrence");
-      if (!occurrence) occurrence = function->getAttrOfType<DictionaryAttr>(
-          isa<ac::SourceTransactionOp>(function) ? "declaration" : "occurrence");
+      if (!occurrence)
+        occurrence = function->getAttrOfType<DictionaryAttr>(
+            isa<ac::SourceTransactionOp>(function) ? "declaration"
+                                                   : "occurrence");
       auto location = site->getAttrOfType<DictionaryAttr>("ac.location");
-      if (!location) location = site->getAttrOfType<DictionaryAttr>("ac.condition_location");
-      if (!location) location = function->getAttrOfType<DictionaryAttr>("ac.guard_location");
-      if (requirement.occurrence != occurrence || requirement.location != location)
+      if (!location)
+        location = site->getAttrOfType<DictionaryAttr>("ac.condition_location");
+      if (!location)
+        location = function->getAttrOfType<DictionaryAttr>("ac.guard_location");
+      if (requirement.occurrence != occurrence ||
+          requirement.location != location)
         return reject("original required-use provenance differs");
       auto operation = record.requirements[requiredIndex];
       if (!operation || !operations.contains(operation) ||
-          operation->getNumOperands() != 3 || operation.getPayload() != bound(payload))
+          operation->getNumOperands() != 3 ||
+          operation.getPayload() != bound(payload))
         return reject("original required payload is disconnected");
       Value path = operation.getPath();
       auto peel = [&](Value expected) -> LogicalResult {
         auto conjunction = path.getDefiningOp<ac::BitsBinaryOp>();
         if (!conjunction || conjunction.getOpcode() != "and" ||
             conjunction.getRhs() != expected ||
-            failed(binaryProof(path, conjunction.getLhs(), expected, "and", site->getLoc())))
+            failed(binaryProof(path, conjunction.getLhs(), expected, "and",
+                               site->getLoc())))
           return reject("original required-use path differs");
         path = conjunction.getLhs();
         return success();
       };
-      if (rawPath && failed(peel(bound(*rawPath)))) return failure();
+      if (rawPath && failed(peel(bound(*rawPath))))
+        return failure();
       SmallVector<std::pair<ac::BranchId, bool>> ancestry;
       auto sourcePath = point.path;
       while (sourcePath.branch) {
-        if (!charge(budget, site) || ancestry.size() > 128) return failure();
+        if (!charge(budget, site) || ancestry.size() > 128)
+          return failure();
         ancestry.push_back({*sourcePath.branch, sourcePath.whenTrue});
         sourcePath = plan.branches[*sourcePath.branch].entry.path;
       }
@@ -7702,24 +8936,35 @@ private:
         Value expected = condition;
         if (!whenTrue) {
           auto conjunction = path.getDefiningOp<ac::BitsBinaryOp>();
-          auto inverted = conjunction ? conjunction.getRhs().getDefiningOp<ac::BitsUnaryOp>()
-                                      : ac::BitsUnaryOp();
+          auto inverted =
+              conjunction
+                  ? conjunction.getRhs().getDefiningOp<ac::BitsUnaryOp>()
+                  : ac::BitsUnaryOp();
           if (!inverted || inverted.getInput() != condition ||
-              failed(generatedProof(inverted, ac::BitsUnaryOp::getOperationName(),
-                  {condition}, {condition.getType()}, b.getDictionaryAttr({
-                      b.getNamedAttr("opcode", b.getStringAttr("not"))}),
-                  site->getLoc(), &rule.getBody().front()))) return failure();
+              failed(generatedProof(
+                  inverted, ac::BitsUnaryOp::getOperationName(), {condition},
+                  {condition.getType()},
+                  b.getDictionaryAttr(
+                      {b.getNamedAttr("opcode", b.getStringAttr("not"))}),
+                  site->getLoc(), &rule.getBody().front())))
+            return failure();
           expected = inverted.getResult();
         }
-        if (failed(peel(expected))) return failure();
+        if (failed(peel(expected)))
+          return failure();
       }
-      if (failed(literalProof(path, bit, transaction.getOccurrence(), site->getLoc(),
-                              true, &rule.getBody().front())) ||
-          failed(generatedProof(operation, ac::ValueRequireOp::getOperationName(),
-              {bound(payload), operation.getAvailability(), operation.getPath()}, {bit},
-              b.getDictionaryAttr({b.getNamedAttr("occurrence", occurrence),
-                  b.getNamedAttr("source_location", location)}),
-              site->getLoc(), &rule.getBody().front()))) return failure();
+      if (failed(literalProof(path, bit, transaction.getOccurrence(),
+                              site->getLoc(), true, &rule.getBody().front())) ||
+          failed(
+              generatedProof(operation, ac::ValueRequireOp::getOperationName(),
+                             {bound(payload), operation.getAvailability(),
+                              operation.getPath()},
+                             {bit},
+                             b.getDictionaryAttr(
+                                 {b.getNamedAttr("occurrence", occurrence),
+                                  b.getNamedAttr("source_location", location)}),
+                             site->getLoc(), &rule.getBody().front())))
+        return failure();
       ++requiredIndex;
       ++scheduledControl;
       return success();
@@ -7734,70 +8979,91 @@ private:
       return success();
     };
     for (const auto &event : plan.events) {
+      // Required-use authentication is event-local. Retain the shared ordered
+      // cursors and generated-operation coverage, while bounding each frozen
+      // event's independently replayable proof work.
+      SourceCheckBudget::LocalScope eventBudget(budget);
       using K = ac::TransactionStateEventKind;
       if (event.kind == K::GuardExit) {
-        const auto &guard = plan.guards[*event.guard];
-        if (failed(requireUse(guard.callable->getRegion(0).front().getTerminator(),
-              guard.frame, guard.predicate, "guard", 0,
-              {guard.control, plan.controls[guard.control].path})) ||
-            failed(sourceControl(guard.control))) return failure();
+        const auto &guard = plan.guards[*event.record];
+        if (failed(requireUse(
+                guard.callable->getRegion(0).front().getTerminator(),
+                guard.frame, guard.predicate, "guard", 0,
+                {guard.control, plan.controls[guard.control].path})) ||
+            failed(sourceControl(guard.control)))
+          return failure();
       } else if (event.kind == K::BranchEnter &&
-                 !plan.branches[*event.branch].selection &&
-                 branchHasStateWrites(plan, *event.branch)) {
-        const auto &branch = plan.branches[*event.branch];
+                 !plan.branches[*event.record].selection &&
+                 branchHasStateWrites(plan, *event.record)) {
+        const auto &branch = plan.branches[*event.record];
         if (failed(requireUse(branch.operation, branch.frame, branch.condition,
-                              "branch", 0, branch.entry))) return failure();
+                              "branch", 0, branch.entry)))
+          return failure();
       } else if (event.kind == K::SelectionEnter) {
-        const auto &selection = plan.selections[*event.selection];
+        const auto &selection = plan.selections[*event.record];
         const auto &branch = plan.branches[selection.branch];
         if (failed(requireUse(branch.operation, branch.frame, branch.condition,
                               "branch", 0, branch.entry)) ||
-            failed(sourceControl(selection.control))) return failure();
+            failed(sourceControl(selection.control)))
+          return failure();
       } else if (event.kind == K::Write) {
-        const auto &write = plan.writes[*event.write];
+        const auto &write = plan.writes[*event.record];
         if ((!write.pathFact || !write.pathFact.getValue()) &&
             failed(requireUse(write.operation, write.frame, write.authoredPath,
-                              "write_path", 0, event.point))) return failure();
-        if (failed(requireUse(write.operation, write.frame, write.value, "state_write",
-            1, event.point, (!write.pathFact || !write.pathFact.getValue())
-                ? std::optional<ac::BoundValueId>(write.authoredPath) : std::nullopt)))
+                              "write_path", 0, event.point)))
+          return failure();
+        if (failed(requireUse(
+                write.operation, write.frame, write.value, "state_write", 1,
+                event.point,
+                (!write.pathFact || !write.pathFact.getValue())
+                    ? std::optional<ac::BoundValueId>(write.authoredPath)
+                    : std::nullopt)))
           return failure();
         for (auto [ordinal, index] : llvm::enumerate(write.indices))
-          if (failed(requireUse(write.operation, write.frame, index, "state_write", 2 + ordinal,
-                                event.point, write.authoredPath))) return failure();
+          if (failed(requireUse(write.operation, write.frame, index,
+                                "state_write", 2 + ordinal, event.point,
+                                write.authoredPath)))
+            return failure();
       } else if (event.kind == K::QueueAccess) {
-        const auto &access = plan.queueAccesses[*event.queueAccess];
-        if (access.payload && failed(requireUse(access.operation, access.frame,
-              *access.payload, "queue_push", 1, event.point, access.authoredPath))) return failure();
+        const auto &access = plan.queueAccesses[*event.record];
+        if (access.payload &&
+            failed(requireUse(access.operation, access.frame, *access.payload,
+                              "queue_push", 1, event.point,
+                              access.authoredPath)))
+          return failure();
         for (auto [index, resource] : llvm::enumerate(preparation.resources)) {
-          if (resource.memoryAccess || resource.access != *event.queueAccess) continue;
-          if (resource.control != scheduledControl || scheduledControl >= preparation.controls.size() ||
+          if (resource.memoryAccess || resource.access != *event.record)
+            continue;
+          if (resource.control != scheduledControl ||
+              scheduledControl >= preparation.controls.size() ||
               preparation.controls[scheduledControl].resource != index)
             return reject("original queue resource schedule differs");
           ++scheduledControl;
         }
       } else if (event.kind == K::MemoryAccess) {
-        const auto &access = plan.memoryAccesses[*event.memoryAccess];
+        const auto &access = plan.memoryAccesses[*event.record];
         for (auto [ordinal, argument] : llvm::enumerate(access.arguments))
           if (failed(requireUse(access.operation, access.frame, argument,
                                 "memory_argument", ordinal, event.point,
-                                access.authoredPath))) return failure();
-        if (*event.memoryAccess >= record.memoryReadPrefixes.size() ||
+                                access.authoredPath)))
+            return failure();
+        if (*event.record >= record.memoryReadPrefixes.size() ||
             (access.kind == ac::TransactionMemoryAccessKind::Read
-                 ? record.memoryReadPrefixes[*event.memoryAccess] !=
+                 ? record.memoryReadPrefixes[*event.record] !=
                        record.prefixes[scheduledControl]
-                 : bool(record.memoryReadPrefixes[*event.memoryAccess])))
+                 : bool(record.memoryReadPrefixes[*event.record])))
           return reject("original Memory reached prefix differs");
         if (access.kind == ac::TransactionMemoryAccessKind::Read) {
-          auto proposal = llvm::find_if(preparation.memoryProposals, [&](const auto &item) {
-            return item.access == *event.memoryAccess;
-          });
-          if (proposal == preparation.memoryProposals.end() ||
-              proposal->reachedControlEnd != scheduledControl)
+          auto proposalIndex = memoryProposalByAccess[*event.record];
+          if (!proposalIndex ||
+              *proposalIndex >= preparation.memoryProposals.size() ||
+              preparation.memoryProposals[*proposalIndex].reachedControlEnd !=
+                  scheduledControl)
             return reject("original Memory read prefix endpoint differs");
         }
         for (auto [index, resource] : llvm::enumerate(preparation.resources)) {
-          if (resource.memoryAccess != event.memoryAccess) continue;
+          if (resource.memoryAccess != event.record)
+            continue;
           if (resource.control != scheduledControl ||
               scheduledControl >= preparation.controls.size() ||
               preparation.controls[scheduledControl].resource != index)
@@ -7805,46 +9071,65 @@ private:
           ++scheduledControl;
         }
       } else if (event.kind == K::FormalWrite) {
-        const auto &formal = plan.formalWrites[*event.formalWrite];
-        if (!formal.owner) continue;
-        if (failed(requireUse(formal.operation, formal.frame, formal.authoredPath,
-                              "formal_path", 0, event.point)) ||
+        const auto &formal = plan.formalWrites[*event.record];
+        if (!formal.owner)
+          continue;
+        if (failed(requireUse(formal.operation, formal.frame,
+                              formal.authoredPath, "formal_path", 0,
+                              event.point)) ||
             failed(requireUse(formal.operation, formal.frame, formal.payload,
-                              "formal_write", 1, event.point, formal.authoredPath)) ||
+                              "formal_write", 1, event.point,
+                              formal.authoredPath)) ||
             failed(requireUse(formal.operation, formal.frame, formal.candidate,
-                              "formal_candidate", 2, event.point, formal.authoredPath)))
+                              "formal_candidate", 2, event.point,
+                              formal.authoredPath)))
           return failure();
         for (auto [ordinal, index] : llvm::enumerate(formal.indices))
-          if (failed(requireUse(formal.operation, formal.frame, index, "formal_write", 3 + ordinal,
-                                event.point, formal.authoredPath))) return failure();
+          if (failed(requireUse(formal.operation, formal.frame, index,
+                                "formal_write", 3 + ordinal, event.point,
+                                formal.authoredPath)))
+            return failure();
       } else if (event.kind == K::CallEnter) {
-        const auto &call = plan.calls[*event.call];
+        const auto &call = plan.calls[*event.record];
         for (auto [ordinal, argument] : llvm::enumerate(call.arguments))
-          if (failed(requireUse(call.operation, call.caller, argument, "call_argument",
-                                ordinal, event.point))) return failure();
+          if (failed(requireUse(call.operation, call.caller, argument,
+                                "call_argument", ordinal, event.point)))
+            return failure();
       } else if (event.kind == K::BodyCheck) {
-        const auto &check = plan.bodyChecks[*event.bodyCheck];
+        const auto &check = plan.bodyChecks[*event.record];
         if (failed(requireUse(check.operation, check.frame, check.condition,
-                              "assert", 0, event.point))) return failure();
+                              "assert", 0, event.point)))
+          return failure();
       } else if (event.kind == K::Observe) {
-        const auto &observation = plan.observations[*event.observation];
+        const auto &observation = plan.observations[*event.record];
         for (auto [ordinal, value] : llvm::enumerate(observation.values))
           if (failed(requireUse(observation.operation, observation.frame, value,
-                                "log", ordinal, event.point))) return failure();
+                                "log", ordinal, event.point)))
+            return failure();
       } else if (event.kind == K::CallExit) {
-        const auto &call = plan.calls[*event.call];
+        const auto &call = plan.calls[*event.record];
         const auto &frame = plan.frames[call.callee];
-        ac::SourceMethodView method{plan.instances[frame.anchor].definition, frame.method, {}};
-        for (uint64_t ordinal = 0; ordinal < method.getNumPublicResults(); ++ordinal)
-          if (failed(requireUse(frame.method->getRegion(1).front().getTerminator(),
-              call.callee, call.results[ordinal].yielded, "return", ordinal, frame.exit)))
+        ac::SourceMethodView method{
+            plan.instances[frame.anchor].definition, frame.method, {}};
+        for (uint64_t ordinal = 0; ordinal < method.getNumPublicResults();
+             ++ordinal)
+          if (failed(
+                  requireUse(frame.method->getRegion(1).front().getTerminator(),
+                             call.callee, call.results[ordinal].yielded,
+                             "return", ordinal, frame.exit)))
             return failure();
       } else if (event.kind == K::TransactionExit) {
         for (auto [ordinal, result] : llvm::enumerate(plan.results))
-          if (failed(requireUse((plan.frames[plan.rootFrame].method
-                  ? plan.frames[plan.rootFrame].method.operator->() : transaction.operator->())
-                  ->getRegion(1).front().getTerminator(),
-              plan.rootFrame, result.yielded, "return", ordinal, event.point))) return failure();
+          if (failed(requireUse(
+                  (plan.frames[plan.rootFrame].method
+                       ? plan.frames[plan.rootFrame].method.operator->()
+                       : transaction.operator->())
+                      ->getRegion(1)
+                      .front()
+                      .getTerminator(),
+                  plan.rootFrame, result.yielded, "return", ordinal,
+                  event.point)))
+            return failure();
       }
     }
     if (requiredIndex != preparation.requirements.size() ||
@@ -7857,21 +9142,35 @@ private:
                             &rule.getBody().front())))
       return failure();
     for (auto [id, scheduled] : llvm::enumerate(preparation.controls)) {
-      const auto *control = scheduled.source ? &plan.controls[*scheduled.source] : nullptr;
-      const auto *requirement = scheduled.requirement
-          ? &preparation.requirements[*scheduled.requirement] : nullptr;
-      const auto *resource = scheduled.resource ? &preparation.resources[*scheduled.resource] : nullptr;
-      Value raw = resource ? record.resources[*scheduled.resource]->getResult(0)
-          : requirement ? record.requirements[*scheduled.requirement]->getResult(0)
-                        : sourceRaw[*scheduled.source];
+      // Control-prefix nodes are independently derived from one frozen
+      // control row. The prefix cursor and generated-node coverage still
+      // enforce global order and completeness across rows.
+      SourceCheckBudget::LocalScope controlBudget(budget);
+      const auto *control =
+          scheduled.source ? &plan.controls[*scheduled.source] : nullptr;
+      const auto *requirement =
+          scheduled.requirement
+              ? &preparation.requirements[*scheduled.requirement]
+              : nullptr;
+      const auto *resource = scheduled.resource
+                                 ? &preparation.resources[*scheduled.resource]
+                                 : nullptr;
+      Value raw =
+          resource ? record.resources[*scheduled.resource]->getResult(0)
+          : requirement
+              ? record.requirements[*scheduled.requirement]->getResult(0)
+              : sourceRaw[*scheduled.source];
       const auto &actual = record.controls[id];
       bool selection =
-          control && std::holds_alternative<ac::BranchSelectControl>(control->boundary);
+          control &&
+          std::holds_alternative<ac::BranchSelectControl>(control->boundary);
       Location location = transaction.getLoc();
-      if (resource) location = detail::resourceOperation(plan, *resource)->getLoc();
-      else if (requirement) location = requirement->site->getLoc();
+      if (resource)
+        location = detail::resourceOperation(plan, *resource)->getLoc();
+      else if (requirement)
+        location = requirement->site->getLoc();
       else if (auto *guard =
-              std::get_if<ac::CallableGuardControl>(&control->boundary))
+                   std::get_if<ac::CallableGuardControl>(&control->boundary))
         location = plan.guards[guard->guard].callable->getLoc();
       else
         location =
@@ -7880,9 +9179,12 @@ private:
                                               .selection]
                               .branch]
                 .operation->getLoc();
-      auto selected = sourceSelected(control ? control->path : requirement ? requirement->point.path
-          : detail::resourcePoint(plan, *resource).path);
-      Value yieldedReached = yield->getOperand(preparation.checkBase + 2 * id + 1);
+      auto selected = sourceSelected(
+          control       ? control->path
+          : requirement ? requirement->point.path
+                        : detail::resourcePoint(plan, *resource).path);
+      Value yieldedReached =
+          yield->getOperand(preparation.checkBase + 2 * id + 1);
       if (failed(selected) || actual.raw != raw ||
           actual.selectedPath != *selected ||
           yield->getOperand(preparation.checkBase + 2 * id) != raw ||
@@ -7948,8 +9250,58 @@ private:
                                           bound))) {
       return failure();
     }
-#include "TransactionQueuePrefixSourceProof.inc"
+    auto retainedPrefixProof = [&](Value complete, ArrayRef<uint64_t> excluded,
+                                   uint64_t end,
+                                   Operation *site) -> LogicalResult {
+      if (end >= record.prefixes.size() || end > preparation.controls.size())
+        return failure();
+      if (excluded.empty())
+        return complete == record.prefixes[end]
+                   ? success()
+                   : reject("original resource complete prefix differs");
+      uint64_t first = excluded.front();
+      if (first >= end)
+        return failure();
+      Value cursor = complete;
+      for (uint64_t index = end; index > first; --index) {
+        uint64_t control = index - 1;
+        if (!charge(budget, site))
+          return failure();
+        if (llvm::is_contained(excluded, control))
+          continue;
+        const auto &scheduled = preparation.controls[control];
+        auto sourcePath =
+            scheduled.source ? plan.controls[*scheduled.source].path
+            : scheduled.requirement
+                ? preparation.requirements[*scheduled.requirement].point.path
+                : detail::resourcePoint(
+                      plan, preparation.resources[*scheduled.resource])
+                      .path;
+        auto projected = sampledPath(plan, sourcePath, budget);
+        while (succeeded(projected) && !projected->empty()) {
+          uint64_t source = projected->getAs<IntegerAttr>("selection").getInt();
+          if (llvm::is_contained(excluded, preparation.sourceControls[source]))
+            return reject(
+                "original queue bypass references an omitted selector");
+          projected = sampledPath(plan, plan.controls[source].path, budget);
+        }
+        if (failed(projected))
+          return failure();
+        auto joined = cursor.getDefiningOp<ac::BitsBinaryOp>();
+        if (!joined || joined.getOpcode() != "and" ||
+            joined.getRhs() != record.controls[control].bypass ||
+            failed(binaryProof(cursor, joined.getLhs(),
+                               record.controls[control].bypass, "and",
+                               site->getLoc())))
+          return reject("original queue retained bypass differs");
+        cursor = joined.getLhs();
+      }
+      if (cursor != record.prefixes[first])
+        return reject("original queue retained prefix has a foreign entry");
+      return success();
+    };
 #include "TransactionMemoryPrefixSourceProof.inc"
+#include "TransactionQueuePrefixSourceProof.inc"
     if (yield->getOperand(preparation.fireResult) != prefix)
       return reject("original final admission prefix differs");
     auto effectPathProof =
@@ -7964,7 +9316,8 @@ private:
     };
     for (OpOperand &use : rule->getResult(preparation.fireResult).getUses())
       if (!availabilityUses.contains(&use))
-        return reject("original internal fire result escapes availability routing");
+        return reject(
+            "original internal fire result escapes availability routing");
     if (llvm::count(originalWriters, true) != preparation.outputs.size())
       return reject("original potential-writer candidate inventory differs");
     for (const auto &output : preparation.outputs) {
@@ -7995,7 +9348,8 @@ private:
           return reject("original observation payload yield differs");
     }
     for (auto [id, check] : llvm::enumerate(plan.bodyChecks)) {
-      uint64_t result = preparation.checkBase + 2 * (preparation.controls.size() + id);
+      uint64_t result =
+          preparation.checkBase + 2 * (preparation.controls.size() + id);
       if (yield->getOperand(result) != sourceChecks[id].first ||
           failed(effectPathProof(yield->getOperand(result + 1),
                                  check.point.path)) ||
@@ -8042,25 +9396,38 @@ private:
     auto ownerIdentity = [&](ac::InvocationFrameId frame) {
       return plan.frames[frame].parent
                  ? plan.frames[frame].receiver
-                 : b.getDictionaryAttr(
-                       {b.getNamedAttr("instance_path", plan.registrationPath)});
+                 : b.getDictionaryAttr({b.getNamedAttr("instance_path",
+                                                       plan.registrationPath)});
     };
-    auto runtimeMetadataPath = [&](ac::TransactionSourcePath source) -> FailureOr<DictionaryAttr> {
+    auto runtimeMetadataPath =
+        [&](ac::TransactionSourcePath source) -> FailureOr<DictionaryAttr> {
       auto path = sampledPath(plan, source, budget);
-      if (failed(path) || path->empty()) return path;
+      if (failed(path) || path->empty())
+        return path;
       NamedAttrList mapped(*path);
       uint64_t index = path->getAs<IntegerAttr>("selection").getInt();
-      mapped.set("selection", b.getI64IntegerAttr(preparation.sourceControls[index]));
+      mapped.set("selection",
+                 b.getI64IntegerAttr(preparation.sourceControls[index]));
       return mapped.getDictionary(b.getContext());
     };
     Operation *lastTerminal = rule.operator->();
     for (auto [ordinal, scheduled] : llvm::enumerate(preparation.controls)) {
-      const auto *control = scheduled.source ? &plan.controls[*scheduled.source] : nullptr;
-      const auto *requirement = scheduled.requirement
-          ? &preparation.requirements[*scheduled.requirement] : nullptr;
-      const auto *resource = scheduled.resource ? &preparation.resources[*scheduled.resource] : nullptr;
-      auto sourcePath = control ? control->path : requirement ? requirement->point.path
-          : detail::resourcePoint(plan, *resource).path;
+      // Guard terminal identity and domain wiring are control-local. Preserve
+      // lastTerminal across scopes to authenticate global terminal order.
+      SourceCheckBudget::LocalScope guardTerminalBudget(budget);
+      const auto *control =
+          scheduled.source ? &plan.controls[*scheduled.source] : nullptr;
+      const auto *requirement =
+          scheduled.requirement
+              ? &preparation.requirements[*scheduled.requirement]
+              : nullptr;
+      const auto *resource = scheduled.resource
+                                 ? &preparation.resources[*scheduled.resource]
+                                 : nullptr;
+      auto sourcePath = control ? control->path
+                        : requirement
+                            ? requirement->point.path
+                            : detail::resourcePoint(plan, *resource).path;
       ac::InvocationFrameId frame;
       DictionaryAttr occurrence, location;
       StringRef kind;
@@ -8074,8 +9441,8 @@ private:
         occurrence = requirement->occurrence;
         location = requirement->location;
         kind = "value_available";
-      } else if (auto *tag =
-              std::get_if<ac::CallableGuardControl>(&control->boundary)) {
+      } else if (auto *tag = std::get_if<ac::CallableGuardControl>(
+                     &control->boundary)) {
         const auto &guard = plan.guards[tag->guard];
         frame = guard.frame;
         location = guard.location;
@@ -8111,11 +9478,13 @@ private:
       if (failed(invocation))
         return failure();
       auto path = sampledPath(plan, sourcePath, budget);
-      if (failed(path)) return failure();
+      if (failed(path))
+        return failure();
       if (!path->empty()) {
         NamedAttrList mapped(*path);
         uint64_t source = path->getAs<IntegerAttr>("selection").getInt();
-        mapped.set("selection", b.getI64IntegerAttr(preparation.sourceControls[source]));
+        mapped.set("selection",
+                   b.getI64IntegerAttr(preparation.sourceControls[source]));
         path = mapped.getDictionary(b.getContext());
       }
       auto expectedGuard = b.getDictionaryAttr(
@@ -8127,56 +9496,56 @@ private:
                           b.getI64IntegerAttr(int64_t(ordinal) - 1))});
       if (guardRows[ordinal] != expectedGuard)
         return reject("original guard admission metadata differs");
-      unsigned matches = 0;
-      for (auto expect :
-           module.getBody().front().getOps<ac::SourceExpectOp>()) {
-        if (!charge(budget, expect, 8))
-          return failure();
-        if (expect->getAttr("ac.check_id") != check.get("id"))
-          continue;
-        ++matches;
-        if (expect.getKind() != "guard_known" ||
-            expect->getAttr("location") != location ||
-            expect->getNumOperands() != 4 ||
-            expect->getOperand(0) !=
-                rule->getResult(preparation.checkBase + 2 * ordinal) ||
-            expect->getOperand(1) !=
-                rule->getResult(preparation.checkBase + 2 * ordinal + 1) ||
-            expect->getOperand(2) !=
-                rule->getOperand(preparation.clockCapture) ||
-            expect->getOperand(3) !=
-                rule->getOperand(preparation.resetCapture) ||
-            !lastTerminal->isBeforeInBlock(expect))
-          return reject("original guard expect span/suffix/domain differs");
-        if (failed(generatedProof(
-                expect, ac::SourceExpectOp::getOperationName(),
-                {rule->getResult(preparation.checkBase + 2 * ordinal),
-                 rule->getResult(preparation.checkBase + 2 * ordinal + 1),
-                 rule->getOperand(preparation.clockCapture),
-                 rule->getOperand(preparation.resetCapture)},
-                {},
-                b.getDictionaryAttr(
-                    {b.getNamedAttr("kind", b.getStringAttr("guard_known")),
-                     b.getNamedAttr("location", location),
-                     b.getNamedAttr("ac.check_id", check.get("id"))}),
-                transaction.getLoc(), &module.getBody().front())))
-          return failure();
-        if (record.controls[ordinal].terminal != expect)
-          return reject("original control terminal locator differs");
-        lastTerminal = expect;
-      }
-      if (matches != 1)
+      if (!charge(budget, transaction, 4))
+        return failure();
+      auto indexed =
+          candidateChecks.find({module.operator->(), check.get("id")});
+      if (indexed == candidateChecks.end() || indexed->second.count != 1)
         return reject("original guard expect inventory differs");
+      auto expect = cast<ac::SourceExpectOp>(indexed->second.operation);
+      if (expect.getKind() != "guard_known" ||
+          expect->getAttr("location") != location ||
+          expect->getNumOperands() != 4 ||
+          expect->getOperand(0) !=
+              rule->getResult(preparation.checkBase + 2 * ordinal) ||
+          expect->getOperand(1) !=
+              rule->getResult(preparation.checkBase + 2 * ordinal + 1) ||
+          expect->getOperand(2) != rule->getOperand(preparation.clockCapture) ||
+          expect->getOperand(3) != rule->getOperand(preparation.resetCapture) ||
+          !lastTerminal->isBeforeInBlock(expect))
+        return reject("original guard expect span/suffix/domain differs");
+      if (failed(generatedProof(
+              expect, ac::SourceExpectOp::getOperationName(),
+              {rule->getResult(preparation.checkBase + 2 * ordinal),
+               rule->getResult(preparation.checkBase + 2 * ordinal + 1),
+               rule->getOperand(preparation.clockCapture),
+               rule->getOperand(preparation.resetCapture)},
+              {},
+              b.getDictionaryAttr(
+                  {b.getNamedAttr("kind", b.getStringAttr("guard_known")),
+                   b.getNamedAttr("location", location),
+                   b.getNamedAttr("ac.check_id", check.get("id"))}),
+              transaction.getLoc(), &module.getBody().front())))
+        return failure();
+      if (record.controls[ordinal].terminal != expect)
+        return reject("original control terminal locator differs");
+      lastTerminal = expect;
     }
     for (const auto &event : plan.events) {
+      // Each sampled effect terminal has an independent frozen identity and
+      // source point. Keep lastTerminal and candidate coverage global so
+      // ordering/completeness remain authenticated, while bounding one effect
+      // proof at a time.
+      SourceCheckBudget::LocalScope effectBudget(budget);
       if (event.kind == ac::TransactionStateEventKind::BodyCheck) {
-        auto id = *event.bodyCheck;
+        auto id = *event.record;
         const auto &source = plan.bodyChecks[id];
         auto identity = b.getDictionaryAttr(
             {b.getNamedAttr("registration", routedOccurrence(plan)),
              b.getNamedAttr("check", source.occurrence),
-             b.getNamedAttr("obligation",
-                            b.getI64IntegerAttr(preparation.controls.size() + id))});
+             b.getNamedAttr(
+                 "obligation",
+                 b.getI64IntegerAttr(preparation.controls.size() + id))});
         auto bodyRows =
             preparation.expectedAdmission.getAs<ArrayAttr>("body_checks");
         auto invocation = invocationIdentity(source.frame);
@@ -8190,7 +9559,8 @@ private:
                                  b.getNamedAttr("invocation", *invocation),
                                  b.getNamedAttr("path", *path)}))
           return reject("original body-check admission metadata differs");
-        if (preparation.expectedRequiredChecks[preparation.controls.size() + id] !=
+        if (preparation
+                .expectedRequiredChecks[preparation.controls.size() + id] !=
             b.getDictionaryAttr(
                 {b.getNamedAttr("id", identity),
                  b.getNamedAttr("kind", b.getStringAttr("assert")),
@@ -8198,40 +9568,35 @@ private:
           return reject("original body-check required metadata differs");
         uint64_t result =
             preparation.checkBase + 2 * (preparation.controls.size() + id);
-        ac::SourceExpectOp found;
-        unsigned matches = 0;
-        for (auto expect :
-             module.getBody().front().getOps<ac::SourceExpectOp>()) {
-          if (!charge(budget, expect, 8))
-            return failure();
-          if (expect->getAttr("ac.check_id") != identity)
-            continue;
-          ++matches;
-          found = expect;
-          NamedAttrList attrs;
-          attrs.append("kind", b.getStringAttr("assert"));
-          attrs.append("location", source.location);
-          attrs.append("ac.check_id", identity);
-          if (source.message)
-            attrs.append("ac.message", source.message);
-          if (expect.getKind() != "assert" || !expect.getSampling().empty() ||
-              expect->getNumOperands() != 2 ||
-              expect.getCondition() != rule->getResult(result) ||
-              expect.getPath() != rule->getResult(result + 1) ||
-              !lastTerminal->isBeforeInBlock(expect))
-            return reject("original body-check terminal shape/order differs");
-          if (failed(generatedProof(
-                  expect, ac::SourceExpectOp::getOperationName(),
-                  {rule->getResult(result), rule->getResult(result + 1)}, {},
-                  attrs.getDictionary(transaction.getContext()),
-                  source.operation->getLoc(), &module.getBody().front())))
-            return failure();
-          lastTerminal = expect;
-        }
-        if (matches != 1 || record.bodyChecks[id] != found)
+        if (!charge(budget, transaction, 4))
+          return failure();
+        auto indexed = candidateChecks.find({module.operator->(), identity});
+        if (indexed == candidateChecks.end() || indexed->second.count != 1)
+          return reject("original body-check terminal inventory differs");
+        auto found = cast<ac::SourceExpectOp>(indexed->second.operation);
+        NamedAttrList attrs;
+        attrs.append("kind", b.getStringAttr("assert"));
+        attrs.append("location", source.location);
+        attrs.append("ac.check_id", identity);
+        if (source.message)
+          attrs.append("ac.message", source.message);
+        if (found.getKind() != "assert" || !found.getSampling().empty() ||
+            found->getNumOperands() != 2 ||
+            found.getCondition() != rule->getResult(result) ||
+            found.getPath() != rule->getResult(result + 1) ||
+            !lastTerminal->isBeforeInBlock(found))
+          return reject("original body-check terminal shape/order differs");
+        if (failed(generatedProof(
+                found, ac::SourceExpectOp::getOperationName(),
+                {rule->getResult(result), rule->getResult(result + 1)}, {},
+                attrs.getDictionary(transaction.getContext()),
+                source.operation->getLoc(), &module.getBody().front())))
+          return failure();
+        lastTerminal = found;
+        if (record.bodyChecks[id] != found)
           return reject("original body-check terminal inventory differs");
       } else if (event.kind == ac::TransactionStateEventKind::Observe) {
-        auto id = *event.observation;
+        auto id = *event.record;
         const auto &source = plan.observations[id];
         auto invocation = invocationIdentity(source.frame);
         if (failed(invocation))
@@ -8262,34 +9627,30 @@ private:
         SmallVector<Value> operands{rule->getResult(pathResult)};
         for (uint64_t ordinal = 0; ordinal < source.values.size(); ++ordinal)
           operands.push_back(rule->getResult(pathResult + 1 + ordinal));
-        ac::SourceObserveOp found;
-        unsigned matches = 0;
-        for (auto observe :
-             module.getBody().front().getOps<ac::SourceObserveOp>()) {
-          if (!charge(budget, observe, 8))
-            return failure();
-          if (observe->getAttr("ac.observation_id") != identity)
-            continue;
-          ++matches;
-          found = observe;
-          if (observe.getKindAttr() != source.kind ||
-              observe.getSpec() != source.spec ||
-              observe->getAttr("ac.location") != source.location ||
-              !lastTerminal->isBeforeInBlock(observe))
-            return reject("original observation terminal shape/order differs");
-          if (failed(generatedProof(
-                  observe, ac::SourceObserveOp::getOperationName(), operands,
-                  {},
-                  b.getDictionaryAttr(
-                      {b.getNamedAttr("kind", source.kind),
-                       b.getNamedAttr("spec", source.spec),
-                       b.getNamedAttr("ac.location", source.location),
-                       b.getNamedAttr("ac.observation_id", identity)}),
-                  source.operation->getLoc(), &module.getBody().front())))
-            return failure();
-          lastTerminal = observe;
-        }
-        if (matches != 1 || record.observations[id] != found)
+        if (!charge(budget, transaction, 4))
+          return failure();
+        auto indexed =
+            candidateObservations.find({module.operator->(), identity});
+        if (indexed == candidateObservations.end() ||
+            indexed->second.count != 1)
+          return reject("original observation terminal inventory differs");
+        auto found = cast<ac::SourceObserveOp>(indexed->second.operation);
+        if (found.getKindAttr() != source.kind ||
+            found.getSpec() != source.spec ||
+            found->getAttr("ac.location") != source.location ||
+            !lastTerminal->isBeforeInBlock(found))
+          return reject("original observation terminal shape/order differs");
+        if (failed(generatedProof(
+                found, ac::SourceObserveOp::getOperationName(), operands, {},
+                b.getDictionaryAttr(
+                    {b.getNamedAttr("kind", source.kind),
+                     b.getNamedAttr("spec", source.spec),
+                     b.getNamedAttr("ac.location", source.location),
+                     b.getNamedAttr("ac.observation_id", identity)}),
+                source.operation->getLoc(), &module.getBody().front())))
+          return failure();
+        lastTerminal = found;
+        if (record.observations[id] != found)
           return reject("original observation terminal inventory differs");
       }
     }
@@ -8302,6 +9663,11 @@ private:
   ac::HardwareAnalysis hardware;
   ac::SourceReceiverProofContext receiverProof;
   BranchTypeAdmissionCache branchTypes;
+  CandidateTerminalIndex candidateChecks;
+  CandidateTerminalIndex candidateObservations;
+  DenseMap<Operation *, DenseMap<StringAttr, Operation *>>
+      sourceStateDeclarations;
+  DenseMap<Operation *, bool> sourceBranchEffects;
   // Node-stable storage keeps simultaneous ArrayRef results valid when another
   // transaction's independent closure is first queried.
   DenseSet<Operation *> operations, clones;
@@ -8313,7 +9679,7 @@ private:
 } // namespace
 
 namespace detail {
-FailureOr<PreparedTransactionLowering>
+FailureOr<FrozenRoutingFacts>
 prepareTransactionLowering(mlir::ModuleOp original,
                            const ac::SourceTransactionStateAnalysis &analysis,
                            SourceCheckBudget &budget) {
@@ -8324,43 +9690,89 @@ prepareTransactionLowering(mlir::ModuleOp original,
   LoweringPreparation builder(original, analysis, budget);
   if (failed(builder.run()))
     return failure();
-  return std::move(static_cast<PreparedTransactionLowering &>(builder));
+  return FrozenRoutingFacts(
+      std::move(static_cast<PreparedTransactionLowering &>(builder)));
 }
 
 FailureOr<MaterializedTransactionLowering>
-materializeTransactionLowering(PreparedTransactionLowering &prepared,
+materializeTransactionLowering(const FrozenRoutingFacts &frozen,
                                SourceCheckBudget &budget) {
-  budget.setPhase("transaction clone/materialization");
-  if (failed(verifyPreparedEffectInventory(prepared, budget)) ||
-      !charge(budget, prepared.original,
-              SourceCheckBudget::multiply(
-                  prepared.transactions.size(),
-                  SourceCheckBudget::bytes(sizeof(MaterializedTransaction)))))
+  if (!frozen)
     return failure();
+  const auto &prepared = frozen.facts();
+  budget.setPhase("transaction clone/materialization: clone");
+  {
+    SourceCheckBudget::LocalScope cloneBudget(budget);
+    if (failed(prepayClone(prepared.original, budget)))
+      return failure();
+  }
+  budget.setPhase("transaction clone/materialization: effect inventory");
+  {
+    SourceCheckBudget::LocalScope inventoryBudget(budget);
+    if (failed(verifyPreparedEffectInventory(prepared, budget)) ||
+        !charge(budget, prepared.original,
+                SourceCheckBudget::multiply(
+                    prepared.transactions.size(),
+                    SourceCheckBudget::bytes(sizeof(MaterializedTransaction)))))
+      return failure();
+  }
   MaterializedTransactionLowering result;
+  result.routingFacts = frozen.sharedFacts();
   result.module =
       cast<mlir::ModuleOp>(prepared.original->clone(result.packageMap));
-  if (failed(materialize(prepared, *result.module, result.packageMap,
-                         result.transactions, result.incomingCommits, budget)))
-    return failure();
-  if (failed(QueuePinMaterializer(prepared, result, budget).run())) return failure();
-  if (failed(MemoryPinMaterializer(prepared, result, budget).run())) return failure();
-  if (failed(materializeTransactionValueAvailability(prepared, result, budget)))
-    return failure();
+  budget.setPhase("transaction clone/materialization: transactions/routes");
+  {
+    SourceCheckBudget::LocalScope transactionBudget(budget);
+    if (failed(materialize(prepared, *result.module, result.packageMap,
+                           result.transactions, result.incomingCommits,
+                           result.memoryReadInstances,
+                           budget)))
+      return failure();
+  }
+  budget.setPhase("transaction clone/materialization: queue pins");
+  {
+    SourceCheckBudget::LocalScope queueBudget(budget);
+    if (failed(QueuePinMaterializer(prepared, result, budget).run()))
+      return failure();
+  }
+  budget.setPhase("transaction clone/materialization: memory pins");
+  {
+    SourceCheckBudget::LocalScope memoryBudget(budget);
+    if (failed(MemoryPinMaterializer(prepared, result, budget).run()))
+      return failure();
+  }
+  budget.setPhase("transaction clone/materialization: availability");
+  {
+    SourceCheckBudget::LocalScope availabilityBudget(budget);
+    if (failed(
+            materializeTransactionValueAvailability(prepared, result, budget)))
+      return failure();
+  }
   return std::move(result);
 }
 
 LogicalResult verifyTransactionMaterialization(
-    const PreparedTransactionLowering &prepared,
-    const MaterializedTransactionLowering &candidate,
-    SourceCheckBudget &budget) {
+    const FrozenRoutingFacts &frozen,
+    const MaterializedTransactionLowering &candidate, SourceCheckBudget &budget,
+    acir::metrics::CompilerPhaseMetrics *metrics) {
   budget.setPhase("transaction original-source proof");
-  if (failed(verifyPreparedEffectInventory(prepared, budget)) ||
-      !candidate.module ||
+  if (!frozen)
+    return failure();
+  const auto &prepared = frozen.facts();
+  if (candidate.routingFacts != frozen.sharedFacts())
+    return prepared.original->emitError()
+           << "transaction candidate was generated from different frozen "
+              "routing facts";
+  {
+    SourceCheckBudget::LocalScope inventoryBudget(budget);
+    if (failed(verifyPreparedEffectInventory(prepared, budget)))
+      return failure();
+  }
+  if (!candidate.module ||
       failed(OriginalSourceProof(prepared, candidate, budget).run()))
     return failure();
   // Standalone legality supplements, never replaces, original-source proof.
-  return ac::verifyRoutedPackage(*candidate.module);
+  return ac::verifyRoutedPackage(*candidate.module, {}, metrics);
 }
 } // namespace detail
 
@@ -8374,23 +9786,24 @@ bool isControlLiteralOne(Value value) {
   if (tree.getAs<StringAttr>("kind").getValue() != "literal")
     return false;
   auto attribute = tree.getAs<DictionaryAttr>("value");
-  auto integer = attribute ? attribute.getAs<ac::MathIntAttr>("value")
-                           : ac::MathIntAttr();
+  auto integer =
+      attribute ? attribute.getAs<ac::MathIntAttr>("value") : ac::MathIntAttr();
   return integer && llvm::APSInt(integer.getCanonicalValue()) == 1;
 }
 
-LogicalResult collectControlFolds(const PreparedTransactionLowering &prepared,
-                                  const MaterializedTransactionLowering &candidate,
-                                  SmallVectorImpl<Operation *> &folds,
-                                  SourceCheckBudget &budget) {
+LogicalResult
+collectControlFolds(const PreparedTransactionLowering &prepared,
+                    const MaterializedTransactionLowering &candidate,
+                    SmallVectorImpl<Operation *> &folds,
+                    SourceCheckBudget &budget) {
   auto append = [&](Operation *op) -> LogicalResult {
     if (!prepayAppend(budget, op, folds))
       return failure();
     folds.push_back(op);
     return success();
   };
-  for (auto [source, routed] : llvm::zip_equal(prepared.transactions,
-                                             candidate.transactions)) {
+  for (auto [source, routed] :
+       llvm::zip_equal(prepared.transactions, candidate.transactions)) {
     auto rule = routed.rule;
     auto yield = cast<ac::YieldOp>(rule.getBody().front().getTerminator());
     for (const auto &proposal : source.queueProposals) {
@@ -8484,19 +9897,32 @@ class RouteTransactionsPass
     : public PassWrapper<RouteTransactionsPass, OperationPass<mlir::ModuleOp>> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RouteTransactionsPass)
+  RouteTransactionsPass() = default;
+  explicit RouteTransactionsPass(TransactionRoutingMetrics metrics)
+      : metrics(metrics) {}
+  RouteTransactionsPass(const RouteTransactionsPass &other)
+      : PassWrapper(other), metrics(other.metrics) {}
   void getDependentDialects(DialectRegistry &registry) const override {
     // Routing constructs the GFIR replacement of every source state.
     registry.insert<ac::ACIRDialect, acir::gfir::GFIRDialect>();
   }
   StringRef getArgument() const final { return "ac-route-transactions"; }
   StringRef getDescription() const final {
-    return "Route sampled transactions to independently verified logical-state ACIR";
+    return "Route sampled transactions to independently verified logical-state "
+           "ACIR";
   }
   void runOnOperation() final {
     auto input = getOperation();
     if (auto stage = input->getAttrOfType<StringAttr>("ac.stage");
         stage && stage.getValue() == "routed") {
-      if (failed(ac::verifyRoutedPackage(input))) signalPassFailure();
+      if (failed(ac::verifyRoutedPackage(input, {}, metrics.proof))) {
+        signalPassFailure();
+        return;
+      }
+      if (metrics.routing)
+        metrics.routing->status = "complete";
+      if (metrics.proof)
+        metrics.proof->status = "complete";
       return;
     }
     if (!ac::detail::findUnloweredTransaction(input)) {
@@ -8507,19 +9933,34 @@ public:
       // complete ordinary external declaration without executable hardware.
       ac::HardwareSourceCheckLimits graphLimits;
       SourceCheckBudget graphBudget(graphLimits);
-      if (failed(mergedEnvelope(input)) || failed(prepayClone(input, graphBudget))) {
+      graphBudget.setMetrics(metrics.routing);
+      if (failed(mergedEnvelope(input)) ||
+          failed(prepayClone(input, graphBudget))) {
         signalPassFailure();
         return;
       }
       OwningOpRef<mlir::ModuleOp> staged = cast<mlir::ModuleOp>(input->clone());
       Builder attributes(input.getContext());
       (*staged)->setAttr("ac.stage", attributes.getStringAttr("routed"));
-      (*staged)->setAttr("ac.routed_contract", attributes.getI64IntegerAttr(llvm::any_of(staged->getOps<ac::SystemOp>(), [](ac::SystemOp system) { return system->hasAttr("ac.entry_boundary"); }) ? 5 : 4));
-      if (failed(ac::verifyRoutedPackage(*staged, graphLimits))) {
+      (*staged)->setAttr("ac.routed_contract",
+                         attributes.getI64IntegerAttr(
+                             llvm::any_of(staged->getOps<ac::SystemOp>(),
+                                          [](ac::SystemOp system) {
+                                            return system->hasAttr(
+                                                "ac.entry_boundary");
+                                          })
+                                 ? 5
+                                 : 4));
+      if (failed(
+              ac::verifyRoutedPackage(*staged, graphLimits, metrics.proof))) {
         signalPassFailure();
         return;
       }
       acceptTransactionCandidate(input, *staged);
+      if (metrics.routing)
+        metrics.routing->status = "complete";
+      if (metrics.proof)
+        metrics.proof->status = "complete";
       return;
     }
     const auto &analysis = getAnalysis<ac::SourceTransactionStateAnalysis>();
@@ -8529,21 +9970,60 @@ public:
     }
     ac::HardwareSourceCheckLimits limits;
     limits.maxWorkUnits = 1024 * 1024;
-    SourceCheckBudget budget(limits);
-    auto prepared = detail::prepareTransactionLowering(input, analysis, budget);
-    if (failed(prepared)) { signalPassFailure(); return; }
+    SourceCheckBudget preparationBudget(limits);
+    preparationBudget.setMetrics(metrics.routing);
+    auto prepared =
+        detail::prepareTransactionLowering(input, analysis, preparationBudget);
+    if (failed(prepared)) {
+      signalPassFailure();
+      return;
+    }
+    if (metrics.routing) {
+      metrics.routing->definitions = prepared->facts().definitions.size();
+      metrics.routing->occurrences = prepared->facts().transactions.size();
+      metrics.routing->planEntries =
+          prepared->facts().definitions.size() +
+          prepared->facts().transactions.size() +
+          prepared->facts().states.size() + prepared->facts().queues.size() +
+          prepared->facts().transactionSchedule.size();
+      metrics.routing->planBytes =
+          sizeof(detail::PreparedTransactionLowering) +
+          prepared->facts().definitions.capacity() *
+              sizeof(detail::DefinitionRouting) +
+          prepared->facts().transactions.capacity() *
+              sizeof(detail::TransactionPreparation) +
+          prepared->facts().states.capacity() * sizeof(ac::SourceStateOp) +
+          prepared->facts().queues.capacity() * sizeof(ac::InstanceOp) +
+          prepared->facts().transactionSchedule.capacity() * sizeof(uint64_t) +
+          prepared->facts().definitionIndex.getMemorySize();
+      for (const auto &transaction : prepared->facts().transactions)
+        if (transaction.plan) {
+          metrics.routing->calls += transaction.plan->calls.size();
+          metrics.routing->instances += transaction.plan->instances.size();
+        }
+    }
     OwningOpRef<mlir::ModuleOp> routed;
     SmallVector<Operation *, 0> folds;
     SourceCheckBudget simplificationBudget(limits);
+    simplificationBudget.setMetrics(metrics.routing);
     {
-      auto candidate = detail::materializeTransactionLowering(*prepared, budget);
-      if (failed(candidate) || failed(detail::verifyTransactionMaterialization(
-                                   *prepared, *candidate, budget))) {
+      SourceCheckBudget materializationBudget(limits);
+      materializationBudget.setMetrics(metrics.routing);
+      auto candidate = detail::materializeTransactionLowering(
+          *prepared, materializationBudget);
+      if (failed(candidate)) {
+        signalPassFailure();
+        return;
+      }
+      SourceCheckBudget proofBudget(limits);
+      proofBudget.setMetrics(metrics.proof);
+      if (failed(detail::verifyTransactionMaterialization(
+              *prepared, *candidate, proofBudget, metrics.proof))) {
         signalPassFailure();
         return;
       }
       simplificationBudget.setPhase("routed control simplification");
-      if (failed(collectControlFolds(*prepared, *candidate, folds,
+      if (failed(collectControlFolds(prepared->facts(), *candidate, folds,
                                      simplificationBudget))) {
         signalPassFailure();
         return;
@@ -8551,20 +10031,30 @@ public:
       routed = std::move(candidate->module);
     }
     // End the original-source proof and release its locators before any SSA
-    // replacement. The compact graph must stand on its own at the GFIR boundary.
+    // replacement. The compact graph must stand on its own at the GFIR
+    // boundary.
     auto changed = simplifyRoutedControls(folds, simplificationBudget);
-    if (failed(changed) || (*changed && failed(ac::verifyRoutedPackage(*routed)))) {
+    if (failed(changed) || (*changed && failed(ac::verifyRoutedPackage(
+                                            *routed, {}, metrics.proof)))) {
       signalPassFailure();
       return;
     }
     acceptTransactionCandidate(input, *routed);
+    if (metrics.routing)
+      metrics.routing->status = "complete";
+    if (metrics.proof)
+      metrics.proof->status = "complete";
   }
+
+private:
+  TransactionRoutingMetrics metrics;
 };
 
 } // namespace
 
-std::unique_ptr<Pass> createRouteTransactionsPass() {
-  return std::make_unique<RouteTransactionsPass>();
+std::unique_ptr<Pass>
+createRouteTransactionsPass(TransactionRoutingMetrics metrics) {
+  return std::make_unique<RouteTransactionsPass>(metrics);
 }
 
 } // namespace acir

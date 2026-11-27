@@ -99,4 +99,11 @@
         auto consumed = consume(*actual, 0);
         if (failed(consumed)) return failure();
         if (!expected.empty())
-          return module->emitOpError() << "Memory physical pin differs from complete actual proposals";
+          return module->emitOpError()
+                 << "Memory physical pin differs from complete actual "
+                    "proposals for operand "
+                 << pin << "; matched " << consumed->size() << ", missing "
+                 << expected.size() << "; first missing path "
+                 << expected.front().proposal->proposal->path
+                 << ", occurrence "
+                 << expected.front().proposal->proposal->occurrence;

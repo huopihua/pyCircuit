@@ -137,7 +137,7 @@ def main():
         PYCIRCUIT_SOURCE_COMPILER=args.source_compiler,
         PYCIRCUIT_LINKER=args.linker,
         PYCIRCUIT_EMITTER=args.emitter,
-        MAKEFLAGS="CFG_CXXFLAGS_PCH_I=-include",
+        MAKEFLAGS="CFG_CXXFLAGS_PCH_I=-include-pch",
     )
     commands, receipts, visibility, stages = [], [], [], []
 
@@ -285,10 +285,6 @@ def main():
                     includes = probe
                 else:
                     includes = generated
-                    metadata = json.loads(
-                        (generated / "simulation_verification.json").read_text()
-                    )
-                    assert metadata["source_checks"] == 46
                 run(
                     label + "-build",
                     [

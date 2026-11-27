@@ -6,6 +6,8 @@
 #include "mlir/IR/Location.h"
 #include "mlir/IR/Operation.h"
 #include "llvm/ADT/StringRef.h"
+#include "pycircuit/Analysis/CompilerPhaseMetrics.h"
+#include <algorithm>
 #include <bit>
 #include <limits>
 
@@ -16,6 +18,57 @@ class SourceCheckBudget {
 public:
   explicit SourceCheckBudget(HardwareSourceCheckLimits limits)
       : limit(limits.maxWorkUnits) {}
+  /// Bound one independently replayable item (for example, one frozen
+  /// transaction invocation) without charging its work again to every parent
+  /// item. The enclosing scope resumes at its prior usage; peak work and
+  /// diagnostic totals still include the nested scope.
+  class LocalScope {
+  public:
+    explicit LocalScope(SourceCheckBudget &budget)
+        : LocalScope(&budget) {}
+    explicit LocalScope(SourceCheckBudget *budget)
+        : budget(budget), parentWork(budget ? budget->used : 0) {
+      if (budget)
+        budget->used = 0;
+    }
+    ~LocalScope() {
+      if (budget)
+        budget->used = parentWork;
+    }
+    LocalScope(const LocalScope &) = delete;
+    LocalScope &operator=(const LocalScope &) = delete;
+    LocalScope(LocalScope &&) = delete;
+    LocalScope &operator=(LocalScope &&) = delete;
+
+  private:
+    SourceCheckBudget *budget;
+    uint64_t parentWork;
+  };
+  /// Temporarily refine a diagnostic/metrics phase inside a larger source
+  /// check stage. Nested semantic planners restore their caller's phase on
+  /// every exit, including failures.
+  class PhaseScope {
+  public:
+    PhaseScope(SourceCheckBudget &budget, llvm::StringRef phase)
+        : PhaseScope(&budget, phase) {}
+    PhaseScope(SourceCheckBudget *budget, llvm::StringRef phase)
+        : budget(budget), parentPhase(budget ? budget->phase : llvm::StringRef()) {
+      if (budget)
+        budget->phase = phase;
+    }
+    ~PhaseScope() {
+      if (budget)
+        budget->phase = parentPhase;
+    }
+    PhaseScope(const PhaseScope &) = delete;
+    PhaseScope &operator=(const PhaseScope &) = delete;
+    PhaseScope(PhaseScope &&) = delete;
+    PhaseScope &operator=(PhaseScope &&) = delete;
+
+  private:
+    SourceCheckBudget *budget;
+    llvm::StringRef parentPhase;
+  };
   /// Raw input accounting cannot trust locations or serialize operations.
   /// Restore the previous diagnostic mode on every exit, including nesting.
   class RawDiagnosticScope {
@@ -72,9 +125,43 @@ public:
     if (mlir::failed(admit(units, site)))
       return mlir::failure();
     used += units;
+    peak = std::max(peak, used);
+    total = add(total, units);
+    if (metrics)
+      metrics->details[("work:" + phase).str()] += units;
+    return mlir::success();
+  }
+  mlir::LogicalResult debitPersistent(uint64_t units,
+                                      mlir::Operation *site) {
+    if (units == std::numeric_limits<uint64_t>::max() ||
+        units > limit - persistent) {
+      auto error = rawDiagnostics
+                       ? mlir::emitError(
+                             mlir::UnknownLoc::get(site->getContext()))
+                       : site->emitOpError();
+      return error
+             << "source-check persistent plan storage exceeds analysis work "
+                "budget before occurrence expansion (requested "
+             << units << ", used " << persistent << ", limit " << limit
+             << ", phase " << phase << ")";
+    }
+    if (mlir::failed(debit(units, site)))
+      return mlir::failure();
+    persistent += units;
+    peak = std::max(peak, persistent);
     return mlir::success();
   }
   void setPhase(llvm::StringRef name) { phase = name; }
+  uint64_t usedWorkUnits() const { return std::max(peak, persistent); }
+  void setMetrics(acir::metrics::CompilerPhaseMetrics *value,
+                  const uint64_t *excludedWork = nullptr) {
+    metrics = value;
+    excluded = excludedWork;
+  }
+  ~SourceCheckBudget() {
+    if (metrics)
+      metrics->work += total - (excluded ? std::min(total, *excluded) : 0);
+  }
   static uint64_t bindings(const HardwareBindings &scope) {
     uint64_t size = sizeof(HardwareBindings);
     for (const auto &entry : scope.integers)
@@ -85,9 +172,11 @@ public:
   }
 
 private:
-  uint64_t limit, used = 0;
+  uint64_t limit, used = 0, peak = 0, total = 0, persistent = 0;
   llvm::StringRef phase = "initialization";
   bool rawDiagnostics = false;
+  acir::metrics::CompilerPhaseMetrics *metrics = nullptr;
+  const uint64_t *excluded = nullptr;
 };
 } // namespace acir::ac::detail
 #endif

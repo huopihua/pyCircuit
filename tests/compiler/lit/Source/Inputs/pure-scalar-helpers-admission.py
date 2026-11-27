@@ -458,6 +458,23 @@ def positive_controls():
         ("helper_zero_trip_existing_binder", "index: u8 = value\n    for index in range(0):\n        index = index + 1\n    return index"),
     ):
         controls.append({"name": name, "text": design(identity.replace("return value", body))})
+    controls.append({
+        "name": "helper_nested_literal_loops",
+        "text": design(identity.replace(
+            "return value",
+            "for outer in range(1):\n        for inner in range(1):\n            value = value + 1\n    return value",
+        )),
+        # Verify both the helper body and its call expansion retain the add.
+        "expected_source_binary_adds": 2,
+    })
+    controls.append({
+        "name": "helper_zero_trip_nested_loops",
+        "text": design(identity.replace(
+            "return value",
+            "for outer in range(0):\n        for inner in range(0):\n            pass\n    return value",
+        )),
+        "expected_source_binary_adds": 0,
+    })
     controls.extend(aggregate_fact_controls())
     # Repeated calls register distinct transactions under the current Rule
     # contract. Retain the old rejection fixture as an acceptance/count oracle.
@@ -607,7 +624,6 @@ def loop_contract_cases():
     rows = []
     identity = "def helper(value: u8) -> u8:\n    return value\n"
     for name, body in (
-        ("nested", "for outer in range(1):\n        for inner in range(1):\n            value = value + 1"),
         ("while", "while value:\n        value = value - 1"),
         ("break", "for index in range(2):\n        break"),
         ("continue", "for index in range(2):\n        continue"),
@@ -622,7 +638,6 @@ def loop_contract_cases():
         ("zero_trip_unknown_call", "for index in range(0):\n        undefined(value)"),
         ("zero_trip_return", "for index in range(0):\n        return value"),
         ("zero_trip_import", "for index in range(0):\n        import math"),
-        ("zero_trip_nested", "for index in range(0):\n        for inner in range(0):\n            pass"),
     ):
         text = design(identity.replace("return value", body + "\n    return value"))
         rows.append({"name": "helper_loop_" + name, "text": text,

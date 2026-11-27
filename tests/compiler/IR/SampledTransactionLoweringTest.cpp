@@ -33,7 +33,7 @@ namespace acir::ac {
 namespace {
 
 using ::acir::detail::MaterializedTransactionLowering;
-using ::acir::detail::PreparedTransactionLowering;
+using ::acir::detail::FrozenRoutingFacts;
 
 class SampledTransactionLoweringTest : public ::testing::Test {
 protected:
@@ -42,7 +42,7 @@ protected:
   struct StagedLowering {
     mlir::OwningOpRef<mlir::ModuleOp> original;
     std::unique_ptr<SourceTransactionStateAnalysis> analysis;
-    PreparedTransactionLowering prepared;
+    FrozenRoutingFacts prepared;
     MaterializedTransactionLowering candidate;
     std::string originalText;
     std::vector<mlir::Operation *> originalOperations;
@@ -223,7 +223,8 @@ protected:
 
   unsigned transactionIndex(const StagedLowering &staged,
                             llvm::StringRef name) {
-    for (auto [index, prepared] : llvm::enumerate(staged.prepared.transactions))
+    for (auto [index, prepared] :
+         llvm::enumerate(staged.prepared->transactions))
       if (prepared.plan->transaction->getAttrOfType<mlir::StringAttr>("name")
               .getValue() == name)
         return index;
@@ -693,7 +694,7 @@ TEST_F(SampledTransactionLoweringTest,
     expectOriginalUnchanged(*staged);
     auto index = shape == 0 ? transactionIndex(*staged, "run")
                             : transactionIndex(*staged, "watch");
-    auto &prepared = staged->prepared.transactions[index];
+    const auto &prepared = staged->prepared->transactions[index];
     auto &record = staged->candidate.transactions[index];
     EXPECT_EQ(record.rule->getAttr("ac.sampled_admission"),
               prepared.expectedAdmission);
@@ -711,7 +712,7 @@ TEST_F(SampledTransactionLoweringTest,
   EXPECT_TRUE(mlir::succeeded(verify(*staged))) << diagnostics;
   expectOriginalUnchanged(*staged);
   auto index = transactionIndex(*staged, "run");
-  const auto &prepared = staged->prepared.transactions[index];
+  const auto &prepared = staged->prepared->transactions[index];
   const auto &plan = *prepared.plan;
   auto &record = staged->candidate.transactions[index];
   ASSERT_EQ(plan.bodyChecks.size(), 3u);
@@ -809,7 +810,7 @@ TEST_F(SampledTransactionLoweringTest,
     auto staged = stage([&](mlir::ModuleOp file) { addAuthoredEffects(file); });
     ASSERT_TRUE(staged);
     auto index = transactionIndex(*staged, "run");
-    const auto &prepared = staged->prepared.transactions[index];
+    const auto &prepared = staged->prepared->transactions[index];
     auto &record = staged->candidate.transactions[index];
     ASSERT_GE(record.bodyChecks.size(), 3u);
     ASSERT_GE(record.observations.size(), 3u);
@@ -903,7 +904,7 @@ TEST_F(SampledTransactionLoweringTest,
   auto staged = stage();
   ASSERT_TRUE(staged);
   auto index = transactionIndex(*staged, "watch");
-  auto &prepared = staged->prepared.transactions[index];
+  const auto &prepared = staged->prepared->transactions[index];
   auto rule = staged->candidate.transactions[index].rule;
   auto *yield = rule.getBody().front().getTerminator();
   auto oldRaw = yield->getOperand(prepared.fireResult + 1);
@@ -930,7 +931,7 @@ TEST_F(SampledTransactionLoweringTest,
   auto staged = stage();
   ASSERT_TRUE(staged);
   auto index = transactionIndex(*staged, "watch");
-  auto &prepared = staged->prepared.transactions[index];
+  const auto &prepared = staged->prepared->transactions[index];
   auto rule = staged->candidate.transactions[index].rule;
   auto checks = rule->getAttrOfType<mlir::ArrayAttr>("ac.required_checks");
   ASSERT_EQ(checks.size(), 1u);
@@ -956,7 +957,7 @@ TEST_F(SampledTransactionLoweringTest,
   auto staged = stage();
   ASSERT_TRUE(staged);
   auto index = transactionIndex(*staged, "run");
-  auto &prepared = staged->prepared.transactions[index];
+  const auto &prepared = staged->prepared->transactions[index];
   ASSERT_FALSE(prepared.outputs.empty());
   auto rule = staged->candidate.transactions[index].rule;
   auto *yield = rule.getBody().front().getTerminator();
@@ -976,14 +977,14 @@ TEST_F(SampledTransactionLoweringTest,
 
 TEST_F(SampledTransactionLoweringTest,
        BranchDataIntentAndResultSelectionsRemainSourceAuthenticated) {
-  for (unsigned mutation = 0; mutation != 10; ++mutation) {
+  for (unsigned mutation = 0; mutation != 8; ++mutation) {
     SCOPED_TRACE(mutation);
     AuthoredBranch source;
     auto staged =
         stage([&](mlir::ModuleOp file) { source = addAuthoredBranch(file); });
     ASSERT_TRUE(staged);
     auto index = transactionIndex(*staged, "run");
-    auto &prepared = staged->prepared.transactions[index];
+    const auto &prepared = staged->prepared->transactions[index];
     const auto &plan = *prepared.plan;
     auto &record = staged->candidate.transactions[index];
     ASSERT_EQ(plan.branches.size(), 1u);
@@ -1072,15 +1073,6 @@ TEST_F(SampledTransactionLoweringTest,
         auto knownOne = record.versions[join.whenTrue].rawIntent;
         record.versions[join.result].rawIntent.replaceAllUsesWith(knownOne);
         record.versions[join.result].rawIntent = knownOne;
-      } else if (mutation == 8) {
-        prepared.outputs.erase(output);
-      } else {
-        auto replacement =
-            llvm::find_if(prepared.outputs, [&](const auto &candidate) {
-              return candidate.binding.owner != join.owner;
-            });
-        ASSERT_NE(replacement, prepared.outputs.end());
-        output->binding = replacement->binding;
       }
     }
     rejects(*staged, "");
@@ -1095,6 +1087,72 @@ TEST_F(SampledTransactionLoweringTest,
 }
 
 TEST_F(SampledTransactionLoweringTest,
+       ImmutableRoutingFactsDoNotAuthenticateForgedOutputInventory) {
+  for (unsigned mutation = 0; mutation != 2; ++mutation) {
+    SCOPED_TRACE(mutation);
+    auto staged = stage(
+        [&](mlir::ModuleOp file) { (void)addAuthoredBranch(file); });
+    ASSERT_TRUE(staged);
+    auto index = transactionIndex(*staged, "run");
+    const auto &authentic = staged->prepared->transactions[index];
+    const auto &plan = *authentic.plan;
+    ASSERT_EQ(plan.joins.size(), 1u);
+    const auto &join = plan.joins.front();
+
+    acir::detail::PreparedTransactionLowering forged =
+        staged->prepared.facts();
+    auto &outputs = forged.transactions[index].outputs;
+    auto output = llvm::find_if(outputs, [&](const auto &candidate) {
+      return candidate.binding.owner == join.owner;
+    });
+    ASSERT_NE(output, outputs.end());
+    if (mutation == 0) {
+      outputs.erase(output);
+      auto &transaction = forged.transactions[index];
+      ASSERT_TRUE(transaction.observationPathResults.empty());
+      ASSERT_TRUE(transaction.queueProposals.empty());
+      ASSERT_TRUE(transaction.memoryProposals.empty());
+      ASSERT_TRUE(transaction.writeDomains.empty());
+      for (auto [ordinal, candidate] : llvm::enumerate(outputs)) {
+        candidate.dataResult =
+            plan.transaction->getNumResults() + 2 * ordinal;
+        candidate.enableResult = candidate.dataResult + 1;
+      }
+      transaction.fireResult =
+          plan.transaction->getNumResults() + 2 * outputs.size();
+      transaction.checkBase = transaction.fireResult + 1;
+      transaction.totalResults =
+          transaction.checkBase +
+          2 * (transaction.controls.size() + plan.bodyChecks.size());
+      mlir::NamedAttrList admission(transaction.expectedAdmission);
+      admission.set("fire_result",
+                    builder.getI64IntegerAttr(transaction.fireResult));
+      transaction.expectedAdmission = admission.getDictionary(&context);
+    } else {
+      auto replacement = llvm::find_if(outputs, [&](const auto &candidate) {
+        return candidate.binding.owner != join.owner;
+      });
+      ASSERT_NE(replacement, outputs.end());
+      output->binding = replacement->binding;
+    }
+    FrozenRoutingFacts forgedFacts(std::move(forged));
+    staged->candidate.routingFacts = forgedFacts.sharedFacts();
+
+    HardwareSourceCheckLimits limits;
+    limits.maxWorkUnits = workLimit;
+    detail::SourceCheckBudget budget(limits);
+    EXPECT_TRUE(mlir::failed(capture([&] {
+      return acir::detail::verifyTransactionMaterialization(
+          forgedFacts, staged->candidate, budget);
+    })));
+    EXPECT_NE(diagnostics.find("transaction original-source proof failed"),
+              std::string::npos)
+        << diagnostics;
+    expectOriginalUnchanged(*staged);
+  }
+}
+
+TEST_F(SampledTransactionLoweringTest,
        ConditionalControlAndEffectPathsUseDedicatedSlotsAndExactFire) {
   auto staged =
       stage([&](mlir::ModuleOp file) { addConditionalArmEffects(file); });
@@ -1102,7 +1160,7 @@ TEST_F(SampledTransactionLoweringTest,
   EXPECT_TRUE(mlir::succeeded(verify(*staged))) << diagnostics;
   expectOriginalUnchanged(*staged);
   auto index = transactionIndex(*staged, "run");
-  const auto &prepared = staged->prepared.transactions[index];
+  const auto &prepared = staged->prepared->transactions[index];
   const auto &plan = *prepared.plan;
   auto &record = staged->candidate.transactions[index];
   ASSERT_EQ(plan.selections.size(), 1u);
@@ -1164,7 +1222,7 @@ TEST_F(SampledTransactionLoweringTest,
     ASSERT_TRUE(staged);
     auto index = transactionIndex(*staged, "run");
     auto &plan = const_cast<TransactionStatePlan &>(
-        *staged->prepared.transactions[index].plan);
+        *staged->prepared->transactions[index].plan);
     ASSERT_EQ(plan.branches.size(), 1u);
     ASSERT_EQ(plan.selections.size(), 1u);
     auto conditional = llvm::find_if(plan.calls, [&](const auto &call) {
@@ -1207,7 +1265,7 @@ TEST_F(SampledTransactionLoweringTest,
     if (mutation == 12) {
       auto event = llvm::find_if(plan.events, [&](const auto &event) {
         return event.kind == TransactionStateEventKind::CallExit &&
-               event.call && &plan.calls[*event.call] == &*conditional;
+               event.record && &plan.calls[*event.record] == &*conditional;
       });
       ASSERT_NE(event, plan.events.end());
       event->point.path = {};
@@ -1293,7 +1351,7 @@ TEST_F(SampledTransactionLoweringTest,
     auto staged = stage();
     ASSERT_TRUE(staged);
     auto index = transactionIndex(*staged, "run");
-    const auto &plan = *staged->prepared.transactions[index].plan;
+    const auto &plan = *staged->prepared->transactions[index].plan;
     auto &record = staged->candidate.transactions[index];
     InvocationFrameId frame;
     BoundValueId id;
@@ -1341,7 +1399,7 @@ TEST_F(SampledTransactionLoweringTest,
     });
     ASSERT_TRUE(staged);
     auto index = transactionIndex(*staged, "run");
-    const auto &plan = *staged->prepared.transactions[index].plan;
+    const auto &plan = *staged->prepared->transactions[index].plan;
     auto &record = staged->candidate.transactions[index];
     if (mutation == 3) {
       mlir::Operation *clone = nullptr;
@@ -1384,7 +1442,7 @@ TEST_F(SampledTransactionLoweringTest,
     auto staged = stage();
     ASSERT_TRUE(staged);
     auto index = transactionIndex(*staged, "run");
-    const auto &plan = *staged->prepared.transactions[index].plan;
+    const auto &plan = *staged->prepared->transactions[index].plan;
     auto &record = staged->candidate.transactions[index];
     if (mutation == 0) {
       auto owner = module(*staged->original);

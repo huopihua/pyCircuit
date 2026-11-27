@@ -305,11 +305,9 @@ public:
   LogicalResult emitObservations() {
     if (!context.isSystem())
       return success();
-    auto plan = observationEmissionPlan(context);
-    if (failed(plan))
-      return failure();
-    auto found = plan->definitions.find(definition);
-    if (found == plan->definitions.end() || found->second.empty())
+    const auto &plan = context.observationPlan();
+    auto found = plan.definitions.find(definition);
+    if (found == plan.definitions.end() || found->second.empty())
       return success();
     for (auto [index, site] : llvm::enumerate(found->second)) {
       auto observe = cast<ac::SourceObserveOp>(site.op);
@@ -388,8 +386,9 @@ public:
       return *source;
     }
     if (isa<ac::TableCreateOp, ac::TableSplatOp, ac::TableMapOp,
-            ac::TableViewOp, ac::TableIndexOp, ac::TableReadOp, ac::TableGetOp, ac::TableMatchOp,
-            ac::TableChooseOp, ac::TableFoldOp, ac::ValueMergeOp>(op)) {
+            ac::TableViewOp, ac::TableIndexOp, ac::TableReadOp, ac::TableGetOp,
+            ac::TableMatchOp, ac::TableChooseOp, ac::TableFoldOp,
+            ac::ValueMergeOp>(op)) {
       if (failed(tableOperation(op)))
         return failure();
       return names.lookup(value);
@@ -624,13 +623,13 @@ public:
     }
     if (auto splat = dyn_cast<ac::TableSplatOp>(op)) {
       auto n = context.shapeSize(splat.getShape(), op, true);
-      auto w = width(splat.getInput().getType());
-      if (failed(n) || failed(w))
+      if (failed(n))
         return failure();
-      auto i = generate(*n, "pyc_broadcast_" + resultName());
-      out << "    assign " << resultName() << "[((" << *n << ")-1-" << i
-          << ")*(" << *w << ") +: (" << *w << ")] = " << operands[0]
-          << ";\n  end\n";
+      // A Table uses one packed MSB-first value. Replication preserves the
+      // same lane order and four-state bits without creating one elaborated
+      // generate scope per lane.
+      out << "  assign " << resultName() << " = {(" << *n << "){" << operands[0]
+          << "}};\n";
       return success();
     }
     if (auto view = dyn_cast<ac::TableViewOp>(op)) {
@@ -691,12 +690,16 @@ public:
     if (isa<ac::TableReadOp, ac::TableGetOp>(op)) {
       auto type = cast<ac::TableType>(op->getOperand(0).getType());
       auto n = count(type), k = width(op->getOperand(1).getType());
-      if (failed(n) || failed(k)) return failure();
+      if (failed(n) || failed(k))
+        return failure();
       auto b = "$clog2(64'(" + *n + ") + 64'd1)";
       auto w = "((" + *k + ") > (" + b + ") ? (" + *k + ") : (" + b + "))";
-      auto selected = element(operands[0], "$unsigned(" + operands[1] + ")", type);
-      if (failed(selected)) return failure();
-      std::string range = "(" + w + ")'($unsigned(" + operands[1] + ")) < (" + w + ")'(" + *n + ")";
+      auto selected =
+          element(operands[0], "$unsigned(" + operands[1] + ")", type);
+      if (failed(selected))
+        return failure();
+      std::string range = "(" + w + ")'($unsigned(" + operands[1] + ")) < (" +
+                          w + ")'(" + *n + ")";
       if (isa<ac::TableGetOp>(op)) {
         out << "  assign " << resultName(1) << " = " << range << ";\n";
         range = resultName(1);
@@ -718,8 +721,169 @@ public:
       auto n = context.shapeSize(shape, op, true);
       if (failed(n))
         return failure();
-      auto i = generate(*n, "pyc_map_" + resultName());
       Block &block = op->getRegion(0).front();
+      // Consume the frozen definition plan: render pure lane regions as one
+      // bounded procedure, and keep the conservative generated fallback for
+      // regions whose operation or merge semantics are not yet supported.
+      const auto &regionPlan = context.tableRegionPlan(op);
+      if (regionPlan.lowering == HardwareTableRegionLowering::Procedural) {
+        auto lane = "pyc_lane_index_" + std::to_string(next++);
+        llvm::DenseMap<Value, std::string> expressions;
+        unsigned arg = 0;
+        if (isMap) {
+          auto w = width(block.getArgument(0).getType());
+          if (failed(w))
+            return failure();
+          expressions[block.getArgument(arg++)] = "(" + *w + ")'(" + lane + ")";
+        }
+        for (auto [j, value] : llvm::enumerate(tables)) {
+          auto selected =
+              element(operands[j], lane, cast<ac::TableType>(value.getType()));
+          if (failed(selected))
+            return failure();
+          expressions[block.getArgument(arg++)] = std::move(*selected);
+        }
+        for (size_t j = tables.size(); j < operands.size(); ++j)
+          expressions[block.getArgument(arg++)] = operands[j];
+
+        std::function<FailureOr<std::string>(Value)> render =
+            [&](Value value) -> FailureOr<std::string> {
+          if (auto found = expressions.find(value); found != expressions.end())
+            return found->second;
+          Operation *nested = value.getDefiningOp();
+          if (!nested || nested->getBlock() != &block)
+            return net(value);
+          SmallVector<std::string> inputs;
+          for (Value input : nested->getOperands()) {
+            auto text = render(input);
+            if (failed(text))
+              return failure();
+            inputs.push_back(std::move(*text));
+          }
+          std::string text;
+          if (auto binary = dyn_cast<ac::BitsBinaryOp>(nested)) {
+            auto symbol = llvm::StringSwitch<StringRef>(binary.getOpcode())
+                              .Case("and", "&")
+                              .Case("or", "|")
+                              .Case("xor", "^")
+                              .Case("add", "+")
+                              .Case("sub", "-")
+                              .Case("mul", "*")
+                              .Case("shl", "<<")
+                              .Case("lshr", ">>")
+                              .Case("ashr", ">>>")
+                              .Default("");
+            if (symbol.empty())
+              return nested->emitOpError()
+                     << "unsupported procedural RTL map binary op";
+            text = "(" +
+                   (binary.getOpcode() == "ashr" ? "$signed(" + inputs[0] + ")"
+                                                 : inputs[0]) +
+                   " " + symbol.str() + " " + inputs[1] + ")";
+          } else if (auto compare = dyn_cast<ac::BitsCompareOp>(nested)) {
+            auto predicate =
+                llvm::StringSwitch<StringRef>(compare.getPredicate())
+                    .Case("eq", "==")
+                    .Case("ne", "!=")
+                    .Case("case_eq", "===")
+                    .Case("ult", "<")
+                    .Case("ule", "<=")
+                    .Case("ugt", ">")
+                    .Case("uge", ">=")
+                    .Case("slt", "<")
+                    .Case("sle", "<=")
+                    .Case("sgt", ">")
+                    .Case("sge", ">=")
+                    .Default("");
+            if (predicate.empty())
+              return nested->emitOpError()
+                     << "unsupported procedural RTL map comparison";
+            bool signedCompare = compare.getPredicate().starts_with("s");
+            text = std::string("(") + (signedCompare ? "$signed(" : "") +
+                   inputs[0] + (signedCompare ? ")" : "") + " " +
+                   predicate.str() + " " + (signedCompare ? "$signed(" : "") +
+                   inputs[1] + (signedCompare ? ")" : "") + ")";
+          } else if (isa<ac::BitsSelectOp>(nested)) {
+            text =
+                "(" + inputs[0] + " ? " + inputs[1] + " : " + inputs[2] + ")";
+          } else if (auto resized = dyn_cast<ac::BitsResizeOp>(nested)) {
+            auto w = width(value.getType());
+            if (failed(w))
+              return failure();
+            if (resized.getMode() == "sext")
+              text = "(" + *w + ")'($signed(" + inputs[0] + "))";
+            else if (resized.getMode() == "zext")
+              text = "(" + *w + ")'($unsigned(" + inputs[0] + "))";
+            else if (resized.getMode() == "trunc")
+              text = "(" + *w + ")'(" + inputs[0] + ")";
+            else
+              return nested->emitOpError()
+                     << "unsupported procedural RTL map resize";
+          } else if (auto merge = dyn_cast<ac::ValueMergeOp>(nested)) {
+            unsigned result = cast<OpResult>(value).getResultNumber();
+            if (result == 0) {
+              text = inputs[0];
+              for (size_t j = merge.getGuards().size(); j-- > 0;)
+                text = "(" + inputs[1 + j] + " ? " +
+                       inputs[1 + merge.getGuards().size() + j] + " : " + text +
+                       ")";
+            } else {
+              text = "1'b0";
+              for (size_t j = 0; j < merge.getGuards().size(); ++j)
+                text = "(" + text + " | " + inputs[1 + j] + ")";
+            }
+          } else {
+            return nested->emitOpError()
+                   << "operation cannot be rendered in a procedural RTL map";
+          }
+          expressions.try_emplace(value, text);
+          return text;
+        };
+
+        SmallVector<std::string> yieldedExpressions;
+        auto yielded = cast<ac::YieldOp>(block.back()).getValues();
+        for (Value value : yielded) {
+          auto text = render(value);
+          if (failed(text))
+            return failure();
+          yieldedExpressions.push_back(std::move(*text));
+        }
+        for (Value result : op->getResults()) {
+          auto type = context.rtlType(result.getType(), op);
+          if (failed(type))
+            return failure();
+          // tableOperation registered these as wires before selecting the
+          // lowering. Procedural assignments need variables, so drive one
+          // private variable and retain the public packed net.
+          auto variable =
+              resultName(cast<OpResult>(result).getResultNumber()) + "_mapped";
+          out << "  " << *type << " " << variable << ";\n"
+              << "  assign "
+              << resultName(cast<OpResult>(result).getResultNumber()) << " = "
+              << variable << ";\n";
+        }
+        out << "  integer " << lane << ";\n  always_comb begin\n";
+        for (auto [j, result] : llvm::enumerate(op->getResults()))
+          out << "    " << resultName(j) << "_mapped = '0;\n";
+        out << "    for (" << lane << " = 0; " << lane << " < (" << *n << "); "
+            << lane << " = " << lane << " + 1) begin\n";
+        for (auto [j, text] : llvm::enumerate(yieldedExpressions)) {
+          if (isMap) {
+            auto dst = element(resultName(j) + "_mapped", lane,
+                               cast<ac::TableType>(op->getResult(j).getType()));
+            if (failed(dst))
+              return failure();
+            out << "      " << *dst << " = " << text << ";\n";
+          } else {
+            out << "      " << resultName() << "_mapped[" << lane
+                << "] = " << text << ";\n";
+          }
+        }
+        out << "    end\n  end\n";
+        return success();
+      }
+
+      auto i = generate(*n, "pyc_map_" + resultName());
       unsigned arg = 0;
       if (isMap) {
         auto w = width(block.getArgument(0).getType());

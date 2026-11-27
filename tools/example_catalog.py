@@ -90,6 +90,32 @@ def catalog(repo: Path) -> dict:
     return data
 
 
+def published_generated_examples(repo: Path, expected: int = 14) -> list[str]:
+    """Return the closed published-example inventory for a fresh candidate run."""
+
+    data = catalog(repo)
+    published = [row for row in data["examples"] if row.get("generated")]
+    if len(published) != expected:
+        raise ValueError(
+            f"published generated example count is {len(published)}, expected {expected}"
+        )
+    return [row["name"] for row in published]
+
+
+def validate_published_test_selection(
+    repo: Path, selection: Path, expected: int = 14
+) -> list[str]:
+    names = published_generated_examples(repo, expected)
+    payload = json.loads(selection.read_text())
+    actual = [test.get("name") for test in payload.get("tests", [])]
+    if actual != names:
+        raise ValueError(
+            "published current-candidate test selection differs from catalog: "
+            f"expected {names}, got {actual}"
+        )
+    return actual
+
+
 def navigation(repo: Path) -> str:
     data = catalog(repo)
     rows = data["examples"]
@@ -309,12 +335,28 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser("navigation")
+    published = sub.add_parser("published-tests")
+    published.add_argument(
+        "--format", choices=("json", "lines", "regex"), default="json"
+    )
+    selection = sub.add_parser("validate-published-selection")
+    selection.add_argument("--selection", required=True, type=Path)
     create = sub.add_parser("generated")
     create.add_argument("--example", required=True)
     create.add_argument("--build", required=True, type=Path)
     args = parser.parse_args()
     if args.action == "navigation":
         (ROOT / "examples/README.md").write_text(navigation(ROOT))
+    elif args.action == "published-tests":
+        names = published_generated_examples(ROOT)
+        if args.format == "regex":
+            print("^(" + "|".join(names) + ")$")
+        elif args.format == "lines":
+            print("\n".join(names))
+        else:
+            print(json.dumps(names, indent=2))
+    elif args.action == "validate-published-selection":
+        validate_published_test_selection(ROOT, args.selection.resolve())
     else:
         text, metadata = generated(ROOT, args.example, args.build.resolve())
         folder = ROOT / "examples" / args.example

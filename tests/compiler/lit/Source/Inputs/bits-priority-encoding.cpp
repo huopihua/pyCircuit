@@ -74,6 +74,11 @@ pyc_dut::Inputs inputs(Pattern pattern,unsigned row,bool highZ,bool latent) {
   drivePort<127>(ports.w127,pattern,row,highZ,latent);
   drivePort<128>(ports.w128,pattern,row,highZ,latent);
   drivePort<129>(ports.w129,pattern,row,highZ,latent);
+  // The source contract exposes the inferred clock/reset domain after the
+  // transactional evaluator is composed into Top. Keep both pins quiescent;
+  // this test exercises only combinational priority encoding.
+  drivePort<1>(ports.pyc_7079635f636c6b,Pattern::Zero,0,false,false);
+  drivePort<1>(ports.pyc_7079635f727374,Pattern::Zero,0,false,false);
   return ports;
 }
 using Symbols = std::vector<char>;

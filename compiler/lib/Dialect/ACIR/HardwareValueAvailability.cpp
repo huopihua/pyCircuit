@@ -2,6 +2,7 @@
 #include "HardwareQueueResources.h"
 #include "pycircuit/Interfaces/LogicalStateInterfaces.h"
 #include "HardwareSourceChecks.h"
+#include "SourceCheckBudget.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallString.h"
 #include <map>
@@ -80,9 +81,14 @@ namespace {
 class AvailabilityProof {
   const HardwareAnalysis &analysis;
   std::function<LogicalResult(uint64_t, Operation *)> debit;
+  SourceCheckBudget *budget = nullptr;
+  bool budgetFailed = false;
   bool charge(uint64_t units, Operation *site) {
+    if (invalid)
+      return false;
     if (!debit || succeeded(debit(units, site))) return true;
     invalid = true;
+    budgetFailed = true;
     return false;
   }
   using Expr = unsigned;
@@ -100,7 +106,7 @@ class AvailabilityProof {
   std::set<std::string> active;
   bool invalid = false;
   struct RowFrame {
-    TableMapOp map;
+    Operation *source = nullptr;
     Expr ordinal;
     DenseMap<Value, Expr> raw, formulas;
     std::map<std::string, Expr> available, rows, rawRows, rowFormulas, constantRows;
@@ -122,7 +128,28 @@ class AvailabilityProof {
     key += ":" + std::to_string(part.size()) + ":" + part.str();
   }
   bool inRow(Value value) {
-    return rowFrame && value.getParentBlock() == &rowFrame->map.getBody().front();
+    return rowFrame && value.getParentBlock() ==
+                           &rowFrame->source->getRegion(0).front();
+  }
+  bool rowOrdinalArgument(unsigned ordinal) {
+    return isa<TableMapOp>(rowFrame->source) && ordinal == 0;
+  }
+  Value rowTableArgument(unsigned ordinal) {
+    if (auto map = dyn_cast<TableMapOp>(rowFrame->source)) {
+      if (ordinal && ordinal <= map.getTables().size())
+        return map.getTables()[ordinal - 1];
+      return {};
+    }
+    auto match = cast<TableMatchOp>(rowFrame->source);
+    return ordinal == 0 ? match.getInput() : Value();
+  }
+  Value rowCaptureArgument(unsigned ordinal) {
+    if (auto map = dyn_cast<TableMapOp>(rowFrame->source)) {
+      unsigned first = 1 + map.getTables().size();
+      return ordinal >= first ? map.getCaptures()[ordinal - first] : Value();
+    }
+    auto match = cast<TableMatchOp>(rowFrame->source);
+    return ordinal ? match.getCaptures()[ordinal - 1] : Value();
   }
   std::string valueKey(Value value, ArrayRef<StringAttr> path = {}) {
     Operation *site = value.getParentBlock()->getParentOp();
@@ -249,6 +276,7 @@ class AvailabilityProof {
     return node(key, {ordinal});
   }
   Expr rawExpression(Value value) {
+    SourceCheckBudget::LocalScope factBudget(budget);
     if (rowDepth >= 128) return reject(value.getParentBlock()->getParentOp(), "row predicate depth exceeds 128");
     ++rowDepth;
     llvm::scope_exit depth([&] { --rowDepth; });
@@ -260,15 +288,21 @@ class AvailabilityProof {
     if (auto argument = dyn_cast<BlockArgument>(value)) {
       unsigned ordinal = argument.getArgNumber();
       Expr result;
-      if (!ordinal) result = node("row-ordinal:" + typeKey(value.getType(), rowFrame->map), {rowFrame->ordinal});
-      else if (ordinal <= rowFrame->map.getTables().size())
-        result = rowValue(rowFrame->map.getTables()[ordinal - 1], rowFrame->ordinal, false);
-      else result = rawExpression(rowFrame->map.getCaptures()[ordinal - 1 - rowFrame->map.getTables().size()]);
+      if (rowOrdinalArgument(ordinal))
+        result = node("row-ordinal:" +
+                          typeKey(value.getType(), rowFrame->source),
+                      {rowFrame->ordinal});
+      else if (Value table = rowTableArgument(ordinal))
+        result = rowValue(table, rowFrame->ordinal, false);
+      else
+        result = rawExpression(rowCaptureArgument(ordinal));
       rowFrame->raw.try_emplace(value, result);
       return result;
     }
     auto *op = value.getDefiningOp();
-    if (!op || op->getNumRegions()) return reject(op ? op : rowFrame->map.getOperation(), "unsupported nested row predicate");
+    if (!op || op->getNumRegions())
+      return reject(op ? op : rowFrame->source,
+                    "unsupported nested row predicate");
     if (!charge(32 + op->getNumOperands() + op->getAttrs().size(), op)) return 0;
     SmallVector<Expr> operands;
     operands.reserve(op->getNumOperands());
@@ -328,6 +362,7 @@ class AvailabilityProof {
     return true;
   }
   FailureOr<KnownGuard> knownGuard(Value value, ArrayRef<StringAttr> path = {}) {
+    SourceCheckBudget::LocalScope factBudget(budget);
     Operation *site = value.getParentBlock()->getParentOp();
     if (guardDepth >= 128) {
       reject(site, "constant guard proof depth exceeds 128");
@@ -349,10 +384,9 @@ class AvailabilityProof {
     if (auto argument = dyn_cast<BlockArgument>(value)) {
       if (auto rule = dyn_cast<RuleOp>(argument.getOwner()->getParentOp()))
         result = knownGuard(rule.getCaptures()[argument.getArgNumber()], path);
-      else if (inRow(value) &&
-               argument.getArgNumber() > rowFrame->map.getTables().size())
-        result = knownGuard(rowFrame->map.getCaptures()[
-            argument.getArgNumber() - rowFrame->map.getTables().size() - 1], path);
+      else if (inRow(value))
+        if (Value capture = rowCaptureArgument(argument.getArgNumber()))
+          result = knownGuard(capture, path);
     } else if (auto rule = value.getDefiningOp<RuleOp>()) {
       auto yield = cast<YieldOp>(rule.getBody().front().back());
       result = knownGuard(yield.getValues()[cast<OpResult>(value).getResultNumber()], path);
@@ -400,9 +434,12 @@ class AvailabilityProof {
   }
   FailureOr<Uniform> uniformAvailability(Value value,
                                          ArrayRef<StringAttr> path = {}) {
+    SourceCheckBudget::LocalScope factBudget(budget);
     Operation *site = value.getParentBlock()->getParentOp();
-    if (uniformDepth >= 128) {
-      reject(site, "uniform field availability depth exceeds 128");
+    // Keep verification aligned with materialization for deep routed Rule
+    // forwarding. Active-key tracking still rejects actual cycles.
+    if (uniformDepth >= 1024) {
+      reject(site, "uniform field availability depth exceeds 1024");
       return failure();
     }
     ++uniformDepth;
@@ -435,11 +472,10 @@ class AvailabilityProof {
         return uniformAvailability(rule.getCaptures()[argument.getArgNumber()], path);
       if (inRow(value)) {
         unsigned ordinal = argument.getArgNumber();
-        if (!ordinal) return Uniform(1);
-        if (ordinal <= rowFrame->map.getTables().size())
-          return uniformAvailability(rowFrame->map.getTables()[ordinal - 1], path);
-        return uniformAvailability(rowFrame->map.getCaptures()[
-            ordinal - rowFrame->map.getTables().size() - 1], path);
+        if (rowOrdinalArgument(ordinal)) return Uniform(1);
+        if (Value table = rowTableArgument(ordinal))
+          return uniformAvailability(table, path);
+        return uniformAvailability(rowCaptureArgument(ordinal), path);
       }
       return Uniform();
     }
@@ -570,6 +606,7 @@ class AvailabilityProof {
   }
   Expr rowValue(Value table, Expr ordinal, unsigned mode,
                 ArrayRef<StringAttr> path = {}) {
+    SourceCheckBudget::LocalScope factBudget(budget);
     if (rowDepth >= 128) return reject(table.getParentBlock()->getParentOp(), "symbolic row depth exceeds 128");
     ++rowDepth;
     llvm::scope_exit depth([&] { --rowDepth; });
@@ -634,7 +671,7 @@ class AvailabilityProof {
     } else if (auto map = table.getDefiningOp<TableMapOp>()) {
       if (!charge(16 + map.getBody().front().getNumArguments(), map)) return 0;
       RowFrame frame;
-      frame.map = map;
+      frame.source = map;
       frame.ordinal = ordinal;
       auto *outer = rowFrame;
       rowFrame = &frame;
@@ -653,6 +690,7 @@ class AvailabilityProof {
   }
   Expr reduceRows(Expr row, Expr domain, TableType type, Operation *site,
                   unsigned depth = 0) {
+    SourceCheckBudget::LocalScope factBudget(budget);
     if (!charge(16, site)) return 0;
     auto key = std::make_pair(row, domain);
     if (auto found = rowReductionCache.find(key); found != rowReductionCache.end())
@@ -706,6 +744,21 @@ class AvailabilityProof {
     Expr row = rowValue(table, domain, available ? 1 : 2, path);
     if (invalid) return 0;
     return reduceRows(row, domain, type, site);
+  }
+  Expr matchAvailability(TableMatchOp match) {
+    auto type = match.getInput().getType();
+    Expr domain = rowDomain(type, match);
+    RowFrame frame;
+    frame.source = match;
+    frame.ordinal = domain;
+    auto *outer = rowFrame;
+    rowFrame = &frame;
+    llvm::scope_exit restore([&] { rowFrame = outer; });
+    Value predicate =
+        cast<YieldOp>(match.getBody().front().getTerminator()).getValues()[0];
+    Expr row = availability(predicate);
+    if (invalid) return 0;
+    return reduceRows(row, domain, type, match);
   }
 
   Expr node(StringRef kind, ArrayRef<Expr> children = {}) {
@@ -792,6 +845,7 @@ class AvailabilityProof {
     return node("eq", {left, right});
   }
   Expr formula(Value value) {
+    SourceCheckBudget::LocalScope factBudget(budget);
     if (!charge(1, value.getParentBlock()->getParentOp())) return 0;
     value = wire(value);
     bool bound = inRow(value);
@@ -842,10 +896,12 @@ class AvailabilityProof {
     else if (inRow(value) && isa<BlockArgument>(value)) {
       auto argument = cast<BlockArgument>(value);
       unsigned ordinal = argument.getArgNumber();
-      if (!ordinal) result = rawExpression(value);
-      else if (ordinal <= rowFrame->map.getTables().size())
-        result = rowValue(rowFrame->map.getTables()[ordinal - 1], rowFrame->ordinal, 2);
-      else result = formula(rowFrame->map.getCaptures()[ordinal - 1 - rowFrame->map.getTables().size()]);
+      if (rowOrdinalArgument(ordinal))
+        result = rawExpression(value);
+      else if (Value table = rowTableArgument(ordinal))
+        result = rowValue(table, rowFrame->ordinal, 2);
+      else
+        result = formula(rowCaptureArgument(ordinal));
     }
     else if (auto op = value.getDefiningOp<BitsBinaryOp>();
              op && op.getOpcode() == "and")
@@ -879,6 +935,7 @@ class AvailabilityProof {
     return 0;
   }
   Expr tableAt(Value table, uint64_t ordinal, ArrayRef<StringAttr> path) {
+    SourceCheckBudget::LocalScope factBudget(budget);
     Operation *site = table.getParentBlock()->getParentOp();
     if (rowDepth >= 128) return reject(site, "constant row depth exceeds 128");
     ++rowDepth;
@@ -966,10 +1023,10 @@ class AvailabilityProof {
       auto *owner = arg.getOwner()->getParentOp();
       if (inRow(arg)) {
         unsigned ordinal = arg.getArgNumber();
-        if (!ordinal) return 1;
-        if (ordinal <= rowFrame->map.getTables().size())
-          return rowValue(rowFrame->map.getTables()[ordinal - 1], rowFrame->ordinal, true, path);
-        return availability(rowFrame->map.getCaptures()[ordinal - 1 - rowFrame->map.getTables().size()], path);
+        if (rowOrdinalArgument(ordinal)) return 1;
+        if (Value table = rowTableArgument(ordinal))
+          return rowValue(table, rowFrame->ordinal, true, path);
+        return availability(rowCaptureArgument(ordinal), path);
       }
       if (auto rule = dyn_cast<RuleOp>(owner))
         return availability(rule.getCaptures()[arg.getArgNumber()], path);
@@ -1181,6 +1238,10 @@ class AvailabilityProof {
                  : all({index,
                         tableElement(get.getInput(), get.getIndex(), path)});
     }
+    if (auto match = dyn_cast<TableMatchOp>(op))
+      return matchAvailability(match);
+    if (auto choose = dyn_cast<TableChooseOp>(op))
+      return availability(choose.getMask());
     if (auto require = dyn_cast<ValueRequireOp>(op))
       return all({availability(require.getAvailability()),
                   availability(require.getPath())});
@@ -1190,7 +1251,9 @@ class AvailabilityProof {
       });
       if (total && isa<TableMapOp, TableMatchOp>(op))
         return 1;
-      return reject(op, "availability requires normalized region provenance");
+      return reject(op, ("availability requires normalized region provenance for " +
+                         op->getName().getStringRef())
+                            .str());
     }
     SmallVector<Expr> operands;
     for (Value operand : op->getOperands())
@@ -1198,6 +1261,7 @@ class AvailabilityProof {
     return all(operands);
   }
   Expr availability(Value value, ArrayRef<StringAttr> path = {}) {
+    SourceCheckBudget::LocalScope factBudget(budget);
     if (!charge(1 + path.size(), value.getParentBlock()->getParentOp())) return 0;
     bool bound = inRow(value);
     if (bound && rowDepth >= 128) return reject(value.getParentBlock()->getParentOp(), "row availability depth exceeds 128");
@@ -1217,10 +1281,42 @@ class AvailabilityProof {
     return result;
   }
   LogicalResult matches(Value payload, Value supplied, Operation *site) {
-    if (availability(payload) != (supplied ? formula(supplied) : 1) || invalid)
+    auto prove = [&]() -> LogicalResult {
+      Expr actual = availability(payload);
+      if (budgetFailed)
+        return failure();
+      Expr expected = supplied ? formula(supplied) : 1;
+      if (budgetFailed)
+        return failure();
+      if (actual == expected && !invalid)
+        return success();
       return site->emitOpError()
              << "availability differs from actual payload SSA";
-    return success();
+    };
+    if (!budget)
+      return prove();
+    SourceCheckBudget::LocalScope assertionBudget(*budget);
+    return prove();
+  }
+  LogicalResult provesAvailable(Value value) {
+    auto prove = [&]() -> LogicalResult {
+      (void)availability(value);
+      return failure(invalid);
+    };
+    if (!budget)
+      return prove();
+    SourceCheckBudget::LocalScope assertionBudget(*budget);
+    return prove();
+  }
+  LogicalResult provesTotal(Value value) {
+    auto prove = [&]() -> LogicalResult {
+      Expr actual = availability(value);
+      return failure(invalid || actual != 1);
+    };
+    if (!budget)
+      return prove();
+    SourceCheckBudget::LocalScope assertionBudget(*budget);
+    return prove();
   }
 
 public:
@@ -1228,6 +1324,12 @@ public:
       const HardwareAnalysis &analysis,
       const std::function<LogicalResult(uint64_t, Operation *)> &debit = {})
       : analysis(analysis), debit(debit) {}
+  AvailabilityProof(const HardwareAnalysis &analysis, SourceCheckBudget &budget)
+      : analysis(analysis),
+        debit([&](uint64_t units, Operation *site) {
+          return budget.debit(units, site);
+        }),
+        budget(&budget) {}
   LogicalResult run() {
     std::optional<DenseSet<OpOperand *>> queueUses;
     for (auto module : analysis.getDefinitions()) {
@@ -1301,11 +1403,15 @@ public:
           auto *target = analysis.resolveCallee(collection);
           if (target && isa<ModuleImportOp>(target) &&
               target->hasAttr("ac.external_contract")) {
-            for (Value output : collection.getOutputs()) availability(output);
+            for (Value output : collection.getOutputs())
+              if (failed(provesAvailable(output)))
+                return WalkResult::interrupt();
             // Result-free extern Collections still cannot bypass the current
             // total-input admission limitation.
             for (Value input : collection.getInputs())
-              if (availability(input) != 1) {
+              if (failed(provesTotal(input))) {
+                if (budgetFailed)
+                  return WalkResult::interrupt();
                 collection.emitOpError()
                     << "availability requires scalar instance routing for ordinary Collections";
                 return WalkResult::interrupt();
@@ -1325,7 +1431,8 @@ public:
           // An extern accepts partial inputs. Its outputs derive their own
           // all-input availability, including dead outputs and cycles.
           for (Value output : instance.getOutputs())
-            availability(output);
+            if (failed(provesAvailable(output)))
+              return WalkResult::interrupt();
           return invalid ? WalkResult::interrupt() : WalkResult::advance();
         }
         auto layout = getModulePortLayout(target);
@@ -1592,6 +1699,20 @@ verifyHardwareValueAvailability(
   if (failed(verifyTransactionReturns(analysis, debit)))
     return failure();
   if (failed(AvailabilityProof(analysis, debit).run()))
+    return failure();
+  return success(succeeded(AvailabilityUses(analysis).collect()));
+}
+LogicalResult verifyHardwareValueAvailability(const HardwareAnalysis &analysis,
+                                              SourceCheckBudget &budget) {
+  SourceCheckBudget::PhaseScope phase(budget, "hardware value availability");
+  if (!hasAvailabilityTransport(analysis))
+    return success();
+  auto debit = [&](uint64_t units, Operation *site) {
+    return budget.debit(units, site);
+  };
+  if (failed(verifyTransactionReturns(analysis, debit)))
+    return failure();
+  if (failed(AvailabilityProof(analysis, budget).run()))
     return failure();
   return success(succeeded(AvailabilityUses(analysis).collect()));
 }

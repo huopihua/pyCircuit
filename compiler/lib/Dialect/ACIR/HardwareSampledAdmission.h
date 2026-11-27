@@ -86,9 +86,24 @@ struct SampledWriteDomainView {
   TableType table;
   mlir::ArrayAttr prefix, suffix;
 };
+struct SampledOperationIdentity {
+  mlir::Operation *operation = nullptr;
+  mlir::DictionaryAttr attributes;
+  llvm::SmallVector<mlir::Value> operands;
+  llvm::SmallVector<mlir::Type> resultTypes, blockArgumentTypes;
+  llvm::SmallVector<uint64_t> regionBlockCounts;
+};
 struct SampledAdmissionView {
   ModuleOp definition;
   RuleOp rule;
+  mlir::DictionaryAttr schema;
+  // Exact source identities used to parse this view. Proofs may reuse the
+  // parsed inventories, but only while the Rule and its published wiring are
+  // still the same immutable source graph.
+  mlir::DictionaryAttr ruleAttributes;
+  llvm::SmallVector<mlir::Value> ruleOperands, yieldedOperands;
+  llvm::SmallVector<mlir::Type> ruleResultTypes, bodyArgumentTypes;
+  llvm::SmallVector<SampledOperationIdentity, 0> bodyOperations;
   uint64_t clockCapture = 0, resetCapture = 0, fireResult = 0;
   uint64_t checkBase = 0, totalResults = 0;
   mlir::Value clock, reset, fire;
@@ -146,6 +161,10 @@ struct TransactionWiringView {
   llvm::SmallVector<TransactionIncomingView> incoming;
   llvm::SmallVector<TransactionWriterView> writers;
 };
+struct ParsedTransactionWiring {
+  TransactionWiringView wiring;
+  llvm::DenseMap<mlir::Operation *, SampledAdmissionView> admissions;
+};
 
 struct CheckedCandidateEnable {
   mlir::Value effectiveEnable, rawIntent;
@@ -167,36 +186,42 @@ struct HardwareIdentityStopPolicy {
 };
 using HardwareIdentityStopIndex = std::multimap<const void *, std::size_t>;
 
-/// Complete definition-local identity boundaries for one read-only validation.
-/// The borrowed IR must outlive this result and remain unchanged. This is not
-/// a cached verification verdict; successful prefix proofs have a separate
-/// invocation-local owner below.
-class PreparedSampledBoundaries {
+/// Complete parsed sampled facts and definition-local identity boundaries for
+/// one read-only validation. The borrowed IR must outlive this result and
+/// remain unchanged. This is not a cached verification verdict; successful
+/// prefix proofs have a separate invocation-local owner below.
+class PreparedSampledDefinition {
 public:
-  PreparedSampledBoundaries(PreparedSampledBoundaries &&) = default;
-  PreparedSampledBoundaries &operator=(PreparedSampledBoundaries &&) = default;
-  PreparedSampledBoundaries(const PreparedSampledBoundaries &) = delete;
-  PreparedSampledBoundaries &
-  operator=(const PreparedSampledBoundaries &) = delete;
+  PreparedSampledDefinition(PreparedSampledDefinition &&) = default;
+  PreparedSampledDefinition &operator=(PreparedSampledDefinition &&) = default;
+  PreparedSampledDefinition(const PreparedSampledDefinition &) = delete;
+  PreparedSampledDefinition &
+  operator=(const PreparedSampledDefinition &) = delete;
 
   const HardwareIdentityScope &getScope() const { return scope; }
   llvm::ArrayRef<HardwareIdentityEndpoint> getBoundaries() const {
     return boundaries;
   }
   const HardwareIdentityStopIndex &getStopIndex() const { return stopIndex; }
+  /// Borrow frozen parsed facts for this Rule. The pointer remains valid until
+  /// this prepared definition is moved or destroyed; the borrowed IR must also
+  /// remain unchanged.
+  mlir::FailureOr<const SampledAdmissionView *>
+  getAdmission(RuleOp rule, SourceCheckBudget &budget) const;
   mlir::LogicalResult verifyFor(ModuleOp definition,
                                 const HardwareBindings &bindings,
                                 SourceCheckBudget &budget) const;
 
 private:
-  PreparedSampledBoundaries(
+  PreparedSampledDefinition(
       HardwareIdentityScope &&scope,
       llvm::SmallVector<HardwareIdentityEndpoint> &&boundaries,
       HardwareIdentityStopIndex &&stopIndex,
-      std::unique_ptr<TransactionWiringView> &&wiring);
+      std::unique_ptr<TransactionWiringView> &&wiring,
+      llvm::DenseMap<mlir::Operation *, SampledAdmissionView> &&admissions);
   friend class SampledAdmissionValidation;
-  friend mlir::FailureOr<std::optional<PreparedSampledBoundaries>>
-  prepareSampledBoundaries(ModuleOp definition,
+  friend mlir::FailureOr<std::optional<PreparedSampledDefinition>>
+  prepareSampledDefinition(ModuleOp definition,
                            const HardwareAnalysis &analysis,
                            const HardwareBindings &bindings,
                            SourceCheckBudget &budget);
@@ -209,14 +234,15 @@ private:
   // Retain the schema used to establish these immutable boundaries. Stable
   // ownership avoids moving nested inline vectors when preparation is returned.
   std::unique_ptr<TransactionWiringView> wiring;
+  llvm::DenseMap<mlir::Operation *, SampledAdmissionView> admissions;
 };
 
-mlir::FailureOr<std::optional<PreparedSampledBoundaries>>
-prepareSampledBoundaries(ModuleOp definition, const HardwareAnalysis &analysis,
+mlir::FailureOr<std::optional<PreparedSampledDefinition>>
+prepareSampledDefinition(ModuleOp definition, const HardwareAnalysis &analysis,
                          const HardwareBindings &bindings,
                          SourceCheckBudget &budget);
 
-/// Reuses only definition-local preparation and completed prefix proofs.
+/// Reuses only definition-local preparation and invocation-local proof facts.
 /// The analysis, budget, package and complete boundaries must remain fixed for
 /// this object's lifetime. Actual occurrence and root wiring proofs stay
 /// separate.
@@ -231,13 +257,17 @@ public:
   SampledAdmissionValidation(SampledAdmissionValidation &&) = delete;
   SampledAdmissionValidation &operator=(SampledAdmissionValidation &&) = delete;
 
-  mlir::FailureOr<const PreparedSampledBoundaries *>
+  mlir::FailureOr<const PreparedSampledDefinition *>
   prepare(ModuleOp definition, const HardwareBindings &bindings);
   /// Borrow immutable definition schema; physical occurrence proofs are
   /// separate.
   mlir::FailureOr<const TransactionWiringView *>
   wiring(ModuleOp definition, const HardwareBindings &bindings);
-  mlir::FailureOr<SampledAdmissionView>
+  /// Prove this Rule in the current validation invocation and borrow its frozen
+  /// parsed facts. No proof conclusion is cached, including within one
+  /// validation instance.
+  /// The pointer remains valid until this validation object is destroyed.
+  mlir::FailureOr<const SampledAdmissionView *>
   verify(RuleOp rule, const HardwareBindings &bindings);
   mlir::FailureOr<llvm::SmallVector<CheckedCandidateEnable, 0>>
   verifyCandidateEnables(const TransactionWriterView &writer,
@@ -260,9 +290,14 @@ public:
   static uint64_t prefixConditionalStorageBytes();
   static uint64_t prefixFrameStorageBytes();
   static uint64_t prefixSelectionPathsStorageBytes();
+  uint64_t preparedContextCount() const { return entries.size(); }
+  uint64_t sampledRuleParseCount() const;
+  uint64_t sampledAdmissionProofCount() const {
+    return sampledAdmissionProofs;
+  }
 
 private:
-  mlir::FailureOr<SampledAdmissionView>
+  mlir::FailureOr<const SampledAdmissionView *>
   verifySampledAdmissionImpl(RuleOp rule, const HardwareBindings &bindings);
   mlir::FailureOr<llvm::SmallVector<CheckedCandidateEnable, 0>>
   verifyCandidateEnablesImpl(const TransactionWriterView &writer,
@@ -272,6 +307,10 @@ private:
   const HardwareAnalysis &analysis;
   SourceCheckBudget &budget;
   llvm::SmallVector<std::unique_ptr<Entry>, 0> entries;
+  llvm::DenseMap<mlir::Operation *, llvm::SmallVector<size_t, 0>>
+      definitionEntries;
+  llvm::DenseMap<const PreparedSampledDefinition *, Entry *> preparedEntries;
+  uint64_t sampledAdmissionProofs = 0;
 };
 
 enum class StateEndpointForm { Logical, DFF, DFFE, DFFECollection };
@@ -290,7 +329,7 @@ mlir::FailureOr<SampledAdmissionView>
 parseSampledAdmission(RuleOp rule, const HardwareAnalysis &analysis,
                       const HardwareBindings &bindings,
                       SourceCheckBudget &budget);
-mlir::FailureOr<TransactionWiringView>
+mlir::FailureOr<ParsedTransactionWiring>
 parseTransactionWiring(ModuleOp module, const HardwareAnalysis &analysis,
                        const HardwareBindings &bindings,
                        SourceCheckBudget &budget);
@@ -309,9 +348,14 @@ normalizeIdentityEndpoint(const HardwareIdentityEndpoint &endpoint,
                           const HardwareAnalysis &analysis,
                           SourceCheckBudget &budget);
 mlir::LogicalResult proveSampledAdmission(
-    const SampledAdmissionView &view, const PreparedSampledBoundaries &prepared,
+    const SampledAdmissionView &view, const PreparedSampledDefinition &prepared,
     const HardwareAnalysis &analysis, const HardwareBindings &bindings,
     SourceCheckBudget &budget);
+mlir::LogicalResult verifyTransactionWiring(
+    const HardwareAnalysis &analysis,
+    llvm::ArrayRef<std::pair<ModuleOp, HardwareBindings>> catalog,
+    llvm::ArrayRef<std::pair<ModuleOp, HardwareBindings>> roots,
+    SampledAdmissionValidation &validation, SourceCheckBudget &budget);
 mlir::LogicalResult verifyTransactionWiring(
     const HardwareAnalysis &analysis,
     llvm::ArrayRef<std::pair<ModuleOp, HardwareBindings>> scopes,

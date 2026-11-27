@@ -27,6 +27,7 @@ struct Engine {
   // Retain the full ModuleAnalysis only for public scheduling requests.
   bool validationOnly = false;
   std::function<LogicalResult(uint64_t, Operation *)> debit;
+  detail::SourceCheckBudget *budget = nullptr;
   LogicalResult charge(uint64_t units, Operation *site) const {
     return debit ? debit(units, site) : success();
   }
@@ -392,6 +393,22 @@ struct Engine {
                      endpoint.path});
       return out;
     }
+    if (auto memory = dyn_cast<InstanceOp>(op);
+        memory && isMemoryInstance(memory)) {
+      auto layout = getMemoryPrimitiveLayout(memory, bindings);
+      if (failed(layout))
+        return failure();
+      unsigned result = cast<OpResult>(value).getResultNumber();
+      if (layout->kind == "byte_mem" && result < layout->readPorts) {
+        out.push_back(
+            {memory.getOperand(layout->readAddressOperands[result]), {}});
+        return out;
+      }
+      // Synchronous Memory payload/live results and all committed write state
+      // are temporal cuts. Their functional inputs are still validated below
+      // when every instance operand is visited.
+      return out;
+    }
     if (auto queue = dyn_cast<InstanceOp>(op); queue && isQueueInstance(queue)) {
       if (failed(analysis.verifyQueueOperation(queue, bindings)))
         return failure();
@@ -533,6 +550,10 @@ struct Engine {
   }
   FailureOr<const CompletedModule *>
   analyze(ModuleOp module, const HardwareBindings &bindings) {
+    // A completed exact-binding module summary is an immutable definition
+    // fact. Build each definition in its own peak window while retaining the
+    // completed child summaries that its caller consumes.
+    Budget::LocalScope definitionBudget(budget);
     if (active.contains(module))
       return module.emitOpError() << "recursive hardware instance hierarchy";
     auto proof = findCompleted(module, bindings, module);
@@ -624,6 +645,11 @@ struct Engine {
     llvm::DenseSet<Operation *> scheduled;
     std::function<FailureOr<InputIndices>(WireEndpoint)> visit;
     visit = [&](WireEndpoint e) -> FailureOr<InputIndices> {
+      // Each endpoint is an independently indexed semantic fact. Preserve the
+      // shared recursion stack and completed endpoint table, while bounding
+      // the peak work of this endpoint rather than accumulating the complete
+      // definition closure into every caller's budget window.
+      Budget::LocalScope endpointBudget(budget);
       if (failed(charge(1, module)))
         return failure();
       if (failed(charge(4 + 3 * e.path.size(), module)))
@@ -776,15 +802,38 @@ struct Engine {
       inputsForDone.push_back(ports);
       return ports;
     };
+    auto validate = [&](WireEndpoint endpoint) -> LogicalResult {
+      SmallVector<Attribute> path(endpoint.path.begin(), endpoint.path.end());
+      EndpointKey key{endpoint.value,
+                      ArrayAttr::get(module.getContext(), path)};
+      if (failed(charge(1 + endpoint.path.size(), module)))
+        return failure();
+      if (doneEndpoints.contains(key))
+        return success();
+      return failure(mlir::failed(visit(endpoint)));
+    };
     auto yield = cast<YieldOp>(module.getBody().front().back());
     for (auto [port, value] : llvm::enumerate(yield.getValues())) {
-      auto leaves = paths(value.getType(), bindings, module);
-      if (failed(leaves))
-        return failure();
-      for (auto path : *leaves) {
+      SmallVector<FieldPath> outputLeaves;
+      {
+        Budget::LocalScope layoutBudget(budget);
+        auto leaves = paths(value.getType(), bindings, module);
+        if (failed(leaves))
+          return failure();
+        outputLeaves = std::move(*leaves);
+      }
+      for (auto path : outputLeaves) {
+        SmallVector<PortEndpoint> dependencyInputs;
+        {
+          Budget::LocalScope dependencyBudget(budget);
         auto inputs = visit({value, path});
         if (failed(inputs))
           return failure();
+          dependencyInputs.reserve(inputs->size());
+          for (size_t index : *inputs)
+            dependencyInputs.push_back(inputEndpoints[index]);
+        }
+        Budget::LocalScope rowBudget(budget);
         if (failed(charge(
                 detail::SourceCheckBudget::add(
                     detail::SourceCheckBudget::bytes(sizeof(OutputDependency)),
@@ -793,8 +842,7 @@ struct Engine {
           return failure();
         OutputDependency dependency;
         dependency.output = {static_cast<unsigned>(port), path};
-        for (size_t index : *inputs) {
-          const auto &input = inputEndpoints[index];
+        for (const auto &input : dependencyInputs) {
           if (failed(charge(
                   detail::SourceCheckBudget::add(
                       detail::SourceCheckBudget::bytes(sizeof(PortEndpoint)),
@@ -817,7 +865,7 @@ struct Engine {
           if (failed(leaves))
             return failure();
           for (auto path : *leaves)
-            if (failed(visit({operand, path})))
+            if (failed(validate({operand, path})))
               return failure();
         }
         if (!validationOnly)
@@ -829,7 +877,7 @@ struct Engine {
         if (failed(leaves))
           return failure();
         for (auto path : *leaves)
-          if (failed(visit({value, path})))
+          if (failed(validate({value, path})))
             return failure();
       }
       if (auto logical = dyn_cast<acir::LogicalStateOpInterface>(op)) {
@@ -837,7 +885,7 @@ struct Engine {
           auto leaves = paths(input.getType(), bindings, logical);
           if (failed(leaves)) return failure();
           for (auto path : *leaves)
-            if (failed(visit({input, path}))) return failure();
+            if (failed(validate({input, path}))) return failure();
         }
       }
       if (validationOnly && op.getNumRegions()) {
@@ -850,7 +898,8 @@ struct Engine {
             auto leaves = paths(value.getType(), bindings, inner);
             if (failed(leaves)) return WalkResult::interrupt();
             for (auto path : *leaves)
-              if (failed(visit({value, path}))) return WalkResult::interrupt();
+              if (failed(validate({value, path})))
+                return WalkResult::interrupt();
           }
           return WalkResult::advance();
         });
@@ -879,12 +928,65 @@ struct Engine {
                        : analysis.verifyInstance(cast<CollectionOp>(op),
                                                  bindings)))
           return failure();
-        for (auto input : instance->getOperands()) {
+        llvm::SmallDenseSet<unsigned, 2> mirrorReadInputs;
+        if (auto allocation = dyn_cast<InstanceOp>(op)) {
+          auto identity = allocation->getAttrOfType<DictionaryAttr>(
+              "ac.memory_read_mirror");
+          if (identity) {
+            auto layout = getMemoryPrimitiveLayout(allocation, bindings);
+            if (failed(layout) || layout->kind != "byte_mem")
+              return allocation.emitOpError()
+                     << "Memory read mirror requires byte_mem layout";
+            InstanceOp canonical;
+            for (auto sibling :
+                 module.getBody().front().getOps<InstanceOp>()) {
+              if (sibling == allocation ||
+                  sibling->hasAttr("ac.memory_read_mirror") ||
+                  sibling.getOccurrence() != identity)
+                continue;
+              if (canonical)
+                return allocation.emitOpError()
+                       << "Memory read mirror canonical allocation is ambiguous";
+              canonical = sibling;
+            }
+            if (!canonical || canonical.getCallee() != allocation.getCallee() ||
+                canonical.getParameters() != allocation.getParameters() ||
+                canonical.getTypeArguments() !=
+                    allocation.getTypeArguments() ||
+                canonical.getResultTypes() != allocation.getResultTypes() ||
+                canonical.getNumOperands() != allocation.getNumOperands())
+              return allocation.emitOpError()
+                     << "Memory read mirror differs from canonical allocation";
+            auto canonicalLayout =
+                getMemoryPrimitiveLayout(canonical, bindings);
+            if (failed(canonicalLayout) ||
+                canonicalLayout->readAddressOperands !=
+                    layout->readAddressOperands)
+              return allocation.emitOpError()
+                     << "Memory read mirror layout differs from canonical allocation";
+            mirrorReadInputs.insert(layout->readAddressOperands.begin(),
+                                    layout->readAddressOperands.end());
+            for (unsigned ordinal = 0;
+                 ordinal < allocation.getNumOperands(); ++ordinal)
+              if (!mirrorReadInputs.contains(ordinal) &&
+                  allocation->getOperand(ordinal) !=
+                      canonical->getOperand(ordinal))
+                return allocation.emitOpError()
+                       << "Memory read mirror shared input differs from canonical allocation";
+          }
+        }
+        for (auto [ordinal, input] : llvm::enumerate(instance->getOperands())) {
+          // A proved async-read mirror contributes only its independent read
+          // address. Its domain/write operands are exact aliases of the
+          // canonical allocation and were already traversed there.
+          if (!mirrorReadInputs.empty() &&
+              !mirrorReadInputs.contains(ordinal))
+            continue;
           auto leaves = paths(input.getType(), bindings, instance);
           if (failed(leaves))
             return failure();
           for (auto path : *leaves)
-            if (failed(visit({input, path})))
+            if (failed(validate({input, path})))
               return failure();
         }
         // A result-free occurrence can still own checks or state. Retain its
@@ -986,15 +1088,19 @@ namespace detail {
 LogicalResult verifySourceCheckDependencies(
     const HardwareAnalysis &analysis,
     ArrayRef<std::pair<ModuleOp, HardwareBindings>> scopes,
-    const std::function<LogicalResult(uint64_t, Operation *)> &debit) {
+    SourceCheckBudget &budget) {
   // Byte memory's pure committed read follows the verified raddr dependency.
   // Every input is still visited; write pins are sampled once after pure SSA.
   Engine combinational{analysis, {}};
   combinational.validationOnly = true;
-  combinational.debit = debit;
-  for (const auto &[module, bindings] : scopes)
+  combinational.debit = [&](uint64_t units, Operation *site) {
+    return budget.debit(units, site);
+  };
+  combinational.budget = &budget;
+  for (const auto &[module, bindings] : scopes) {
     if (failed(combinational.analyze(module, bindings)))
       return failure();
+  }
   return success();
 }
 } // namespace detail

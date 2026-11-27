@@ -107,8 +107,8 @@ def cpp(layout, graph="dut.root_->pyc_implementation", system=False):
         snap += [f"append_fifo<{depth}>(out, {owner}->{name}_state->current(0));"]
         raw += [f"raw_fifo(out, {owner}->{name}_state->current(0));"]
         flags += [
-            f"if ({owner}->{name}_out_valid.element(0).value().toBool() && {owner}->{name}_out_ready.element(0).value().toBool()) pop |= (1u<<{i});",
-            f"if ({owner}->{name}_in_ready.element(0).value().toBool() && {owner}->{name}_in_valid.element(0).value().toBool()) push |= (1u<<{i});",
+            f"if ({owner}->{name}_valid.element(0).value().toBool() && {owner}->{name}_out_ready.element(0).value().toBool()) pop |= (1u<<{i});",
+            f"if ({owner}->{name}_ready.element(0).value().toBool() && {owner}->{name}_in_valid.element(0).value().toBool()) push |= (1u<<{i});",
         ]
     for owner, field, count in (
         (sched, "entries", 8),

@@ -45,8 +45,7 @@ mlir::FailureOr<ResolvedSourceEffectOwner> resolveObservationOwner(
 mlir::LogicalResult verifySourceCheckDependencies(
     const HardwareAnalysis &analysis,
     llvm::ArrayRef<std::pair<ModuleOp, HardwareBindings>> scopes,
-    const std::function<mlir::LogicalResult(uint64_t, mlir::Operation *)>
-        &debit);
+    SourceCheckBudget &budget);
 mlir::FailureOr<llvm::SmallVector<HardwareCheckBinding>>
 definitionSourceChecks(const HardwareAnalysis &analysis, ModuleOp definition,
                        const HardwareBindings &bindings,

@@ -4,6 +4,7 @@
 // the local observation case verifies common native IR semantics directly.
 #include "Compiler/HardwareEmitCommon.h"
 #include "Compiler/HardwareEmitCppChecks.h"
+#include "Compiler/FinalVerilogSourceParts.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "pycircuit/Dialect/ACIR/ACIRDialect.h"
@@ -434,4 +435,64 @@ TEST(HardwareSourceChecksExecution,
   }
   ASSERT_TRUE(emitNative("noisy-path", input.string(), output));
   ASSERT_TRUE(runNoisyObservationNative(output));
+}
+
+TEST(HardwareSourceChecksExecution, PreparedPlanFeedsBothBackends) {
+  MLIRContext context;
+  context.loadDialect<ac::ACIRDialect>();
+  const char *final = R"mlir(
+#w1 = #ac.static_expr<{kind = "literal", value = {kind = "integer", value = #ac.math_int<1>}, origin = {site = {definition = @Shared, ast_path = []}, expansion = []}, location = {path = "shared.py", line = 1 : i64, column = 1 : i64, end_line = 1 : i64, end_column = 2 : i64}}>
+!b1 = !ac.bits<#w1>
+#owner = {package = "", path = "shared.py"}
+module attributes {ac.stage = "final", ac.source_units = [{package = "", path = "shared.py"}]} {
+  "ac.module"() ({
+  ^bb0(%input: !b1):
+    "ac.yield"(%input) : (!b1) -> ()
+  }) {sym_name = "Shared", source_owner = #owner, parameters = [], type_parameters = [], function_type = (!b1) -> !b1, input_names = ["input"], output_names = ["output"]} : () -> ()
+  "ac.system"() {entry = {callee = @Shared, parameters = [], type_arguments = []}, domain = "default"} : () -> ()
+}
+)mlir";
+  auto package = parseSourceString<ModuleOp>(final, &context);
+  ASSERT_TRUE(package);
+  ac::HardwareAnalysis analysis(*package);
+  acir::compiler::HardwareEmitContext emitter(*package, analysis);
+  ASSERT_TRUE(succeeded(emitter.prepareNativeChecks()));
+  const auto checkCount = emitter.sourceChecks().checks.size();
+  auto cpp = acir::compiler::emitPreparedCppSourceParts(emitter);
+  ASSERT_TRUE(succeeded(cpp));
+  auto verilog = acir::compiler::emitPreparedVerilogSourceParts(emitter);
+  ASSERT_TRUE(succeeded(verilog));
+  EXPECT_FALSE(cpp->sourceGroups.empty());
+  EXPECT_FALSE(verilog->sourceGroups.empty());
+  EXPECT_EQ(cpp->sourceCheckCount, checkCount);
+  EXPECT_EQ(verilog->sourceCheckCount, checkCount);
+  ASSERT_EQ(cpp->sourceGroups.size(), verilog->sourceGroups.size());
+  for (size_t index = 0; index < cpp->sourceGroups.size(); ++index)
+    EXPECT_EQ(cpp->sourceGroups[index].sourceOwner,
+              verilog->sourceGroups[index].sourceOwner);
+}
+
+TEST(HardwareSourceChecksExecution, PreparedPlanRejectsPackageMutation) {
+  MLIRContext context;
+  context.loadDialect<ac::ACIRDialect>();
+  const char *final = R"mlir(
+#w1 = #ac.static_expr<{kind = "literal", value = {kind = "integer", value = #ac.math_int<1>}, origin = {site = {definition = @Shared, ast_path = []}, expansion = []}, location = {path = "shared.py", line = 1 : i64, column = 1 : i64, end_line = 1 : i64, end_column = 2 : i64}}>
+!b1 = !ac.bits<#w1>
+#owner = {package = "", path = "shared.py"}
+module attributes {ac.stage = "final", ac.source_units = [{package = "", path = "shared.py"}]} {
+  "ac.module"() ({
+  ^bb0(%input: !b1):
+    "ac.yield"(%input) : (!b1) -> ()
+  }) {sym_name = "Shared", source_owner = #owner, parameters = [], type_parameters = [], function_type = (!b1) -> !b1, input_names = ["input"], output_names = ["output"]} : () -> ()
+  "ac.system"() {entry = {callee = @Shared, parameters = [], type_arguments = []}, domain = "default"} : () -> ()
+}
+)mlir";
+  auto package = parseSourceString<ModuleOp>(final, &context);
+  ASSERT_TRUE(package);
+  ac::HardwareAnalysis analysis(*package);
+  acir::compiler::HardwareEmitContext emitter(*package, analysis);
+  ASSERT_TRUE(succeeded(emitter.prepareNativeChecks()));
+  package->getOperation()->setAttr("test.mutation", UnitAttr::get(&context));
+  EXPECT_TRUE(failed(acir::compiler::emitPreparedCppSourceParts(emitter)));
+  EXPECT_TRUE(failed(acir::compiler::emitPreparedVerilogSourceParts(emitter)));
 }

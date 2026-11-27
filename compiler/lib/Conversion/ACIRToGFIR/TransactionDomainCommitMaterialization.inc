@@ -6,7 +6,9 @@ FailureOr<bool> unorderedOwnerGroup(const PreparedTransactionLowering &prepared,
   auto target = routingKey(anchorPath(plan, physical.anchor), physical.declaration->getResult(0));
   for (const auto &peer : prepared.transactions) {
     if (!charge(budget, plan.transaction)) return failure();
-    if (peer.plan == &plan || peer.plan->routingModule != plan.routingModule) continue;
+    if (peer.plan.get() == &plan ||
+        peer.plan->routingModule != plan.routingModule)
+      continue;
     for (const auto &output : peer.outputs) {
       if (!charge(budget, plan.transaction)) return failure();
       const auto &other = peer.plan->owners[output.binding.owner];

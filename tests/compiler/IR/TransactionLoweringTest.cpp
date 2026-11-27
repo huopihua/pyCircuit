@@ -1192,12 +1192,12 @@ TEST_F(TransactionLoweringTest,
       });
       ASSERT_TRUE(mlir::succeeded(candidate)) << diagnostics;
       auto index =
-          llvm::find_if(prepared->transactions,
+          llvm::find_if((*prepared)->transactions,
                         [&](const auto &entry) {
                           return entry.plan->transaction ==
                                  split->getParentOfType<SourceTransactionOp>();
                         }) -
-          prepared->transactions.begin();
+          (*prepared)->transactions.begin();
       ASSERT_LT(static_cast<size_t>(index), candidate->transactions.size());
       auto &transaction = candidate->transactions[index];
       ASSERT_EQ(transaction.branchResults.size(), 1u);
@@ -1324,13 +1324,13 @@ TEST_F(TransactionLoweringTest,
     });
     ASSERT_TRUE(mlir::succeeded(candidate)) << diagnostics;
     auto selected =
-        llvm::find_if(prepared->transactions, [&](const auto &entry) {
+        llvm::find_if((*prepared)->transactions, [&](const auto &entry) {
           return entry.plan->transaction ==
                  split->getParentOfType<SourceTransactionOp>();
         });
-    ASSERT_NE(selected, prepared->transactions.end());
+    ASSERT_NE(selected, (*prepared)->transactions.end());
     auto &transaction = candidate->transactions[std::distance(
-        prepared->transactions.begin(), selected)];
+        (*prepared)->transactions.begin(), selected)];
     ASSERT_EQ(transaction.branchResults.size(), 1u);
     auto &record = transaction.branchResults[0];
     ASSERT_EQ(record.value.getType(), split.getResult(0).getType());
@@ -1441,13 +1441,13 @@ TEST_F(TransactionLoweringTest,
           *prepared, materializationBudget);
     });
     ASSERT_TRUE(mlir::succeeded(candidate)) << diagnostics;
-    auto selected = llvm::find_if(prepared->transactions, [&](const auto &entry) {
+    auto selected = llvm::find_if((*prepared)->transactions, [&](const auto &entry) {
       return entry.plan->transaction ==
              split->getParentOfType<SourceTransactionOp>();
     });
-    ASSERT_NE(selected, prepared->transactions.end());
+    ASSERT_NE(selected, (*prepared)->transactions.end());
     auto &transaction = candidate->transactions[
-        std::distance(prepared->transactions.begin(), selected)];
+        std::distance((*prepared)->transactions.begin(), selected)];
     ASSERT_EQ(transaction.branchResults.size(), 1u);
     auto &record = transaction.branchResults[0];
     ASSERT_FALSE(record.generated.empty());
@@ -1647,7 +1647,7 @@ TEST_F(TransactionLoweringTest,
       return acir::detail::prepareTransactionLowering(*file, analysis, prepareBudget);
     });
     ASSERT_TRUE(mlir::succeeded(prepared)) << diagnostics;
-    ASSERT_TRUE(prepared->valueAvailability);
+    ASSERT_TRUE((*prepared)->valueAvailability);
     detail::SourceCheckBudget materializeBudget(limits);
     auto candidate = capture([&] {
       return acir::detail::materializeTransactionLowering(*prepared, materializeBudget);
@@ -2233,11 +2233,11 @@ TEST_F(TransactionLoweringTest,
           *prepared, *materialized, proofBudget);
     }))) << diagnostics;
     auto preparedIndex =
-        llvm::find_if(prepared->transactions, [&](const auto &entry) {
+        llvm::find_if((*prepared)->transactions, [&](const auto &entry) {
           return entry.plan->transaction == run;
         });
-    ASSERT_NE(preparedIndex, prepared->transactions.end());
-    auto index = std::distance(prepared->transactions.begin(), preparedIndex);
+    ASSERT_NE(preparedIndex, (*prepared)->transactions.end());
+    auto index = std::distance((*prepared)->transactions.begin(), preparedIndex);
     EXPECT_EQ(materialized->transactions[index].bodyChecks.size(),
               kind == "expect" ? 1u : 0u);
     EXPECT_EQ(materialized->transactions[index].observations.size(),
@@ -2304,12 +2304,12 @@ TEST_F(TransactionLoweringTest,
         *authenticPrepared, *authenticMaterialized, effectProofBudget);
   }))) << diagnostics;
   auto effectEntry =
-      llvm::find_if(authenticPrepared->transactions, [&](const auto &entry) {
+      llvm::find_if((*authenticPrepared)->transactions, [&](const auto &entry) {
         return entry.plan->transaction == effectRun;
       });
-  ASSERT_NE(effectEntry, authenticPrepared->transactions.end());
+  ASSERT_NE(effectEntry, (*authenticPrepared)->transactions.end());
   auto effectIndex =
-      std::distance(authenticPrepared->transactions.begin(), effectEntry);
+      std::distance((*authenticPrepared)->transactions.begin(), effectEntry);
   EXPECT_EQ(authenticMaterialized->transactions[effectIndex].bodyChecks.size(),
             1u);
   EXPECT_EQ(
@@ -2425,6 +2425,85 @@ TEST_F(TransactionLoweringTest,
 }
 
 TEST_F(TransactionLoweringTest,
+       CandidateRequiresTheExactFrozenRoutingFactsIdentity) {
+  auto file = parse();
+  ASSERT_TRUE(file);
+  SourceTransactionStateAnalysis analysis(file->getOperation());
+  ASSERT_TRUE(analysis.isValid()) << diagnostics;
+  HardwareSourceCheckLimits limits;
+  detail::SourceCheckBudget firstPreparationBudget(limits);
+  auto first = capture([&] {
+    return acir::detail::prepareTransactionLowering(
+        *file, analysis, firstPreparationBudget);
+  });
+  ASSERT_TRUE(mlir::succeeded(first)) << diagnostics;
+  detail::SourceCheckBudget secondPreparationBudget(limits);
+  auto second = capture([&] {
+    return acir::detail::prepareTransactionLowering(
+        *file, analysis, secondPreparationBudget);
+  });
+  ASSERT_TRUE(mlir::succeeded(second)) << diagnostics;
+  ASSERT_NE(first->sharedFacts(), second->sharedFacts());
+
+  detail::SourceCheckBudget materializationBudget(limits);
+  auto candidate = capture([&] {
+    return acir::detail::materializeTransactionLowering(
+        *first, materializationBudget);
+  });
+  ASSERT_TRUE(mlir::succeeded(candidate)) << diagnostics;
+  EXPECT_EQ(candidate->routingFacts, first->sharedFacts());
+
+  detail::SourceCheckBudget matchingProofBudget(limits);
+  EXPECT_TRUE(mlir::succeeded(capture([&] {
+    return acir::detail::verifyTransactionMaterialization(
+        *first, *candidate, matchingProofBudget);
+  }))) << diagnostics;
+  detail::SourceCheckBudget foreignProofBudget(limits);
+  EXPECT_TRUE(mlir::failed(capture([&] {
+    return acir::detail::verifyTransactionMaterialization(
+        *second, *candidate, foreignProofBudget);
+  })));
+  EXPECT_NE(diagnostics.find("different frozen routing facts"),
+            std::string::npos)
+      << diagnostics;
+}
+
+TEST_F(TransactionLoweringTest,
+       FrozenRoutingFactsOwnOccurrencePlansBeyondAnalysisLifetime) {
+  auto file = parse();
+  ASSERT_TRUE(file);
+  HardwareSourceCheckLimits limits;
+  std::optional<acir::detail::FrozenRoutingFacts> prepared;
+  {
+    auto analysis =
+        std::make_unique<SourceTransactionStateAnalysis>(file->getOperation());
+    ASSERT_TRUE(analysis->isValid()) << diagnostics;
+    detail::SourceCheckBudget preparationBudget(limits);
+    auto result = capture([&] {
+      return acir::detail::prepareTransactionLowering(
+          *file, *analysis, preparationBudget);
+    });
+    ASSERT_TRUE(mlir::succeeded(result)) << diagnostics;
+    prepared.emplace(std::move(*result));
+  }
+  ASSERT_TRUE(*prepared);
+  ASSERT_FALSE((*prepared)->transactions.empty());
+  ASSERT_TRUE((*prepared)->transactions.front().plan);
+
+  detail::SourceCheckBudget materializationBudget(limits);
+  auto candidate = capture([&] {
+    return acir::detail::materializeTransactionLowering(
+        *prepared, materializationBudget);
+  });
+  ASSERT_TRUE(mlir::succeeded(candidate)) << diagnostics;
+  detail::SourceCheckBudget proofBudget(limits);
+  EXPECT_TRUE(mlir::succeeded(capture([&] {
+    return acir::detail::verifyTransactionMaterialization(
+        *prepared, *candidate, proofBudget);
+  }))) << diagnostics;
+}
+
+TEST_F(TransactionLoweringTest,
        OriginalSourceProofRevalidatesReceiverInventoryInEachRun) {
   auto file = crossFixture();
   ASSERT_TRUE(file);
@@ -2489,11 +2568,11 @@ TEST_F(TransactionLoweringTest,
     auto candidateText = print(materialized->module->getOperation());
 
     auto selected =
-        llvm::find_if(prepared->transactions, [](const auto &entry) {
+        llvm::find_if((*prepared)->transactions, [](const auto &entry) {
           return entry.plan->frames.size() > 1 &&
                  entry.plan->instances.size() > 1;
         });
-    ASSERT_NE(selected, prepared->transactions.end());
+    ASSERT_NE(selected, (*prepared)->transactions.end());
     auto &plan = const_cast<TransactionStatePlan &>(*selected->plan);
     ASSERT_GT(plan.values.size(), 1u);
     llvm::SmallVector<BoundValueId> nonLive;
@@ -2602,11 +2681,11 @@ TEST_F(TransactionLoweringTest,
   });
   ASSERT_TRUE(mlir::succeeded(materialized)) << diagnostics;
 
-  auto selected = llvm::find_if(prepared->transactions, [](const auto &entry) {
+  auto selected = llvm::find_if((*prepared)->transactions, [](const auto &entry) {
     return entry.plan->frames.size() > 1 && !entry.liveIns.empty();
   });
-  ASSERT_NE(selected, prepared->transactions.end());
-  auto index = std::distance(prepared->transactions.begin(), selected);
+  ASSERT_NE(selected, (*prepared)->transactions.end());
+  auto index = std::distance((*prepared)->transactions.begin(), selected);
   ASSERT_LT(static_cast<size_t>(index), materialized->transactions.size());
   const auto &plan = *selected->plan;
   const auto &record = materialized->transactions[index];
@@ -2658,9 +2737,9 @@ TEST_F(TransactionLoweringTest,
   auto candidateBefore = identities(*materialized->module);
   auto candidateText = print(materialized->module->getOperation());
 
-  ASSERT_EQ(prepared->transactions.size(), materialized->transactions.size());
+  ASSERT_EQ((*prepared)->transactions.size(), materialized->transactions.size());
   for (auto [preparation, record] :
-       llvm::zip(prepared->transactions, materialized->transactions)) {
+       llvm::zip((*prepared)->transactions, materialized->transactions)) {
     const auto &plan = *preparation.plan;
     ASSERT_EQ(record.frames.size(), plan.frames.size());
     for (auto [frame, binding] : llvm::enumerate(plan.frames))
@@ -2908,8 +2987,8 @@ TEST_F(TransactionLoweringTest,
                                                     preparationBudget);
   });
   ASSERT_TRUE(mlir::succeeded(prepared)) << diagnostics;
-  const auto &relayRoutes = prepared->definitions[
-      prepared->definitionIndex.lookup(relay.getOperation())];
+  const auto &relayRoutes = (*prepared)->definitions[
+      (*prepared)->definitionIndex.lookup(relay.getOperation())];
   ASSERT_EQ(relayRoutes.downward.size(), 2u);
   ASSERT_EQ(relayRoutes.downward[0].path.size(), 1u);
   ASSERT_EQ(relayRoutes.downward[1].path.size(), 1u);
@@ -2918,13 +2997,13 @@ TEST_F(TransactionLoweringTest,
   auto state = first<SourceStateOp>(provider.getBody());
   EXPECT_EQ(relayRoutes.downward[0].value, state.getQ());
   EXPECT_EQ(relayRoutes.downward[1].value, state.getQ());
-  const auto &providerRoutes = prepared->definitions[
-      prepared->definitionIndex.lookup(provider.getOperation())];
+  const auto &providerRoutes = (*prepared)->definitions[
+      (*prepared)->definitionIndex.lookup(provider.getOperation())];
   ASSERT_EQ(providerRoutes.downward.size(), 1u);
   EXPECT_TRUE(providerRoutes.downward[0].path.empty());
   EXPECT_EQ(providerRoutes.downward[0].value, state.getQ());
   unsigned downwardCount = 0;
-  for (const auto &definition : prepared->definitions)
+  for (const auto &definition : (*prepared)->definitions)
     downwardCount += definition.downward.size();
   EXPECT_EQ(downwardCount, 3u);
 
@@ -3749,7 +3828,7 @@ TEST_F(
   });
   ASSERT_TRUE(mlir::succeeded(successful)) << diagnostics;
   llvm::SmallVector<std::tuple<size_t, size_t, size_t>> planSizes;
-  for (const auto &transaction : prepared->transactions)
+  for (const auto &transaction : (*prepared)->transactions)
     planSizes.emplace_back(transaction.plan->bodyChecks.size(),
                            transaction.plan->observations.size(),
                            transaction.plan->events.size());
@@ -3769,7 +3848,7 @@ TEST_F(
       << diagnostics;
   EXPECT_EQ(diagnostics.find("sampled effect lowering"), std::string::npos)
       << diagnostics;
-  for (auto [index, transaction] : llvm::enumerate(prepared->transactions))
+  for (auto [index, transaction] : llvm::enumerate((*prepared)->transactions))
     EXPECT_EQ(planSizes[index],
               std::make_tuple(transaction.plan->bodyChecks.size(),
                               transaction.plan->observations.size(),
@@ -4318,12 +4397,13 @@ protected:
   auto link(mlir::ModuleOp body, mlir::ModuleOp interface,
             compiler::SourceLinkStages *stages,
             compiler::SourceLinkTarget target =
-                compiler::SourceLinkTarget::Hardware) {
+                compiler::SourceLinkTarget::Hardware,
+            compiler::SourceLinkMetrics *metrics = nullptr) {
     return capture([&] {
       return compiler::linkSourceUnits(
           {{body, interface}}, "lower.Owner",
           [&] { return mlir::emitError(builder.getUnknownLoc()); }, target,
-          stages);
+          stages, {}, "strict", "", metrics);
     });
   }
 };
@@ -4411,6 +4491,26 @@ TEST_F(SourceLinkStageTest,
                 ->getAttrOfType<mlir::StringAttr>("ac.stage")
                 .getValue(),
             "source");
+}
+
+TEST_F(SourceLinkStageTest,
+       SuccessfulLinkPublishesNativeProofAndFinalVerificationMetrics) {
+  auto body = sourceBody();
+  ASSERT_TRUE(body);
+  auto interface = header(*body);
+  ASSERT_TRUE(interface);
+  compiler::SourceLinkMetrics metrics;
+  auto linked = link(*body, *interface, nullptr,
+                     compiler::SourceLinkTarget::Hardware, &metrics);
+  ASSERT_TRUE(mlir::succeeded(linked)) << diagnostics;
+  EXPECT_EQ(metrics.proof.status, "complete");
+  EXPECT_GT(metrics.proof.work, 0u);
+  EXPECT_GT(metrics.proof.details.lookup("source_check_plan_entries"), 0u);
+  EXPECT_EQ(metrics.finalVerification.status, "complete");
+  EXPECT_GT(metrics.finalVerification.work, 0u);
+  EXPECT_GT(metrics.finalVerification.details.lookup(
+                "source_check_plan_entries"),
+            0u);
 }
 
 TEST_F(SourceLinkStageTest,

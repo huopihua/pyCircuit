@@ -1,0 +1,24 @@
+{
+  "schema": "pycircuit-issue-431-wse40-lock-v1",
+  "repository": "https://github.com/bobobobo271/pyCircuit",
+  "revision": "c0bc7088a68e9e0693c2f26ee4f6776f19c67bea",
+  "directory": "designs/wse_model",
+  "build_script": "tools/build_wse_machine.py",
+  "top_source": "models/machine/timed_machine.py",
+  "top_source_materialization": "tools/fixed_timed_ledger.py",
+  "top_source_sha256": "30a641aae00bf4616b97278bfe2a8db6c88a36bca5d9f47fab7d1082c022ed19",
+  "compiler_revision": "9b394d437dee4fb0f14869aad119e56cb4f8ed57",
+  "python": {
+    "implementation": "cpython",
+    "version": "3.14.6"
+  },
+  "profile": {
+    "nodes": 40,
+    "early_slots": 2,
+    "seen_slots": 56,
+    "beat_bytes": 64,
+    "model": "timed",
+    "optimization": "O1",
+    "build_parallelism": 1
+  }
+}

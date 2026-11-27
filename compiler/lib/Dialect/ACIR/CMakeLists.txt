@@ -95,6 +95,7 @@ target_include_directories(ACIRDialect PRIVATE
 # (ACIRDialect referencing analysis symbols) is forbidden and enforced by
 # pycircuit_verify_layering and the two layer probes.
 add_acir_library(ACIRAnalysis SOURCES
+  CompilerPhaseMetrics.cpp
   HardwareAnalysis.cpp
   HardwareAnalysisDependencies.cpp
   HardwareAnalysisValidation.cpp

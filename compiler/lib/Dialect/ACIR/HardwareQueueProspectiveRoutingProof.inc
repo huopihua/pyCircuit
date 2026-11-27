@@ -390,8 +390,15 @@
       return module->emitOpError() << "Queue subtree summaries differ from actual ancestor demand inventory";
     uint64_t validityOutputs = llvm::count_if(ports.outputValidity, [](int64_t i) { return i >= 0; });
     validityOutputs += ports.routedOutputValidity.size();
-    if (module.getFunctionType().getNumResults() < validityOutputs + requiredSummaries.size()) return failure();
-    uint64_t outputBase = module.getFunctionType().getNumResults() - validityOutputs - requiredSummaries.size();
+    auto memoryReadInputs = memoryReadInputCount();
+    if (failed(memoryReadInputs) || *memoryReadInputs % 2) return failure();
+    uint64_t memoryReadOutputs = *memoryReadInputs / 2;
+    if (module.getFunctionType().getNumResults() <
+        validityOutputs + memoryReadOutputs + requiredSummaries.size())
+      return failure();
+    uint64_t outputBase = module.getFunctionType().getNumResults() -
+                          validityOutputs - memoryReadOutputs -
+                          requiredSummaries.size();
     if (outputBase < ports.sourceOutputCount) return failure();
     for (auto [payload, companion] : ports.routedOutputValidity)
       if (payload < int64_t(ports.sourceOutputCount) || payload >= int64_t(outputBase))

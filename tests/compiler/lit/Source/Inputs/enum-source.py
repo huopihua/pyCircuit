@@ -1697,14 +1697,14 @@ B3_CASES = [
         "source": "from enum import Enum\nfrom typing import Annotated\nimport pycircuit as ac\n@ac.encoding(width=2)\nclass State(Enum):\n    ZERO = 0\n    ONE = 1\n@ac.encoding(width=2)\nclass Other(Enum):\n    ZERO = 0\n    ONE = 1\n@ac.encoding(width=2)\nclass NoZero(Enum):\n    FIRST = 1\n    SECOND = 2\n@ac.struct\nclass Entry:\n    state: State = Other.ZERO\n",
         "positive": False,
         "category": "unused invalid declared default",
-        "expected_diagnostic": "unsigned boundary hardware type mismatch",
+        "expected_diagnostic": "binding boundary hardware type mismatch",
     },
     {
         "name": "default-overridden-Other-ZERO",
         "source": "from enum import Enum\nfrom typing import Annotated\nimport pycircuit as ac\n@ac.encoding(width=2)\nclass State(Enum):\n    ZERO = 0\n    ONE = 1\n@ac.encoding(width=2)\nclass Other(Enum):\n    ZERO = 0\n    ONE = 1\n@ac.encoding(width=2)\nclass NoZero(Enum):\n    FIRST = 1\n    SECOND = 2\n@ac.struct\nclass Entry:\n    state: State = Other.ZERO\n@ac.module\ndef Top() -> Entry:\n    return Entry(state=State.ONE)\n",
         "positive": False,
         "category": "overridden invalid declared default",
-        "expected_diagnostic": "unsigned boundary hardware type mismatch",
+        "expected_diagnostic": "binding boundary hardware type mismatch",
     },
     {
         "name": "control-nozero-declaration",

@@ -22,6 +22,22 @@ using namespace mlir;
 namespace acir::ac {
 namespace detail {
 namespace {
+Type substituteBoundType(Type type, const HardwareBindings &bindings,
+                         SmallVectorImpl<Type> &active) {
+  auto formal = dyn_cast<TypeParamType>(type);
+  if (!formal || !bindings.owner ||
+      formal.getOwner().getValue() !=
+          SymbolTable::getSymbolName(bindings.owner).getValue())
+    return type;
+  if (llvm::is_contained(active, type))
+    return type; // The owning resolver diagnoses cyclic aliases.
+  auto found = bindings.types.find(formal.getName().getValue());
+  if (found == bindings.types.end())
+    return type;
+  active.push_back(type);
+  llvm::scope_exit cleanup([&] { active.pop_back(); });
+  return substituteBoundType(found->second, bindings, active);
+}
 Attribute substitute(Attribute attr, const HardwareBindings &bindings) {
   if (auto expr = dyn_cast_or_null<StaticExprAttr>(attr)) {
     auto tree = expr.getTree();
@@ -51,10 +67,26 @@ Attribute substitute(Attribute attr, const HardwareBindings &bindings) {
       }
     }
     // Provenance is immutable source evidence, not part of the static
-    // computation. Literal and type-width nodes have no expression children
-    // to substitute; keep their complete authored metadata by identity.
+    // computation. A type-width node has no expression children, but its type
+    // may be an occurrence binding (for example byte_mem T = bits[WIDTH]).
+    // Rewrite that formal while preserving the complete authored metadata.
+    if (kind && kind.getValue() == "type_width") {
+      auto original = tree.getAs<TypeAttr>("type");
+      if (!original)
+        return expr;
+      SmallVector<Type, 2> active;
+      Type rewritten = substituteBoundType(original.getValue(), bindings, active);
+      if (rewritten == original.getValue())
+        return expr;
+      NamedAttrList fields(tree);
+      fields.set("type", TypeAttr::get(rewritten));
+      return StaticExprAttr::get(
+          attr.getContext(), fields.getDictionary(attr.getContext()));
+    }
+    // Literal and reference nodes have no expression children to substitute;
+    // keep their complete authored metadata by identity.
     if (!kind || kind.getValue() == "literal" ||
-        kind.getValue() == "type_width" || kind.getValue() == "reference")
+        kind.getValue() == "reference")
       return expr;
     SmallVector<StringRef, 3> children;
     if (kind.getValue() == "unary") children.push_back("operand");
@@ -322,7 +354,11 @@ evaluateHardwareStatic(const PackedWidthResolver &resolver,
     if (!bindings.owner || !owner || !name ||
         owner.getValue() != SymbolTable::getSymbolName(bindings.owner).getValue() ||
         !bindings.integers.contains(name.getValue()))
-      return site->emitOpError() << "unresolved hardware static expression";
+      return site->emitOpError()
+             << "unresolved hardware static expression " << expression
+             << " under owner "
+             << (bindings.owner ? SymbolTable::getSymbolName(bindings.owner)
+                                : StringAttr());
     // Follow only explicit bindings. The active expression guard rejects cycles;
     // no declaration default or source-local alias becomes a static fact.
     return evaluateHardwareStatic(resolver, expression, bindings, site);

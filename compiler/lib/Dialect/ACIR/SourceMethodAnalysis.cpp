@@ -326,7 +326,7 @@ private:
                           const HardwareAnalysis &hardware, Operation *site) {
     // Arithmetic/index transport keeps its existing source verifier.
     if (!hardwareType(type)) return success();
-    if (!bindingCost(bindings, site) || failed(boundCost(type, site)))
+    if (failed(boundCost(type, site)))
       return failure();
     auto width = hardware.getPackedWidth(type, bindings, site);
     if (failed(width)) return failure();
@@ -340,10 +340,18 @@ private:
                                 unsigned depth = 0) {
     if (depth > maxDepth)
       return operation->emitOpError() << "bound Method region depth exceeded";
+    // Bindings are immutable throughout this body proof. Account for their
+    // storage once at the root, not once per operand/result/block argument.
+    if (depth == 0 && !bindingCost(bindings, operation))
+      return failure();
+    // The complete package has already passed MLIR verification before this
+    // analysis starts.  Do not rescan every generic attribute/property DAG for
+    // every actual occurrence: this proof consumes resolved hardware types and
+    // the operation-specific verifier below.  boundType still bounds every
+    // recursively interpreted hardware type/static expression, while the
+    // definition-level source inventory accounts for operation structure.
     if (!charge(operation, 1 + operation->getNumOperands() +
-                               operation->getNumResults()) ||
-        failed(boundCost(operation->getAttrDictionary(), operation)) ||
-        failed(boundCost(operation->getPropertiesAsAttribute(), operation)))
+                               operation->getNumResults()))
       return failure();
     bool hardwareOperands = true;
     for (TypeRange types : {TypeRange(operation->getOperandTypes()),

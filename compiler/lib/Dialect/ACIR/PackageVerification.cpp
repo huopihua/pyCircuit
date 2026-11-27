@@ -3,6 +3,7 @@
 #include "EntryBoundary.h"
 #include "HardwareSourceChecks.h"
 #include "HardwareValueAvailability.h"
+#include "SourceCheckBudget.h"
 #include "pycircuit/Dialect/ACIR/SourceUnitValidation.h"
 #include "pycircuit/Interfaces/LogicalStateInterfaces.h"
 
@@ -136,10 +137,13 @@ LogicalResult detail::verifyHardwarePackageStage(
 }
 LogicalResult detail::verifyHardwarePackageEnvelope(
     const HardwareAnalysis &analysis, const PackageStagePolicy &policy,
-    const std::function<LogicalResult(uint64_t, Operation *)> &debit) {
+    SourceCheckBudget &budget) {
   auto package = analysis.getPackage();
   if (!package)
     return failure();
+  auto debit = [&](uint64_t units, Operation *site) {
+    return budget.debit(units, site);
+  };
   if (failed(verifyEntryBoundary(analysis, false, debit)))
     return failure();
   auto registrations = package.walk([&](Operation *operation) {
@@ -211,6 +215,6 @@ LogicalResult detail::verifyHardwarePackageEnvelope(
                << "executable hardware package has unresolved ordinary module import; implementation is required for execution completeness";
     }
   }
-  return verifyHardwareValueAvailability(analysis, debit);
+  return verifyHardwareValueAvailability(analysis, budget);
 }
 } // namespace acir::ac

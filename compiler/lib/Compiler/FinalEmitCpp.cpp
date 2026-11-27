@@ -254,17 +254,13 @@ LogicalResult emitDefinitionOnce(HardwareEmitContext &context,
                                  llvm::DenseSet<Operation *> &done) {
   if (done.contains(module))
     return success();
-  for (auto &op : module.getBody().front())
-    if (isa<ac::InstanceOp, ac::CollectionOp>(op)) {
-      auto *callee =
-          isa<ac::InstanceOp>(op)
-              ? context.analysis.resolveCallee(cast<ac::InstanceOp>(op))
-              : context.analysis.resolveCallee(cast<ac::CollectionOp>(op));
-      if (auto nested = dyn_cast_or_null<ac::ModuleOp>(callee))
-        if (nested.getSourceOwner() == module.getSourceOwner() &&
-            failed(emitDefinitionOnce(context, nested, out, done)))
-          return failure();
-    }
+  for (HardwareDefinitionId childId :
+       context.definitionPlan(module).dependencies) {
+    auto nested = context.definitionPlan(childId).definition;
+    if (nested.getSourceOwner() == module.getSourceOwner() &&
+        failed(emitDefinitionOnce(context, nested, out, done)))
+      return failure();
+  }
   done.insert(module);
   return emitHardwareCppDefinition(context, module, out);
 }
@@ -287,9 +283,9 @@ FailureOr<FinalCppSourceParts>
 emitPreparedCppSourceParts(HardwareEmitContext &context) {
   auto package = context.package;
   auto &analysis = context.analysis;
-  // The retained view never grants authority after mutation. Both public and
-  // internal native gates consume this exact verified emission implementation.
-  if (failed(analysis.verifySourceCheckPlan(context.sourceChecks())))
+  // The prepared plan never grants authority after mutation. Check the exact
+  // package identity without rebuilding and reproving the source-check plan.
+  if (failed(context.verifyPreparedPackage()))
     return failure();
   auto root = rootModule(context);
   if (failed(root))
@@ -402,18 +398,13 @@ emitPreparedCppSourceParts(HardwareEmitContext &context) {
     llvm::StringSet<> includes;
     for (Operation *declaration : unit.declarations)
       if (auto module = dyn_cast<ac::ModuleOp>(declaration))
-        for (auto &op : module.getBody().front())
-          if (isa<ac::InstanceOp, ac::CollectionOp>(op)) {
-            auto *callee =
-                isa<ac::InstanceOp>(op)
-                    ? analysis.resolveCallee(cast<ac::InstanceOp>(op))
-                    : analysis.resolveCallee(cast<ac::CollectionOp>(op));
-            if (auto nested = dyn_cast_or_null<ac::ModuleOp>(callee)) {
-              auto childHeader = context.names(nested).header;
-              if (childHeader != group.headerPath)
-                includes.insert(childHeader);
-            }
-          }
+        for (HardwareDefinitionId childId :
+             context.definitionPlan(module).dependencies) {
+          auto nested = context.definitionPlan(childId).definition;
+          auto childHeader = context.names(nested).header;
+          if (childHeader != group.headerPath)
+            includes.insert(childHeader);
+        }
     for (auto &item : includes)
       group.header += "#include \"" + item.getKey().str() + "\"\n";
     {
@@ -550,10 +541,14 @@ LogicalResult emitCpp(ModuleOp package, ac::HardwareAnalysis &analysis,
   auto parts = emitCppSourceParts(package, analysis);
   if (failed(parts))
     return failure();
-  out << parts->supportHeader;
-  for (auto &group : parts->sourceGroups)
-    out << "\n" << group.header;
-  out << "\n" << parts->systemHeader;
+  renderCppSourceParts(*parts, out);
   return success();
+}
+void renderCppSourceParts(const FinalCppSourceParts &parts,
+                          llvm::raw_ostream &out) {
+  out << parts.supportHeader;
+  for (const auto &group : parts.sourceGroups)
+    out << "\n" << group.header;
+  out << "\n" << parts.systemHeader;
 }
 } // namespace acir::compiler

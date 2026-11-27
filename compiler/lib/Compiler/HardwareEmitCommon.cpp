@@ -1,5 +1,6 @@
 #include "HardwareEmitCommon.h"
 #include "../Dialect/ACIR/ACIRSourceContracts.h"
+#include "../Dialect/ACIR/HardwareSourceCheckPreflight.h"
 #include "../Dialect/ACIR/HardwareSourceChecks.h"
 #include "FinalCppNames.h"
 #include "mlir/IR/Builders.h"
@@ -161,7 +162,45 @@ StringRef arithmeticHelper(const HardwareEmitContext &context, StringRef opcode,
     return floorDiv ? "pyc_floordiv" : "pyc_mod";
   if (auto *package = context.rtlPackage)
     (floorDiv ? package->floorDiv : package->mod) = true;
-  return floorDiv ? "pycircuit_types::pyc_floordiv" : "pycircuit_types::pyc_mod";
+  return floorDiv ? "pycircuit_types::pyc_floordiv"
+                  : "pycircuit_types::pyc_mod";
+}
+
+bool supportsProceduralTableRegion(Operation *operation) {
+  if (!isa<ac::TableMapOp, ac::TableMatchOp>(operation))
+    return false;
+  Block &block = operation->getRegion(0).front();
+  return llvm::all_of(block.without_terminator(), [](Operation &nested) {
+    if (auto merge = dyn_cast<ac::ValueMergeOp>(nested))
+      return llvm::all_of(merge.getPaths(), [](Attribute raw) {
+        return cast<ArrayAttr>(raw).empty();
+      });
+    return isa<ac::BitsBinaryOp, ac::BitsCompareOp, ac::BitsSelectOp,
+               ac::BitsResizeOp>(nested);
+  });
+}
+
+std::optional<uint64_t> closedTableLaneCount(HardwareEmitContext &context,
+                                             ArrayAttr shape, Operation *site) {
+  uint64_t lanes = 1;
+  for (Attribute raw : shape) {
+    auto expression = cast<ac::StaticExprAttr>(raw);
+    if (!context.isClosedStatic(expression))
+      return std::nullopt;
+    auto value = context.analysis.evaluateStatic(expression, {}, site);
+    auto integer = succeeded(value) ? dyn_cast<ac::MathIntAttr>(*value)
+                                    : ac::MathIntAttr();
+    if (!integer)
+      return std::nullopt;
+    llvm::APSInt extent(integer.getCanonicalValue());
+    if (extent.isNegative() || extent.getActiveBits() > 64)
+      return std::nullopt;
+    uint64_t amount = extent.getZExtValue();
+    if (amount != 0 && lanes > std::numeric_limits<uint64_t>::max() / amount)
+      return std::nullopt;
+    lanes *= amount;
+  }
+  return lanes;
 }
 // True when this node renders as a signed arithmetic helper call, whose result
 // is already `logic signed [63:0]`.
@@ -170,8 +209,8 @@ bool arithmeticCall(DictionaryAttr tree) {
   if (!kind || kind.getValue() != "binary")
     return false;
   auto opcode = tree.getAs<StringAttr>("operator");
-  return opcode && (opcode.getValue() == "floordiv" ||
-                    opcode.getValue() == "mod");
+  return opcode &&
+         (opcode.getValue() == "floordiv" || opcode.getValue() == "mod");
 }
 FailureOr<std::string>
 staticTree(HardwareEmitContext const &context, DictionaryAttr tree,
@@ -292,9 +331,7 @@ staticTree(HardwareEmitContext const &context, DictionaryAttr tree,
     if (opcode.getValue() == "to_int")
       return *a;
     auto operand =
-        rtl ? (arithmeticCall(operandTree)
-                   ? *a
-                   : "$signed(64'( " + *a + " ))")
+        rtl ? (arithmeticCall(operandTree) ? *a : "$signed(64'( " + *a + " ))")
             : "std::int64_t(" + *a + ")";
     return "(" + symbol.str() + "(" + operand + "))";
   }
@@ -378,8 +415,10 @@ buildObservationPlan(HardwareEmitContext &context) {
   ObservationEmissionPlan plan;
   // Full hardware validation is performed by prepareImpl before emission.
   // Without observations, no descriptor geometry needs to be instantiated.
-  bool hasObservations = false;
-  context.package.walk([&](ac::SourceObserveOp) { hasObservations = true; });
+  bool hasObservations =
+      llvm::any_of(context.definitionPlans(), [](const auto &definition) {
+        return !definition.observations.empty();
+      });
   if (!hasObservations)
     return plan;
   auto root = observationRoot(context);
@@ -402,11 +441,11 @@ buildObservationPlan(HardwareEmitContext &context) {
     };
     SmallVector<Group> groups;
     SmallVector<ObservationEmissionSite> sites;
-    for (Operation &op : definition.getBody().front()) {
-      auto observe = dyn_cast<ac::SourceObserveOp>(op);
-      if (!observe)
-        continue;
-      auto identity = op.getAttrOfType<DictionaryAttr>("ac.observation_id");
+    for (Operation *operation :
+         context.definitionPlan(definition).observations) {
+      auto observe = cast<ac::SourceObserveOp>(operation);
+      auto identity =
+          operation->getAttrOfType<DictionaryAttr>("ac.observation_id");
       auto key = [&](Attribute value,
                      llvm::DenseMap<Attribute, uint64_t> &table) {
         auto found = table.find(value);
@@ -441,14 +480,12 @@ buildObservationPlan(HardwareEmitContext &context) {
     }
     plan.definitions[definition] = std::move(sites);
     const auto &parent = bindings;
-    for (Operation &op : definition.getBody().front()) {
-      if (!isa<ac::InstanceOp, ac::CollectionOp>(op))
-        continue;
-      auto *callee =
-          isa<ac::InstanceOp>(op)
-              ? context.analysis.resolveCallee(cast<ac::InstanceOp>(op))
-              : context.analysis.resolveCallee(cast<ac::CollectionOp>(op));
-      auto child = dyn_cast_or_null<ac::ModuleOp>(callee);
+    for (const HardwareEmissionChild &planned :
+         context.definitionPlan(definition).children) {
+      Operation &op = *planned.occurrence;
+      auto child = planned.definition
+                       ? context.definitionPlan(*planned.definition).definition
+                       : ac::ModuleOp();
       uint64_t shape = 1;
       if (auto collection = dyn_cast<ac::CollectionOp>(op)) {
         auto extents =
@@ -616,13 +653,35 @@ buildObservationPlan(HardwareEmitContext &context) {
       return context.package.emitOpError()
              << "native observation stable ordinals are not unique";
   }
+  if (auto *metrics = context.metrics()) {
+    uint64_t entries = plan.table.size() + plan.occurrences.size();
+    for (const auto &entry : plan.definitions)
+      entries += entry.second.size();
+    for (const auto &entry : plan.children)
+      entries += entry.second.size();
+    entries += plan.subtreeWidth.size() + plan.childBaseUnits.size();
+    uint64_t bytes =
+        plan.table.capacity() * sizeof(plan.table.front()) +
+        plan.occurrences.capacity() * sizeof(ObservationEmissionOccurrence);
+    for (const auto &entry : plan.definitions)
+      bytes += entry.second.capacity() * sizeof(ObservationEmissionSite);
+    for (const auto &entry : plan.children)
+      bytes += entry.second.capacity() * sizeof(ObservationEmissionChild);
+    for (const auto &entry : plan.childBaseUnits)
+      bytes += entry.second.capacity() * sizeof(uint64_t);
+    metrics->details["observation_plan_entries"] = entries;
+    metrics->details["observation_plan_bytes"] = bytes;
+    metrics->planEntries += entries;
+    metrics->planBytes += bytes;
+  }
   return plan;
 }
 } // namespace
-HardwareEmitContext::HardwareEmitContext(ModuleOp package,
-                                         ac::HardwareAnalysis &analysis,
-                                         bool physical)
-    : package(package), analysis(analysis), physical_(physical) {}
+HardwareEmitContext::HardwareEmitContext(
+    ModuleOp package, ac::HardwareAnalysis &analysis, bool physical,
+    acir::metrics::CompilerPhaseMetrics *metrics)
+    : package(package), analysis(analysis), physical_(physical),
+      metrics_(metrics) {}
 LogicalResult HardwareEmitContext::prepare() { return prepareImpl(false); }
 LogicalResult HardwareEmitContext::prepareNativeChecks() {
   return prepareImpl(true);
@@ -649,12 +708,23 @@ std::string HardwareEmitContext::rtlReset(StringRef expression) const {
 }
 LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
   sourceChecks_.reset();
+  observationPlan_.reset();
+  preparedPackage_.clear();
   names_.clear();
+  definitionIds_.clear();
+  definitionPlans_.clear();
+  rootReachableDefinitions_.clear();
+  standardRtlSources_.clear();
   if (!package)
     return failure();
   // Building the plan includes full package verification. Retain that result
   // instead of verifying and expanding the same occurrence closure twice.
-  auto checks = analysis.getSourceCheckPlan();
+  ac::detail::SourceCheckBuildMetrics buildMetrics;
+  auto checks = ac::detail::buildSourceCheckPlan(
+      analysis, {}, ac::detail::PackageStagePolicy::hardware(),
+      metrics_ ? &buildMetrics : nullptr);
+  if (metrics_)
+    ac::detail::publishSourceCheckMetrics(buildMetrics, *metrics_);
   if (failed(checks))
     return failure();
   // The C++ native observation plan prepares through `prepareNativeChecks()`
@@ -662,7 +732,11 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
   // shared gate stays closed for `ac.observe` because the Verilog target has no
   // observation channel yet, and a silently dropped observation is
   // exactly what the fail-closed contract forbids.
+  if (metrics_)
+    ++metrics_->irWalks;
   auto unsupported = package.walk([&](Operation *op) {
+    if (metrics_)
+      ++metrics_->visitedNodes;
     if ((allowSourceChecks || !isa<ac::SourceObserveOp>(op)) &&
         (allowSourceChecks || !isa<ac::SourceExpectOp>(op)))
       return WalkResult::advance();
@@ -1084,10 +1158,310 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
     physicalProjection_ = *projection;
   }
   sourceChecks_ = std::move(*checks);
+  if (failed(prepareDefinitionEmissionPlans(cast<ac::ModuleOp>(root->owner))))
+    return failure();
+  auto observation = buildObservationPlan(*this);
+  if (failed(observation))
+    return failure();
+  observationPlan_ = std::move(*observation);
+  capturePreparedPackage();
+  if (metrics_)
+    metrics_->status = "complete";
+  return success();
+}
+LogicalResult
+HardwareEmitContext::prepareDefinitionEmissionPlans(ac::ModuleOp root) {
+  auto definitions = analysis.getDefinitions();
+  if (definitions.size() > std::numeric_limits<HardwareDefinitionId>::max())
+    return package.emitOpError() << "too many hardware definitions to emit";
+  definitionPlans_.reserve(definitions.size());
+  for (auto definition : definitions) {
+    HardwareDefinitionId id = definitionPlans_.size();
+    definitionIds_.try_emplace(definition, id);
+    HardwareDefinitionEmissionPlan plan;
+    plan.id = id;
+    plan.definition = definition;
+    definitionPlans_.push_back(std::move(plan));
+  }
+
+  llvm::StringSet<> standardSources;
+  auto addStandardSource = [&](std::string path) {
+    if (standardSources.insert(path).second)
+      standardRtlSources_.push_back(std::move(path));
+  };
+  for (auto &plan : definitionPlans_) {
+    llvm::SmallDenseSet<HardwareDefinitionId, 8> dependencies;
+    if (metrics_)
+      ++metrics_->irWalks;
+    WalkResult scanned = plan.definition.walk([&](Operation *operation) {
+      if (operation == plan.definition.getOperation())
+        return WalkResult::advance();
+      if (metrics_)
+        ++metrics_->visitedNodes;
+      bool topLevel =
+          operation->getBlock() == &plan.definition.getBody().front();
+      if (topLevel && isa<ac::SourceObserveOp>(operation))
+        plan.observations.push_back(operation);
+      if (auto splat = dyn_cast<ac::TableSplatOp>(operation)) {
+        ++plan.tableSplats;
+        return WalkResult::advance();
+      }
+      if (isa<ac::TableMapOp, ac::TableMatchOp>(operation)) {
+        ArrayAttr shape =
+            isa<ac::TableMapOp>(operation)
+                ? cast<ac::TableMapOp>(operation).getShape()
+                : cast<ac::TableType>(operation->getOperand(0).getType())
+                      .getShape();
+        plan.tableRegions.try_emplace(
+            operation, HardwareTableRegionEmissionPlan{
+                           supportsProceduralTableRegion(operation)
+                               ? HardwareTableRegionLowering::Procedural
+                               : HardwareTableRegionLowering::Generated,
+                           closedTableLaneCount(*this, shape, operation)});
+        return WalkResult::advance();
+      }
+      if (!topLevel || !isa<ac::InstanceOp, ac::CollectionOp>(operation))
+        return WalkResult::advance();
+      Operation *callee =
+          isa<ac::InstanceOp>(operation)
+              ? analysis.resolveCallee(cast<ac::InstanceOp>(operation))
+              : analysis.resolveCallee(cast<ac::CollectionOp>(operation));
+      HardwareEmissionChild child;
+      child.occurrence = operation;
+      child.callee = callee;
+      child.queue = isa<ac::InstanceOp>(operation) &&
+                    ac::isQueueInstance(cast<ac::InstanceOp>(operation));
+      child.primitiveKind = analysis.getPrimitiveKind(callee).str();
+      if (auto nested = dyn_cast_or_null<ac::ModuleOp>(callee)) {
+        auto found = definitionIds_.find(nested);
+        if (found == definitionIds_.end()) {
+          operation->emitOpError()
+              << "resolved child definition is absent from emission plan";
+          return WalkResult::interrupt();
+        }
+        child.definition = found->second;
+        if (dependencies.insert(*child.definition).second)
+          plan.dependencies.push_back(*child.definition);
+      }
+      if (child.queue)
+        addStandardSource("include/verilog/fifo.v");
+      plan.children.push_back(std::move(child));
+      return WalkResult::advance();
+    });
+    if (scanned.wasInterrupted())
+      return failure();
+    auto work = analysis.getIndependentWorkSubtrees(plan.definition);
+    if (failed(work))
+      return failure();
+    plan.independentWorkSubtrees = std::move(*work);
+  }
+
+  auto rootId = definitionId(root);
+  if (!rootId)
+    return root.emitOpError() << "root definition is absent from emission plan";
+  llvm::SmallVector<HardwareDefinitionId, 0> pending{*rootId};
+  llvm::SmallDenseSet<HardwareDefinitionId, 16> reached;
+  while (!pending.empty()) {
+    HardwareDefinitionId id = pending.pop_back_val();
+    if (!reached.insert(id).second)
+      continue;
+    definitionPlans_[id].reachableFromRoot = true;
+    rootReachableDefinitions_.push_back(id);
+    llvm::append_range(pending, definitionPlans_[id].dependencies);
+  }
+
+  for (auto imported : package.getOps<ac::ModuleImportOp>()) {
+    auto kind = analysis.getPrimitiveKind(imported);
+    if (kind.empty())
+      return imported.emitOpError()
+             << "unresolved module import in hardware emission plan";
+    if (kind == "fifo_local" || kind == "fifo_downstream_pop")
+      continue;
+    addStandardSource("include/verilog/" + kind.str() + ".v");
+  }
+
+  if (metrics_) {
+    uint64_t tableSplats = 0, tableMaps = 0, tableMatches = 0;
+    uint64_t proceduralTableRegions = 0, generatedTableRegions = 0;
+    uint64_t generatedLaneOccurrences = 0, symbolicGeneratedTableRegions = 0;
+    uint64_t tableRegionElaborationUnits = 0;
+    uint64_t entries = definitionPlans_.size() + definitionIds_.size() +
+                       rootReachableDefinitions_.size() +
+                       standardRtlSources_.size();
+    uint64_t bytes =
+        definitionPlans_.capacity() * sizeof(HardwareDefinitionEmissionPlan) +
+        rootReachableDefinitions_.capacity() * sizeof(HardwareDefinitionId) +
+        standardRtlSources_.capacity() * sizeof(std::string);
+    for (const auto &plan : definitionPlans_) {
+      entries += plan.children.size() + plan.dependencies.size() +
+                 plan.independentWorkSubtrees.size() +
+                 plan.observations.size() + plan.tableRegions.size();
+      bytes += plan.children.capacity() * sizeof(HardwareEmissionChild) +
+               plan.dependencies.capacity() * sizeof(HardwareDefinitionId) +
+               plan.independentWorkSubtrees.capacity() * sizeof(Operation *) +
+               plan.observations.capacity() * sizeof(Operation *) +
+               plan.tableRegions.getMemorySize();
+      tableSplats += plan.tableSplats;
+      tableRegionElaborationUnits += plan.tableSplats;
+      for (const auto &[operation, region] : plan.tableRegions) {
+        tableMaps += isa<ac::TableMapOp>(operation);
+        tableMatches += isa<ac::TableMatchOp>(operation);
+        if (region.lowering == HardwareTableRegionLowering::Procedural) {
+          ++proceduralTableRegions;
+          ++tableRegionElaborationUnits;
+        } else {
+          ++generatedTableRegions;
+          if (region.staticLanes) {
+            generatedLaneOccurrences += *region.staticLanes;
+            tableRegionElaborationUnits += *region.staticLanes;
+          } else {
+            ++symbolicGeneratedTableRegions;
+          }
+        }
+      }
+      for (const auto &child : plan.children)
+        bytes += child.primitiveKind.capacity();
+    }
+    for (const auto &source : standardRtlSources_)
+      bytes += source.capacity();
+    metrics_->details["definition_emission_plan_entries"] = entries;
+    metrics_->details["definition_emission_plan_bytes"] = bytes;
+    metrics_->details["rtl_table_splats"] = tableSplats;
+    metrics_->details["rtl_table_maps"] = tableMaps;
+    metrics_->details["rtl_table_matches"] = tableMatches;
+    metrics_->details["rtl_procedural_table_regions"] = proceduralTableRegions;
+    metrics_->details["rtl_generated_table_regions"] = generatedTableRegions;
+    metrics_->details["rtl_generated_lane_occurrences"] =
+        generatedLaneOccurrences;
+    metrics_->details["rtl_symbolic_generated_table_regions"] =
+        symbolicGeneratedTableRegions;
+    metrics_->details["rtl_table_region_elaboration_units"] =
+        tableRegionElaborationUnits;
+    metrics_->planEntries += entries;
+    metrics_->planBytes += bytes;
+  }
+  return success();
+}
+void HardwareEmitContext::capturePreparedPackage() {
+  if (metrics_)
+    ++metrics_->irWalks;
+  package.getOperation()->walk([&](Operation *operation) {
+    if (metrics_)
+      ++metrics_->visitedNodes;
+    PreparedOperationIdentity identity;
+    identity.operation = operation;
+    identity.parentBlock = operation->getBlock();
+    identity.location = operation->getLoc();
+    identity.attributes = operation->getAttrDictionary();
+    identity.properties = operation->getPropertiesAsAttribute();
+    llvm::append_range(identity.operands, operation->getOperands());
+    llvm::append_range(identity.resultTypes, operation->getResultTypes());
+    llvm::append_range(identity.successors, operation->getSuccessors());
+    for (Region &region : operation->getRegions())
+      for (Block &block : region) {
+        identity.blocks.push_back(&block);
+        for (BlockArgument argument : block.getArguments())
+          identity.blockArgumentTypes.push_back(argument.getType());
+      }
+    preparedPackage_.push_back(std::move(identity));
+  });
+  if (metrics_) {
+    metrics_->details["prepared_package_identity_entries"] =
+        preparedPackage_.size();
+    uint64_t bytes =
+        preparedPackage_.capacity() * sizeof(PreparedOperationIdentity);
+    for (const auto &identity : preparedPackage_)
+      bytes += identity.operands.capacity() * sizeof(Value) +
+               identity.resultTypes.capacity() * sizeof(Type) +
+               identity.blocks.capacity() * sizeof(Block *) +
+               identity.blockArgumentTypes.capacity() * sizeof(Type) +
+               identity.successors.capacity() * sizeof(Block *);
+    metrics_->details["prepared_package_identity_bytes"] = bytes;
+    metrics_->planEntries += preparedPackage_.size();
+    metrics_->planBytes += bytes;
+  }
+}
+LogicalResult HardwareEmitContext::verifyPreparedPackage() {
+  size_t index = 0;
+  bool same = true;
+  package.getOperation()->walk([&](Operation *operation) {
+    if (!same || index >= preparedPackage_.size()) {
+      same = false;
+      return WalkResult::interrupt();
+    }
+    const auto &expected = preparedPackage_[index++];
+    if (expected.operation != operation ||
+        expected.parentBlock != operation->getBlock() ||
+        expected.location != operation->getLoc() ||
+        expected.attributes != operation->getAttrDictionary() ||
+        expected.properties != operation->getPropertiesAsAttribute() ||
+        !llvm::equal(expected.operands, operation->getOperands()) ||
+        !llvm::equal(expected.resultTypes, operation->getResultTypes()) ||
+        !llvm::equal(expected.successors, operation->getSuccessors())) {
+      same = false;
+      return WalkResult::interrupt();
+    }
+    size_t blockIndex = 0, argumentIndex = 0;
+    for (Region &region : operation->getRegions())
+      for (Block &block : region) {
+        if (blockIndex >= expected.blocks.size() ||
+            expected.blocks[blockIndex++] != &block) {
+          same = false;
+          return WalkResult::interrupt();
+        }
+        for (BlockArgument argument : block.getArguments())
+          if (argumentIndex >= expected.blockArgumentTypes.size() ||
+              expected.blockArgumentTypes[argumentIndex++] !=
+                  argument.getType()) {
+            same = false;
+            return WalkResult::interrupt();
+          }
+      }
+    if (blockIndex != expected.blocks.size() ||
+        argumentIndex != expected.blockArgumentTypes.size()) {
+      same = false;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  if (!same || index != preparedPackage_.size())
+    return package.getOperation()->emitOpError()
+           << "hardware emission package changed after preparation";
   return success();
 }
 const EmitNames &HardwareEmitContext::names(Operation *definition) const {
   return names_.find(definition)->second;
+}
+std::optional<HardwareDefinitionId>
+HardwareEmitContext::definitionId(Operation *definition) const {
+  auto found = definitionIds_.find(definition);
+  if (found == definitionIds_.end())
+    return std::nullopt;
+  return found->second;
+}
+const HardwareDefinitionEmissionPlan &
+HardwareEmitContext::definitionPlan(HardwareDefinitionId id) const {
+  assert(id < definitionPlans_.size() && "invalid hardware definition id");
+  return definitionPlans_[id];
+}
+const HardwareDefinitionEmissionPlan &
+HardwareEmitContext::definitionPlan(ac::ModuleOp definition) const {
+  auto id = definitionId(definition);
+  assert(id && "unplanned hardware definition");
+  return definitionPlan(*id);
+}
+const HardwareTableRegionEmissionPlan &
+HardwareEmitContext::tableRegionPlan(Operation *operation) const {
+  auto definition = operation->getParentOfType<ac::ModuleOp>();
+  assert(definition && "Table region must belong to a hardware definition");
+  auto found = definitionPlan(definition).tableRegions.find(operation);
+  assert(found != definitionPlan(definition).tableRegions.end() &&
+         "unplanned Table region");
+  return found->second;
+}
+const ObservationEmissionPlan &HardwareEmitContext::observationPlan() const {
+  assert(observationPlan_ && "emission context must be prepared");
+  return *observationPlan_;
 }
 FailureOr<std::string>
 HardwareEmitContext::cppFormalName(StringRef name, Operation *site) const {
@@ -1230,8 +1604,8 @@ FailureOr<std::string> HardwareEmitContext::rtlType(Type type,
   }
   if (!declaration)
     return site->emitOpError() << "unresolved RTL nominal type";
-  auto q = qualified(SymbolTable::getSymbolName(declaration).getValue(), site,
-                     "_");
+  auto q =
+      qualified(SymbolTable::getSymbolName(declaration).getValue(), site, "_");
   if (failed(q))
     return failure();
   if (rtlPackage)
@@ -1800,20 +2174,18 @@ observationPayloadWidth(HardwareEmitContext &context,
 }
 FailureOr<std::string>
 cppObservationDescriptorTable(HardwareEmitContext &context) {
-  auto plan = buildObservationPlan(context);
-  if (failed(plan))
-    return failure();
+  const auto &plan = context.observationPlan();
   // An unobserved design keeps the empty configuration and emits no table at
   // all, so its generated glue stays byte-identical to the previous emitter.
-  if (plan->table.empty())
+  if (plan.table.empty())
     return std::string();
   std::string text;
   llvm::raw_string_ostream out(text);
   out << "static constexpr gfsim::ObservationDescriptor "
          "pyc_observation_descriptors["
-      << plan->table.size() << "] = {";
-  for (auto [index, entry] : llvm::enumerate(plan->table)) {
-    const auto &occurrence = plan->occurrences[index];
+      << plan.table.size() << "] = {";
+  for (auto [index, entry] : llvm::enumerate(plan.table)) {
+    const auto &occurrence = plan.occurrences[index];
     auto observe = cast<ac::SourceObserveOp>(occurrence.site.op);
     auto width = observationPayloadWidth(context, occurrence);
     if (failed(width))
@@ -1831,41 +2203,32 @@ cppObservationDescriptorTable(HardwareEmitContext &context) {
 }
 FailureOr<std::string>
 cppObservationConfigureCall(HardwareEmitContext &context) {
-  auto plan = buildObservationPlan(context);
-  if (failed(plan))
-    return failure();
-  if (plan->table.empty())
+  const auto &plan = context.observationPlan();
+  if (plan.table.empty())
     return std::string("observations_.Configure({}, 0)");
   return "observations_.Configure(pyc_observation_descriptors, " +
-         std::to_string(plan->events) + ")";
+         std::to_string(plan.events) + ")";
 }
 FailureOr<std::string> cppObservationChildBase(HardwareEmitContext &context,
                                                ac::ModuleOp definition,
                                                unsigned childIndex) {
-  auto plan = buildObservationPlan(context);
-  if (failed(plan))
-    return failure();
-  auto bases = plan->childBaseUnits.find(definition);
-  if (bases == plan->childBaseUnits.end() || childIndex >= bases->second.size())
+  const auto &plan = context.observationPlan();
+  auto bases = plan.childBaseUnits.find(definition);
+  if (bases == plan.childBaseUnits.end() || childIndex >= bases->second.size())
     return definition.emitOpError() << "native observation child is unplanned";
   return std::to_string(bases->second[childIndex]);
 }
 FailureOr<uint64_t> cppObservationLaneStride(HardwareEmitContext &context,
                                              ac::ModuleOp definition) {
-  auto plan = buildObservationPlan(context);
-  if (failed(plan))
-    return failure();
-  auto sites = plan->definitions.find(definition);
-  return sites == plan->definitions.end()
+  const auto &plan = context.observationPlan();
+  auto sites = plan.definitions.find(definition);
+  return sites == plan.definitions.end()
              ? uint64_t{0}
              : static_cast<uint64_t>(sites->second.size());
 }
 FailureOr<uint64_t> cppObservationSubtreeWidth(HardwareEmitContext &context,
                                                ac::ModuleOp definition) {
-  auto plan = buildObservationPlan(context);
-  if (failed(plan))
-    return failure();
-  return plan->subtreeWidth.lookup(definition);
+  return context.observationPlan().subtreeWidth.lookup(definition);
 }
 LogicalResult
 cppObservationStaging(HardwareEmitContext &context, ac::ModuleOp definition,
@@ -1873,11 +2236,9 @@ cppObservationStaging(HardwareEmitContext &context, ac::ModuleOp definition,
                       llvm::StringRef object, llvm::StringRef count,
                       const std::function<FailureOr<std::string>(Value)> &value,
                       llvm::raw_ostream &out) {
-  auto plan = buildObservationPlan(context);
-  if (failed(plan))
-    return failure();
-  auto sites = plan->definitions.find(definition);
-  if (sites == plan->definitions.end() || sites->second.empty())
+  const auto &plan = context.observationPlan();
+  auto sites = plan.definitions.find(definition);
+  if (sites == plan.definitions.end() || sites->second.empty())
     return success();
   // One staged value per descriptor, so every observed operand keeps its own
   // `ObservationDescriptor` and therefore its own globally unique ordinal.
@@ -1943,7 +2304,7 @@ bool HardwareEmitContext::isSystem() {
 }
 FailureOr<ObservationEmissionPlan>
 observationEmissionPlan(HardwareEmitContext &context) {
-  return buildObservationPlan(context);
+  return context.observationPlan();
 }
 namespace {
 FailureOr<llvm::json::Value> metadataValue(Attribute value, Operation *site) {
@@ -2016,20 +2377,20 @@ observationSiteMetadataJson(ac::SourceObserveOp observe) {
 }
 FailureOr<std::string>
 cppObservationRunnerMetadata(HardwareEmitContext &context) {
-  auto plan = buildObservationPlan(context);
+  const auto &plan = context.observationPlan();
   auto root = observationRoot(context);
-  if (failed(plan) || failed(root))
+  if (failed(root))
     return failure();
   std::string text;
   llvm::raw_string_ostream out(text);
   out << "inline std::span<const gfsim::RunnerObservation> "
          "pyc_observation_metadata() {\n";
-  if (plan->occurrences.empty()) {
+  if (plan.occurrences.empty()) {
     out << "  return {};\n}\n";
     return text;
   }
   out << "  static const gfsim::RunnerObservation entries[] = {\n";
-  for (const auto &entry : plan->occurrences) {
+  for (const auto &entry : plan.occurrences) {
     auto observe = cast<ac::SourceObserveOp>(entry.site.op);
     auto identity = observe->getAttrOfType<DictionaryAttr>("ac.observation_id");
     if (!identity)

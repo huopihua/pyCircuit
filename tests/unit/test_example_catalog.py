@@ -116,6 +116,35 @@ def test_checked_out_catalog_matches_registered_examples(tool):
     navigation = tool.navigation(ROOT)
     assert "docs/gates/logs" not in navigation
     assert "migration" not in navigation.lower()
+    published = tool.published_generated_examples(ROOT)
+    assert len(published) == 14
+    assert set(published) == {
+        row["name"] for row in data["examples"] if row.get("generated")
+    }
+
+
+def test_published_inventory_does_not_treat_checked_in_receipt_as_a_run(
+    tool, catalog_repo
+):
+    repo, data = catalog_repo
+    generated = next(row for row in data["examples"] if row.get("generated"))
+    receipt = repo / generated["folder"] / generated["generated"]
+    receipt.write_text("not a current execution receipt\n")
+    assert tool.published_generated_examples(repo, expected=1) == ["beta"]
+
+
+def test_published_selection_requires_every_current_candidate_test(
+    tool, catalog_repo, tmp_path
+):
+    repo, _ = catalog_repo
+    selection = tmp_path / "selection.json"
+    _write_json(selection, {"tests": [{"name": "beta"}]})
+    assert tool.validate_published_test_selection(repo, selection, expected=1) == [
+        "beta"
+    ]
+    _write_json(selection, {"tests": []})
+    with pytest.raises(ValueError, match="selection differs from catalog"):
+        tool.validate_published_test_selection(repo, selection, expected=1)
 
 
 @pytest.fixture

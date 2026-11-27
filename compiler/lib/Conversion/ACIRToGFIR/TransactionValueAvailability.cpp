@@ -8,6 +8,9 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/ScopeExit.h"
+#include <algorithm>
+#include <bit>
+#include <functional>
 #include <limits>
 #include <optional>
 
@@ -21,12 +24,19 @@ class ValueAvailabilityMaterializer {
   // distinction between nested fields and one field containing punctuation.
   using Key = std::pair<Value, ArrayAttr>;
   using AvailabilityMap = llvm::DenseMap<Key, Value>;
-  // Keep inactive entries rather than erase them: hash-table growth remains
-  // governed only by entry count, with no hidden tombstone-triggered rehash.
-  using ActiveKeys = llvm::DenseMap<Key, bool>;
+  // Cycle detection is an active recursion path, not a persistent semantic
+  // plan. Every availability recursion is already capped at 128, so keep the
+  // path inline and pop it on return instead of retaining a second cache-sized
+  // DenseMap of inactive entries.
+  using ActiveKeys = llvm::SmallVector<Key, 128>;
   using RowKey = std::pair<Key, uint64_t>;
-  using SelectedRows = llvm::DenseMap<RowKey, Value>;
-  using ActiveSelectedRows = llvm::DenseMap<RowKey, bool>;
+  struct SelectedRowValue {
+    Value value;
+    bool initialized = false;
+  };
+  using SelectedRows =
+      llvm::DenseMap<Key, SmallVector<SelectedRowValue, 0>>;
+  using ActiveSelectedRows = llvm::SmallVector<RowKey, 128>;
   using UniformResult = std::optional<Value>;
   using UniformMap = llvm::DenseMap<Key, UniformResult>;
   using GuardMap = llvm::DenseMap<Key, std::optional<bool>>;
@@ -44,12 +54,32 @@ class ValueAvailabilityMaterializer {
   DenseMap<Operation *, Ports> ports;
   DenseMap<Operation *, unsigned> colors;
   DenseMap<Operation *, MaterializedTransaction *> records;
+  // Candidate SSA is occurrence-local, but every callable result still has a
+  // frozen invocation owner in TransactionStatePlan.  Keep that delta as an
+  // index so recursive availability discovery does not charge a caller for the
+  // complete, independently replayable body of every nested invocation.  One
+  // actual SSA may be both a callee yield and its caller's call-result alias;
+  // retain the first stable owner because there is still only one generated
+  // availability value for that actual SSA.  Proof conclusions are never
+  // shared through this index.
+  struct OccurrenceValue {
+    uint64_t scope = 0;
+    Value availability;
+    bool initialized = false;
+  };
+  struct OccurrenceEntry {
+    Value value;
+    OccurrenceValue record;
+  };
+  SmallVector<OccurrenceEntry, 0> occurrenceValues;
+  uint64_t activeInvocationScope = 0;
   AvailabilityMap cache;
   ActiveKeys active;
   DenseMap<Value, Value> inputAvailability;
   DenseMap<std::pair<Operation *, Value>, Value> ruleCaptures;
   struct RowFrame {
-    ac::TableMapOp source, companion;
+    Operation *source = nullptr;
+    ac::TableMapOp companion;
     IRMapping raw;
     AvailabilityMap cache, bindings, rows;
     ActiveKeys active, activeRows;
@@ -69,6 +99,31 @@ class ValueAvailabilityMaterializer {
   GuardMap guardCache;
   ActiveKeys uniformActive, guardActive;
   unsigned uniformDepth = 0, guardDepth = 0;
+  OccurrenceValue *lookupOccurrence(Value value) {
+    auto less = [](const void *left, const void *right) {
+      return std::less<const void *>()(left, right);
+    };
+    auto found = std::lower_bound(
+        occurrenceValues.begin(), occurrenceValues.end(), value,
+        [&](const OccurrenceEntry &entry, Value wanted) {
+          return less(entry.value.getAsOpaquePointer(),
+                      wanted.getAsOpaquePointer());
+        });
+    return found != occurrenceValues.end() && found->value == value
+               ? &found->record
+               : nullptr;
+  }
+  template <typename Fn>
+  auto inInvocationScope(Value value, Fn &&fn) -> decltype(fn()) {
+    auto *found = lookupOccurrence(value);
+    if (!found || !found->scope || found->scope == activeInvocationScope)
+      return fn();
+    ac::detail::SourceCheckBudget::LocalScope local(budget);
+    uint64_t previous = activeInvocationScope;
+    activeInvocationScope = found->scope;
+    llvm::scope_exit restore([&] { activeInvocationScope = previous; });
+    return fn();
+  }
   FailureOr<Key> keyFor(Value value, ArrayRef<StringAttr> path,
                         Operation *site) {
     // Replace pointer/field serialization with typed handle uniquing. Pay path
@@ -100,36 +155,54 @@ class ValueAvailabilityMaterializer {
     if (count > std::numeric_limits<unsigned>::max() ||
         failed(budget.debit(2, site))) return failure();
     if (capacity > oldCapacity) {
-      uint64_t growth = ac::detail::SourceCheckBudget::add(oldCapacity,
-          ac::detail::SourceCheckBudget::bytes(
-              ac::detail::SourceCheckBudget::multiply(capacity - oldCapacity,
-                                                       sizeof(Bucket))));
-      if (failed(budget.debit(growth, site))) return failure();
+      uint64_t growth = ac::detail::SourceCheckBudget::bytes(
+          ac::detail::SourceCheckBudget::multiply(capacity - oldCapacity,
+                                                   sizeof(Bucket)));
+      if (failed(budget.debit(oldCapacity, site)) ||
+          failed(budget.debitPersistent(growth, site)))
+        return failure();
     }
     storage.reserve(count);
     return success();
   }
   template <typename Map, typename CacheKey>
   FailureOr<bool> enterKey(Map &storage, const CacheKey &key, Operation *site) {
-    // Prepay this lookup and the cleanup lookup before making the key active.
-    if (failed(budget.debit(4, site)))
+    if (failed(budget.debit(2 + storage.size(), site)))
       return failure();
-    auto found = storage.find(key);
-    if (found != storage.end()) {
-      if (found->second)
-        return false;
-      found->second = true;
-    } else {
-      if (failed(reserveKey(site, storage)))
-        return failure();
-      storage.try_emplace(key, true);
-    }
+    if (llvm::is_contained(storage, key))
+      return false;
+    storage.push_back(key);
     return true;
   }
   bool inRow(Value value) {
-    return rowFrame && value.getParentBlock() == &rowFrame->source.getBody().front();
+    return rowFrame && value.getParentBlock() ==
+                           &rowFrame->source->getRegion(0).front();
+  }
+  bool rowOrdinalArgument(unsigned ordinal) {
+    return isa<ac::TableMapOp>(rowFrame->source) && ordinal == 0;
+  }
+  Value rowTableArgument(unsigned ordinal) {
+    if (auto map = dyn_cast<ac::TableMapOp>(rowFrame->source)) {
+      if (ordinal && ordinal <= map.getTables().size())
+        return map.getTables()[ordinal - 1];
+      return {};
+    }
+    auto match = cast<ac::TableMatchOp>(rowFrame->source);
+    return ordinal == 0 ? match.getInput() : Value();
+  }
+  Value rowCaptureArgument(unsigned ordinal) {
+    if (auto map = dyn_cast<ac::TableMapOp>(rowFrame->source)) {
+      unsigned first = 1 + map.getTables().size();
+      return ordinal >= first ? map.getCaptures()[ordinal - first] : Value();
+    }
+    auto match = cast<ac::TableMatchOp>(rowFrame->source);
+    return ordinal ? match.getCaptures()[ordinal - 1] : Value();
   }
   FailureOr<Value> raw(Value value, Operation *site) {
+    return inInvocationScope(value,
+                             [&] { return deriveRaw(value, site); });
+  }
+  FailureOr<Value> deriveRaw(Value value, Operation *site) {
     if (rowDepth >= 128)
       return (void)error(site, "row predicate depth exceeds 128"), failure();
     ++rowDepth;
@@ -169,13 +242,13 @@ class ValueAvailabilityMaterializer {
     if (auto found = rowFrame->bindings.find(key); found != rowFrame->bindings.end())
       return found->second;
     unsigned ordinal = argument.getArgNumber();
-    if (!ordinal) return Value();
-    auto source = rowFrame->source;
+    if (rowOrdinalArgument(ordinal)) return Value();
     auto companion = rowFrame->companion;
-    bool table = ordinal <= source.getTables().size();
-    auto available = table
-        ? rows(source.getTables()[ordinal - 1], path, companion)
-        : availability(source.getCaptures()[ordinal - 1 - source.getTables().size()], path, companion);
+    Value tableInput = rowTableArgument(ordinal);
+    bool table = bool(tableInput);
+    auto available = table ? rows(tableInput, path, companion)
+                           : availability(rowCaptureArgument(ordinal), path,
+                                          companion);
     if (failed(available)) return failure();
     if (!*available) {
       if (failed(reserveKey(site, rowFrame->bindings))) return failure();
@@ -215,6 +288,28 @@ class ValueAvailabilityMaterializer {
                        ac::detail::SourceCheckBudget::multiply(
                            capacity - storage.capacity(), sizeof(Element)))),
             site)))
+      return failure();
+    storage.reserve(capacity);
+    return success();
+  }
+  template <typename Vector>
+  LogicalResult reservePersistentAppend(Vector &storage, uint64_t count,
+                                        Operation *site) {
+    using Element = typename Vector::value_type;
+    uint64_t required =
+        ac::detail::SourceCheckBudget::add(storage.size(), count);
+    if (required <= storage.capacity())
+      return success();
+    uint64_t capacity = std::max(
+        required,
+        ac::detail::SourceCheckBudget::add(
+            ac::detail::SourceCheckBudget::multiply(storage.capacity(), 2), 1));
+    uint64_t growth = ac::detail::SourceCheckBudget::bytes(
+        ac::detail::SourceCheckBudget::multiply(
+            capacity - storage.capacity(), sizeof(Element)));
+    if (capacity > std::numeric_limits<unsigned>::max() ||
+        failed(budget.debit(2, site)) ||
+        failed(budget.debitPersistent(growth, site)))
       return failure();
     storage.reserve(capacity);
     return success();
@@ -324,6 +419,12 @@ class ValueAvailabilityMaterializer {
   // A proven null Value denotes scalar one; nullopt means not proven uniform.
   FailureOr<std::optional<bool>> knownGuard(Value value,
       ArrayRef<StringAttr> path, Operation *site) {
+    return inInvocationScope(value, [&] {
+      return deriveKnownGuard(value, path, site);
+    });
+  }
+  FailureOr<std::optional<bool>> deriveKnownGuard(
+      Value value, ArrayRef<StringAttr> path, Operation *site) {
     SmallVector<StringAttr> projected(path.begin(), path.end());
     if (failed(canonicalProjection(value, projected, site)))
       return failure();
@@ -342,7 +443,7 @@ class ValueAvailabilityMaterializer {
     auto entered = enterKey(active, key, site);
     if (failed(entered)) return failure();
     if (!*entered) return (void)error(site, "cyclic guard proof"), failure();
-    llvm::scope_exit cleanup([&] { active.find(key)->second = false; });
+    llvm::scope_exit cleanup([&] { active.pop_back(); });
     FailureOr<std::optional<bool>> result = std::optional<bool>();
     if (auto argument = dyn_cast<BlockArgument>(value)) {
       if (auto rule = dyn_cast<ac::RuleOp>(argument.getOwner()->getParentOp()))
@@ -388,12 +489,21 @@ class ValueAvailabilityMaterializer {
   }
   FailureOr<UniformResult> uniformAvailability(Value value,
       ArrayRef<StringAttr> path, Operation *site) {
+    return inInvocationScope(value, [&] {
+      return deriveUniformAvailabilityQuery(value, path, site);
+    });
+  }
+  FailureOr<UniformResult> deriveUniformAvailabilityQuery(
+      Value value, ArrayRef<StringAttr> path, Operation *site) {
     SmallVector<StringAttr> projected(path.begin(), path.end());
     if (failed(canonicalProjection(value, projected, site)))
       return failure();
     path = projected;
-    if (uniformDepth >= 128)
-      return (void)error(site, "uniform availability depth exceeds 128"), failure();
+    // Uniform forwarding can legitimately cross a deep hierarchy of routed
+    // Rules. Active-key cycle detection is the semantic guard; retain a larger
+    // finite recursion bound for host-stack protection.
+    if (uniformDepth >= 1024)
+      return (void)error(site, "uniform availability depth exceeds 1024"), failure();
     ++uniformDepth;
     llvm::scope_exit depth([&] { --uniformDepth; });
     auto paidKey = keyFor(value, path, site);
@@ -406,7 +516,7 @@ class ValueAvailabilityMaterializer {
     auto entered = enterKey(active, key, site);
     if (failed(entered)) return failure();
     if (!*entered) return (void)error(site, "cyclic uniform availability"), failure();
-    llvm::scope_exit cleanup([&] { active.find(key)->second = false; });
+    llvm::scope_exit cleanup([&] { active.pop_back(); });
     auto result = deriveUniformAvailability(value, path, site);
     if (failed(result)) return failure();
     if (failed(reserveKey(site, cache))) return failure();
@@ -436,12 +546,11 @@ class ValueAvailabilityMaterializer {
         return UniformResult(*bound);
       }
       if (isa<ac::ModuleOp>(argument.getOwner()->getParentOp())) return scalar();
-      if (inRow(argument) && argument.getArgNumber()) {
-        auto map = rowFrame->source;
-        unsigned i = argument.getArgNumber() - 1;
-        Value input = i < map.getTables().size() ? map.getTables()[i]
-            : map.getCaptures()[i - map.getTables().size()];
-        auto result = uniformAvailability(input, path, map);
+      if (inRow(argument) &&
+          !rowOrdinalArgument(argument.getArgNumber())) {
+        Value input = rowTableArgument(argument.getArgNumber());
+        if (!input) input = rowCaptureArgument(argument.getArgNumber());
+        auto result = uniformAvailability(input, path, rowFrame->source);
         if (failed(result) || !*result) return result;
         return scalar();
       }
@@ -716,6 +825,11 @@ class ValueAvailabilityMaterializer {
     return map->getResult(0);
   }
   FailureOr<Value> rows(Value value, ArrayRef<StringAttr> path, Operation *site) {
+    return inInvocationScope(value,
+                             [&] { return deriveRows(value, path, site); });
+  }
+  FailureOr<Value> deriveRows(Value value, ArrayRef<StringAttr> path,
+                              Operation *site) {
     if (rowDepth >= 128)
       return (void)error(site, "row availability depth exceeds 128"), failure();
     ++rowDepth;
@@ -730,7 +844,7 @@ class ValueAvailabilityMaterializer {
     auto entered = enterKey(localActive, key, site);
     if (failed(entered)) return failure();
     if (!*entered) return (void)error(site, "cyclic row availability"), failure();
-    llvm::scope_exit cleanup([&] { localActive.find(key)->second = false; });
+    llvm::scope_exit cleanup([&] { localActive.pop_back(); });
     auto type = cast<ac::TableType>(value.getType());
     if (failed(budget.debit(16 + 4 * type.getShape().size(), site))) return failure();
     Type companionType = ac::TableType::get(site->getContext(), type.getShape(), bit);
@@ -832,6 +946,71 @@ class ValueAvailabilityMaterializer {
     return result;
   }
 
+  FailureOr<Value> matchAvailability(ac::TableMatchOp match,
+                                     Operation *site) {
+    auto type = match.getInput().getType();
+    auto ordinal = ordinalType(type, site);
+    if (failed(ordinal)) return failure();
+    Type companionType =
+        ac::TableType::get(site->getContext(), type.getShape(), bit);
+    Builder b(site->getContext());
+    auto *operation = create(
+        site, ac::TableMapOp::getOperationName(), match->getOperands(),
+        {companionType},
+        {b.getNamedAttr("shape", type.getShape()),
+         b.getNamedAttr(
+             "operandSegmentSizes",
+             b.getDenseI32ArrayAttr(
+                 {1, int32_t(match.getCaptures().size())}))},
+        1);
+    if (!operation ||
+        failed(budget.debit(
+            16 + 4 * (match.getBody().front().getNumArguments() + 1), site)))
+      return failure();
+    auto companion = cast<ac::TableMapOp>(operation);
+    auto *body = new Block;
+    companion.getBody().push_back(body);
+    body->addArgument(*ordinal, site->getLoc());
+    RowFrame frame;
+    frame.source = match;
+    frame.companion = companion;
+    for (BlockArgument argument : match.getBody().front().getArguments())
+      frame.raw.map(
+          argument,
+          body->addArgument(argument.getType(), argument.getLoc()));
+    auto *yield = create(companion, ac::YieldOp::getOperationName(), {}, {}, {},
+                         0, body);
+    if (!yield) return failure();
+    auto *outer = rowFrame;
+    rowFrame = &frame;
+    llvm::scope_exit restore([&] { rowFrame = outer; });
+    Value predicate =
+        cast<ac::YieldOp>(match.getBody().front().getTerminator()).getValues()[0];
+    auto available = availability(predicate, {}, yield);
+    if (failed(available)) return failure();
+    if (!*available) available = one(yield);
+    if (failed(available)) return failure();
+    yield->setOperands({*available});
+    unsigned tables = companion.getTables().size();
+    unsigned captures = companion.getCaptures().size();
+    for (unsigned i = body->getNumArguments(); i-- > 1;) {
+      if (failed(budget.debit(1, site))) return failure();
+      if (!body->getArgument(i).use_empty()) continue;
+      companion->eraseOperand(i - 1);
+      body->eraseArgument(i);
+      if (i <= tables) --tables;
+      else --captures;
+    }
+    companion->setAttr(
+        "operandSegmentSizes",
+        b.getDenseI32ArrayAttr({int32_t(tables), int32_t(captures)}));
+    auto *fold = create(site, ac::TableFoldOp::getOperationName(),
+                        {companion.getResult(0)}, {bit},
+                        {b.getNamedAttr("kind", b.getStringAttr("and"))});
+    if (!fold) return failure();
+    return fold->getResult(0);
+  }
+
   LogicalResult error(Operation *site, StringRef message) {
     return site->emitOpError() << "value availability: " << message;
   }
@@ -853,7 +1032,10 @@ class ValueAvailabilityMaterializer {
   Operation *create(Operation *site, StringRef name, ValueRange operands,
                     TypeRange types, ArrayRef<NamedAttribute> attrs = {},
                     unsigned regions = 0, Block *block = nullptr) {
+    uint64_t storage = ac::detail::SourceCheckBudget::add(
+        16 + operands.size() + types.size() + attrs.size(), regions);
     if (failed(budget.debit(16 + operands.size() + attrs.size(), site)) ||
+        failed(budget.debitPersistent(storage, site)) ||
         failed(reserveAppend(candidate.availabilityOperations, 1, site)))
       return nullptr;
     OpBuilder builder(site);
@@ -915,6 +1097,13 @@ class ValueAvailabilityMaterializer {
   }
   FailureOr<Value> tableAt(Value table, uint64_t ordinal,
                            ArrayRef<StringAttr> path, Operation *site) {
+    return inInvocationScope(table, [&] {
+      return deriveTableAtQuery(table, ordinal, path, site);
+    });
+  }
+  FailureOr<Value> deriveTableAtQuery(Value table, uint64_t ordinal,
+                                      ArrayRef<StringAttr> path,
+                                      Operation *site) {
     if (rowDepth >= 128)
       return (void)error(site, "selected row depth exceeds 128"), failure();
     ++rowDepth;
@@ -927,19 +1116,31 @@ class ValueAvailabilityMaterializer {
     auto &active = rowFrame ? rowFrame->activeSelected : activeSelectedRows;
     if (failed(keyLookup(site)))
       return failure();
-    if (auto found = cache.find(key); found != cache.end())
-      return found->second;
+    auto found = cache.find(key.first);
+    if (found != cache.end() && key.second < found->second.size() &&
+        found->second[key.second].initialized)
+      return found->second[key.second].value;
     auto entered = enterKey(active, key, site);
     if (failed(entered))
       return failure();
     if (!*entered)
       return (void)error(site, "cyclic selected row availability"), failure();
-    llvm::scope_exit cleanup([&] { active.find(key)->second = false; });
+    llvm::scope_exit cleanup([&] { active.pop_back(); });
     auto result = deriveTableAt(table, ordinal, path, site);
     if (succeeded(result)) {
-      if (failed(reserveKey(site, cache)))
-        return failure();
-      cache.try_emplace(key, *result);
+      found = cache.find(key.first);
+      if (found == cache.end()) {
+        if (failed(reserveKey(site, cache)))
+          return failure();
+        found = cache.try_emplace(key.first).first;
+      }
+      if (key.second >= found->second.size()) {
+        uint64_t count = key.second + 1 - found->second.size();
+        if (failed(reservePersistentAppend(found->second, count, site)))
+          return failure();
+        found->second.resize(key.second + 1);
+      }
+      found->second[key.second] = {*result, true};
     }
     return result;
   }
@@ -1283,11 +1484,19 @@ class ValueAvailabilityMaterializer {
       if (failed(selected)) return failure();
       return conjunction(site, *index, *selected);
     }
+    if (auto match = dyn_cast<ac::TableMatchOp>(operation))
+      return matchAvailability(match, site);
+    if (auto choose = dyn_cast<ac::TableChooseOp>(operation))
+      return availability(choose.getMask(), {}, site);
     if (operation->getNumRegions()) {
       auto inputs = all(site, operation->getOperands());
       if (failed(inputs)) return failure();
       if (!*inputs && isa<ac::TableMapOp, ac::TableMatchOp>(operation)) return Value();
-      return (void)error(site, "availability requires normalized region provenance"), failure();
+      return (void)error(site,
+                         ("availability requires normalized region provenance for " +
+                          operation->getName().getStringRef())
+                             .str()),
+             failure();
     }
     return all(site, operation->getOperands());
   }
@@ -1331,6 +1540,13 @@ class ValueAvailabilityMaterializer {
   }
   FailureOr<Value> availability(Value value, ArrayRef<StringAttr> path,
                                 Operation *site) {
+    return inInvocationScope(value, [&] {
+      return deriveAvailabilityQuery(value, path, site);
+    });
+  }
+  FailureOr<Value> deriveAvailabilityQuery(Value value,
+                                           ArrayRef<StringAttr> path,
+                                           Operation *site) {
     SmallVector<StringAttr> projected(path.begin(), path.end());
     if (failed(canonicalProjection(value, projected, site)))
       return failure();
@@ -1344,18 +1560,27 @@ class ValueAvailabilityMaterializer {
     auto paidKey = keyFor(value, path, site);
     if (failed(paidKey)) return failure();
     auto key = std::move(*paidKey);
-    auto &localCache = inRow(value) ? rowFrame->cache : cache;
+    bool row = inRow(value);
+    auto *occurrence = !row && path.empty() ? lookupOccurrence(value) : nullptr;
+    if (occurrence && occurrence->initialized)
+      return occurrence->availability;
+    auto &localCache = row ? rowFrame->cache : cache;
     auto &localActive = inRow(value) ? rowFrame->active : active;
     if (failed(keyLookup(site))) return failure();
     if (auto found = localCache.find(key); found != localCache.end()) return found->second;
     auto entered = enterKey(localActive, key, site);
     if (failed(entered)) return failure();
     if (!*entered) return (void)error(site, "cyclic required availability"), failure();
-    llvm::scope_exit cleanup([&] { localActive.find(key)->second = false; });
+    llvm::scope_exit cleanup([&] { localActive.pop_back(); });
     auto result = derive(value, path, site);
     if (succeeded(result)) {
-      if (failed(reserveKey(site, localCache))) return failure();
-      localCache.try_emplace(key, *result);
+      if (occurrence) {
+        occurrence->availability = *result;
+        occurrence->initialized = true;
+      } else {
+        if (failed(reserveKey(site, localCache))) return failure();
+        localCache.try_emplace(key, *result);
+      }
     }
     return result;
   }
@@ -1420,6 +1645,26 @@ class ValueAvailabilityMaterializer {
       if (mapped == old) operationRemaps.push_back(source);
     for (auto [source, value] : remaps) candidate.packageMap.map(source, value);
     for (auto source : operationRemaps) candidate.packageMap.map(source, replacement.operator->());
+    // Invocation maps and flattened bound values are proof locators outside
+    // SSA use lists. Preserve their source keys while rebasing child results.
+    for (auto &record : candidate.transactions) {
+      for (auto &frame : record.frames) {
+        SmallVector<std::pair<Value, Value>> frameRemaps;
+        for (auto [source, mapped] : frame.getValueMap()) {
+          auto result = dyn_cast_or_null<OpResult>(mapped);
+          if (result && result.getOwner() == old)
+            frameRemaps.push_back(
+                {source, replacement->getResult(result.getResultNumber())});
+        }
+        for (auto [source, mapped] : frameRemaps)
+          frame.map(source, mapped);
+      }
+      for (Value &mapped : record.boundValues) {
+        auto result = dyn_cast_or_null<OpResult>(mapped);
+        if (result && result.getOwner() == old)
+          mapped = replacement->getResult(result.getResultNumber());
+      }
+    }
     // Pin records are verifier locators outside the SSA use lists. Scan them
     // once, using the preserved result ordinal to select the replacement.
     auto remapPinValue = [&](Value &recorded) {
@@ -1436,12 +1681,19 @@ class ValueAvailabilityMaterializer {
       for (auto &selection : pin.selections)
         remapPinValue(selection.value);
     }
+    // Generated async-read instances are proof locators rather than package
+    // clone-map entries. Availability routing rebuilds them like every other
+    // Module instance, so retain their identity at the replacement operation.
+    for (ac::InstanceOp &read : candidate.memoryReadInstances)
+      if (read == old)
+        read = replacement;
     for (auto [ordinal, value] : llvm::enumerate(old.getResults()))
       value.replaceAllUsesWith(replacement->getResult(ordinal));
     old.erase();
     return success();
   }
   LogicalResult process(ac::ModuleOp module) {
+    ac::detail::SourceCheckBudget::LocalScope moduleBudget(budget);
     if (colors.lookup(module) == 2) return success();
     if (colors.lookup(module) == 1) return error(module, "recursive Module route");
     colors[module] = 1;
@@ -1451,9 +1703,13 @@ class ValueAvailabilityMaterializer {
         if (failed(process(child))) return failure();
         instances.push_back(instance);
       }
-    for (auto instance : instances)
-      if (failed(replaceInstance(instance, cast<ac::ModuleOp>(hardware.resolveCallee(instance)))))
+    for (auto instance : instances) {
+      ac::detail::SourceCheckBudget::LocalScope instanceBudget(budget);
+      if (failed(replaceInstance(
+              instance,
+              cast<ac::ModuleOp>(hardware.resolveCallee(instance)))))
         return failure();
+    }
     for (auto instance : module.getBody().front().getOps<ac::InstanceOp>()) {
       auto child = dyn_cast_or_null<ac::ModuleOp>(hardware.resolveCallee(instance));
       if (!child) continue;
@@ -1461,6 +1717,7 @@ class ValueAvailabilityMaterializer {
       SmallVector<Value> inputs(instance.getOperands());
       for (uint64_t i = 0; i < layout.inputs; ++i) {
         if (layout.input[i] < 0) continue;
+        ac::detail::SourceCheckBudget::LocalScope inputBudget(budget);
         auto value = availability(inputs[i], {}, instance);
         if (failed(value)) return failure();
         if (!*value) { value = one(instance); if (failed(value)) return failure(); }
@@ -1471,6 +1728,7 @@ class ValueAvailabilityMaterializer {
     for (auto &record : candidate.transactions) {
       if (record.rule->getParentOp() != module) continue;
       for (auto requirement : record.requirements) {
+        ac::detail::SourceCheckBudget::LocalScope requirementBudget(budget);
         Value payload = requirement->getOperand(0), path = requirement->getOperand(1);
         auto value = availability(payload, {}, requirement);
         if (failed(value)) return failure();
@@ -1484,6 +1742,7 @@ class ValueAvailabilityMaterializer {
     SmallVector<Attribute> names(module.getOutputNames().getValue());
     Builder b(module.getContext());
     for (uint64_t i = 0; i < layout.outputs; ++i) {
+      ac::detail::SourceCheckBudget::LocalScope outputBudget(budget);
       auto value = availability(outputs[i], {}, yield);
       if (failed(value)) return failure();
       if (!*value) continue;
@@ -1494,6 +1753,7 @@ class ValueAvailabilityMaterializer {
     // Pop summaries are private controls, outside the lexical payload export
     // range. They never acquire payload-availability companions.
     for (uint64_t i = layout.outputs; i < layout.routedEnd; ++i) {
+      ac::detail::SourceCheckBudget::LocalScope outputBudget(budget);
       auto value = availability(outputs[i], {}, yield);
       if (failed(value)) return failure();
       if (!*value) continue;
@@ -1567,6 +1827,58 @@ public:
   }
   LogicalResult run() {
     for (auto &record : candidate.transactions) records[record.rule] = &record;
+    // Index only definition-owned operation results.  Formal block arguments
+    // intentionally alias caller values and therefore cannot establish an
+    // occurrence owner.  Conflicting result aliases are marked ambiguous and
+    // remain under the enclosing work scope.
+    {
+      ac::detail::SourceCheckBudget::LocalScope indexBudget(budget);
+      for (auto [transactionIndex, item] :
+           llvm::enumerate(prepared.transactions)) {
+        const auto &plan = *item.plan;
+        auto &record = candidate.transactions[transactionIndex];
+        if (record.frames.size() != plan.frames.size())
+          return plan.transaction->emitOpError()
+                 << "availability invocation frame inventory is inconsistent";
+        for (const auto &ref : plan.values) {
+          if (ref.frame >= record.frames.size())
+            return plan.transaction->emitOpError()
+                   << "availability invocation frame inventory is inconsistent";
+          if (!isa<OpResult>(ref.value))
+            continue;
+          Value actual = record.frames[ref.frame].lookupOrNull(ref.value);
+          if (!actual)
+            continue;
+          uint64_t scope = (uint64_t(transactionIndex + 1) << 32) |
+                           uint64_t(ref.frame + 1);
+          if (failed(reservePersistentAppend(occurrenceValues, 1,
+                                             plan.transaction)))
+          return failure();
+          occurrenceValues.push_back({actual, OccurrenceValue{scope}});
+        }
+      }
+      uint64_t comparisons = ac::detail::SourceCheckBudget::multiply(
+          occurrenceValues.size(),
+          std::max<unsigned>(1, std::bit_width(occurrenceValues.size())));
+      if (failed(budget.debit(comparisons, prepared.original)))
+        return failure();
+      auto less = [](const OccurrenceEntry &left,
+                     const OccurrenceEntry &right) {
+        return std::less<const void *>()(left.value.getAsOpaquePointer(),
+                                         right.value.getAsOpaquePointer());
+      };
+      llvm::sort(occurrenceValues, less);
+      unsigned write = 0;
+      for (const auto &entry : occurrenceValues) {
+        if (write && occurrenceValues[write - 1].value == entry.value) {
+          occurrenceValues[write - 1].record.scope = std::min(
+              occurrenceValues[write - 1].record.scope, entry.record.scope);
+          continue;
+        }
+        occurrenceValues[write++] = entry;
+      }
+      occurrenceValues.resize(write);
+    }
     for (const auto &definition : prepared.definitions) {
       auto module = cast<ac::ModuleOp>(candidate.packageMap.lookup(definition.module.operator->()));
       if (failed(budget.debit(1 + ac::detail::SourceCheckBudget::bytes(
@@ -1599,7 +1911,9 @@ public:
       module->setAttr("input_names", b.getArrayAttr(names));
       if (failed(refresh(module))) return failure();
     }
-    for (auto module : hardware.getDefinitions()) if (failed(process(module))) return failure();
+    for (auto module : hardware.getDefinitions())
+      if (failed(process(module))) return failure();
+    ac::detail::SourceCheckBudget::LocalScope cleanupBudget(budget);
     return removeDeadAvailability();
   }
 };

@@ -5,6 +5,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "pycircuit/Dialect/ACIR/SourceTransactionStateAnalysis.h"
+#include "pycircuit/Analysis/CompilerPhaseMetrics.h"
 #include <memory>
 
 namespace mlir {
@@ -44,6 +45,21 @@ struct MemoryPinRoute {
   mlir::Type type, predicateType;
 };
 
+struct AsyncMemoryReadChannel {
+  uint64_t transaction = 0, access = 0;
+  llvm::SmallVector<ac::InstanceOp> path;
+  ac::InstanceOp allocation;
+  mlir::Type payloadType;
+  mlir::Type addressType, predicateType;
+};
+
+struct AsyncMemoryReadRoute {
+  uint64_t channel = 0;
+  llvm::SmallVector<ac::InstanceOp> path;
+  mlir::Type payloadType;
+  mlir::Type addressType, predicateType;
+};
+
 struct DefinitionRouting {
   ac::ModuleOp module;
   llvm::SmallVector<Route> upward, downward;
@@ -55,6 +71,8 @@ struct DefinitionRouting {
   llvm::DenseMap<RoutingKey, unsigned> queuePopSummaryIndex;
   llvm::SmallVector<MemoryPinRoute, 0> memoryIncoming;
   llvm::DenseMap<QueueRoutingKey, unsigned> memoryIncomingIndex;
+  llvm::SmallVector<AsyncMemoryReadRoute, 0> memoryReadOutputs;
+  llvm::DenseMap<uint64_t, unsigned> memoryReadOutputIndex;
   unsigned sourceInputs = 0, sourceOutputs = 0;
   mlir::DictionaryAttr expectedWiring, expectedQueueWiring, expectedReturns;
 };
@@ -111,6 +129,7 @@ inline mlir::DictionaryAttr resourceLocation(const ac::TransactionStatePlan &pla
 struct TransactionMemoryProposal {
   uint64_t access = 0, rawResult = 0, pathResult = 0;
   std::optional<uint64_t> physicalReuse;
+  std::optional<uint64_t> readChannel;
   uint64_t reachedControlEnd = 0;
   llvm::SmallVector<uint64_t, 0> excludedControls;
   llvm::SmallVector<uint64_t, 0> argumentResults;
@@ -142,7 +161,10 @@ struct TransactionPreparedControl {
 };
 
 struct TransactionPreparation {
-  const ac::TransactionStatePlan *plan = nullptr;
+  /// Immutable occurrence delta owned by the frozen routing facts. Source IR
+  /// handles inside the plan remain borrowed, but the semantic plan object no
+  /// longer depends on the lifetime of an analysis-manager instance.
+  std::shared_ptr<const ac::TransactionStatePlan> plan;
   llvm::SmallVector<ac::BoundValueId> liveIns;
   llvm::SmallVector<TransactionCandidatePreparation> outputs;
   llvm::SmallVector<TransactionValueRequirement, 0> requirements;
@@ -151,6 +173,9 @@ struct TransactionPreparation {
   llvm::SmallVector<TransactionQueueExternalPop, 0> externalPops;
   llvm::SmallVector<TransactionQueueProposal, 0> queueProposals;
   llvm::SmallVector<TransactionMemoryProposal, 0> memoryProposals;
+  /// Definition-routed async read values captured by the isolated Rule body,
+  /// in first source-use order. Entries are global read-channel ordinals.
+  llvm::SmallVector<uint64_t, 0> memoryReadCaptures;
   llvm::SmallVector<TransactionWriteDomain, 0> writeDomains;
   llvm::SmallVector<uint64_t, 0> sourceControls;
   uint64_t clockCapture = 0, resetCapture = 0, fireResult = 0;
@@ -160,18 +185,44 @@ struct TransactionPreparation {
   mlir::ArrayAttr expectedRequiredChecks;
 };
 
-/// Immutable preparation data borrowing the original package and analysis.
-/// Both must outlive materialization and verification of the detached
-/// candidate.
+/// Mutable storage used only while routing facts are being prepared. Published
+/// consumers receive FrozenRoutingFacts instead of this builder representation.
+/// Borrowed source and analysis handles must outlive materialization and
+/// verification of the detached candidate.
 struct PreparedTransactionLowering {
   mlir::ModuleOp original;
   llvm::SmallVector<TransactionPreparation, 0> transactions;
   llvm::SmallVector<ac::SourceStateOp> states;
   llvm::SmallVector<ac::InstanceOp> queues;
+  llvm::SmallVector<AsyncMemoryReadChannel, 0> memoryReadChannels;
   llvm::SmallVector<uint64_t> transactionSchedule;
   llvm::SmallVector<DefinitionRouting, 0> definitions;
   llvm::DenseMap<mlir::Operation *, unsigned> definitionIndex;
   bool valueAvailability = false;
+};
+
+/// Published, immutable routing facts shared by candidate generation and the
+/// independent original-source proof. Sharing this storage grants no proof
+/// authority: every candidate is still checked against the current source IR.
+class FrozenRoutingFacts {
+public:
+  FrozenRoutingFacts() = default;
+  explicit FrozenRoutingFacts(PreparedTransactionLowering &&facts)
+      : storage(std::make_shared<const PreparedTransactionLowering>(
+            std::move(facts))) {}
+
+  explicit operator bool() const { return bool(storage); }
+  const PreparedTransactionLowering *operator->() const {
+    return storage.get();
+  }
+  const PreparedTransactionLowering &operator*() const { return *storage; }
+  const PreparedTransactionLowering &facts() const { return *storage; }
+  const std::shared_ptr<const PreparedTransactionLowering> &sharedFacts() const {
+    return storage;
+  }
+
+private:
+  std::shared_ptr<const PreparedTransactionLowering> storage;
 };
 
 struct MaterializedVersion {
@@ -252,6 +303,9 @@ struct MaterializedMemoryPin {
 };
 
 struct MaterializedTransactionLowering {
+  /// Identity of the frozen facts used to generate this candidate. This is not
+  /// a cached proof verdict; verification still replays the current source.
+  std::shared_ptr<const PreparedTransactionLowering> routingFacts;
   mlir::OwningOpRef<mlir::ModuleOp> module;
   mlir::IRMapping packageMap;
   llvm::SmallVector<MaterializedTransaction, 0> transactions;
@@ -260,23 +314,33 @@ struct MaterializedTransactionLowering {
   llvm::SmallVector<MaterializedQueueMerge, 0> queueMerges;
   llvm::SmallVector<mlir::Value, 0> queueDisabled;
   llvm::SmallVector<MaterializedMemoryPin, 0> memoryPins;
+  llvm::SmallVector<ac::InstanceOp, 0> memoryReadInstances;
+  llvm::SmallVector<MaterializedBranchResult, 0> memoryReadSelections;
+  llvm::SmallVector<std::pair<mlir::Value, mlir::Value>, 0>
+      memoryReadInputs;
 };
 
-mlir::FailureOr<PreparedTransactionLowering>
+mlir::FailureOr<FrozenRoutingFacts>
 prepareTransactionLowering(mlir::ModuleOp original,
                            const ac::SourceTransactionStateAnalysis &analysis,
                            ac::detail::SourceCheckBudget &budget);
 mlir::FailureOr<MaterializedTransactionLowering>
-materializeTransactionLowering(PreparedTransactionLowering &prepared,
+materializeTransactionLowering(const FrozenRoutingFacts &prepared,
                                ac::detail::SourceCheckBudget &budget);
 mlir::LogicalResult verifyTransactionMaterialization(
-    const PreparedTransactionLowering &prepared,
+    const FrozenRoutingFacts &prepared,
     const MaterializedTransactionLowering &candidate,
-    ac::detail::SourceCheckBudget &budget);
+    ac::detail::SourceCheckBudget &budget,
+    acir::metrics::CompilerPhaseMetrics *metrics = nullptr);
 } // namespace acir::detail
 
 namespace acir {
-std::unique_ptr<mlir::Pass> createRouteTransactionsPass();
+struct TransactionRoutingMetrics {
+  acir::metrics::CompilerPhaseMetrics *routing = nullptr;
+  acir::metrics::CompilerPhaseMetrics *proof = nullptr;
+};
+std::unique_ptr<mlir::Pass>
+createRouteTransactionsPass(TransactionRoutingMetrics metrics = {});
 void registerACIRToGFIRPasses();
 } // namespace acir
 #endif

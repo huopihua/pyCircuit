@@ -31,6 +31,7 @@ struct BoundDefinition {
   HardwareBindings bindings;
   SmallVector<uint64_t> checkIndices;
   SmallVector<uint64_t> samplingIndices;
+  llvm::DenseMap<uint64_t, uint64_t> samplingOrdinals;
   SmallVector<Allocation> allocations;
   std::optional<unsigned> reset;
   bool hasChecks = false;
@@ -39,13 +40,46 @@ struct BoundDefinition {
 class Builder {
 public:
   Builder(const HardwareAnalysis &analysis, HardwareSourceCheckLimits limits,
-          const PackageStagePolicy &policy)
-      : analysis(analysis), policy(policy), budget(limits), validation(analysis, budget) {}
+          const PackageStagePolicy &policy, SourceCheckBuildMetrics *metrics)
+      : analysis(analysis), policy(policy), budget(limits),
+        validation(analysis, budget), metrics(metrics) {}
   FailureOr<HardwareSourceCheckPlan> build() {
     auto package = analysis.getPackage();
-    budget.setPhase("raw preflight");
     if (!package)
       return failure();
+    auto recordMetrics = [&] {
+      if (!metrics)
+        return;
+      metrics->workUnits = budget.usedWorkUnits();
+      metrics->definitions = definitionCount;
+      metrics->boundDefinitions = nodes.size();
+      metrics->preparedSampledContexts = validation.preparedContextCount();
+      metrics->sampledRuleParses = validation.sampledRuleParseCount();
+      metrics->sampledAdmissionProofs =
+          validation.sampledAdmissionProofCount();
+      metrics->ownerOccurrences = plan.owners.size();
+      metrics->resolvedChecks = plan.checks.size();
+      metrics->planEntries = plan.bindings.size() + plan.owners.size() +
+                             plan.checks.size() + plan.commits.size() +
+                             plan.samplingBindings.size() +
+                             plan.samplingOccurrences.size();
+      metrics->planBytes =
+          plan.bindings.capacity() * sizeof(HardwareCheckBinding) +
+          plan.owners.capacity() * sizeof(HardwareCheckOwnerOccurrence) +
+          plan.checks.capacity() * sizeof(HardwareResolvedSourceCheck) +
+          plan.commits.capacity() * sizeof(HardwareCheckCommitEndpoint) +
+          plan.samplingBindings.capacity() *
+              sizeof(HardwareCheckSamplingBinding) +
+          plan.samplingOccurrences.capacity() *
+              sizeof(HardwareCheckSamplingOccurrence);
+    };
+    llvm::scope_exit reportMetrics([&] { recordMetrics(); });
+    auto finish = [&]() -> FailureOr<HardwareSourceCheckPlan> {
+      recordMetrics();
+      metrics = nullptr;
+      return std::move(plan);
+    };
+    budget.setPhase("raw preflight");
     {
       Budget::RawDiagnosticScope rawDiagnostics(budget);
       if (failed(rawPreflight()))
@@ -53,6 +87,14 @@ public:
     }
     if (failed(verifyHardwarePackageStage(analysis, policy))) return failure();
     {
+      // NativeSourceCheckScope is thread-local. MLIR may otherwise verify
+      // nested isolated operations on worker threads that cannot see it.
+      // Later planning retains the context's original threading mode.
+      MLIRContext *context = package.getContext();
+      bool wasMultithreaded = context->isMultithreadingEnabled();
+      context->disableMultithreading();
+      llvm::scope_exit restoreThreading(
+          [&] { context->enableMultithreading(wasMultithreaded); });
       NativeSourceCheckScope native(analysis, validation, budget, nativeChecks);
       // Establish the builtin package's own ODS/trait/custom shape before any
       // child verifier assumes its parent is well formed. Full nonrecursive
@@ -95,10 +137,9 @@ public:
                                                            true))))
           return failure();
     }
-    if (failed(verifyHardwarePackageEnvelope(
-            analysis, policy, [&](uint64_t units, Operation *site) {
-              return budget.debit(units, site);
-            }))) return failure();
+    budget.setPhase("package envelope");
+    if (failed(verifyHardwarePackageEnvelope(analysis, policy, budget)))
+      return failure();
     auto resetSemantics = getHardwareResetSemantics(package);
     if (failed(resetSemantics))
       return failure();
@@ -112,36 +153,55 @@ public:
     if (failed(rootIndex))
       return failure();
     auto scopes = std::move(catalogScopes);
+    const size_t catalogCount = scopes.size();
+    SmallVector<std::pair<ModuleOp, HardwareBindings>> transactionRoots;
     if (failed(budget.debit(
             Budget::multiply(
-                Budget::add(nodes.size(), scopes.size()),
+                Budget::add(Budget::multiply(2, nodes.size()),
+                            Budget::multiply(2, scopes.size())),
                 Budget::bytes(sizeof(std::pair<ModuleOp, HardwareBindings>))),
             package)))
       return failure();
+    if (Budget::add(nodes.size(), scopes.size()) >
+        transactionRoots.max_size())
+      return package.emitOpError()
+             << "transaction proof root inventory exceeds capacity";
+    transactionRoots.reserve(Budget::add(nodes.size(), scopes.size()));
     for (const auto &node : nodes) {
       if (failed(
               budget.debit(Budget::bindings(node->bindings), node->definition)))
         return failure();
       scopes.emplace_back(node->definition, node->bindings);
+      transactionRoots.emplace_back(node->definition, node->bindings);
+    }
+    // Catalog rows are immutable definition facts, not executable occurrence
+    // verdicts. Keep a default-binding proof root only for a retained
+    // definition that has no reachable bound root. Every reachable bound root
+    // remains present, even when another root has identical bindings.
+    for (size_t index = 0; index < catalogCount; ++index) {
+      const auto &[definition, bindings] = scopes[index];
+      if (failed(budget.debit(
+              Budget::orderedLookupCost(boundIndices.size()), definition)))
+        return failure();
+      if (boundIndices.find(definition) == boundIndices.end())
+        transactionRoots.emplace_back(definition, bindings);
     }
     budget.setPhase("compact dependencies");
-    if (failed(verifySourceCheckDependencies(
-            analysis, scopes, [&](uint64_t units, Operation *site) {
-              return budget.debit(units, site);
-            })))
+    if (failed(verifySourceCheckDependencies(analysis, scopes, budget)))
       return failure();
     budget.setPhase("queue resource wiring");
     if (failed(verifyQueueResourceWiring(analysis, scopes, budget)))
       return failure();
     budget.setPhase("transaction wiring");
-    if (failed(verifyTransactionWiring(analysis, scopes, validation, budget)))
+    if (failed(verifyTransactionWiring(analysis, scopes, transactionRoots,
+                                       validation, budget)))
       return failure();
     // A closed system needs the complete managed commit tree even without
     // source assertions: generated reset/prepare/commit must reach every leaf.
     // Reusable modules without checks still avoid hypothetical expansion.
     auto role = root->owner->getAttrOfType<StringAttr>("ac.root_kind");
     if (!nodes[*rootIndex]->hasChecks && (!role || role.getValue() != "system"))
-      return std::move(plan);
+      return finish();
     budget.setPhase("occurrence summary");
     auto expansion = summarize(*rootIndex);
     if (failed(expansion) || failed(budget.admit(expansion->cost, package)))
@@ -160,7 +220,7 @@ public:
     budget.setPhase("materialization");
     if (failed(materialize(*rootIndex, {}, std::nullopt, {})))
       return failure();
-    return std::move(plan);
+    return finish();
   }
 
 private:
@@ -216,6 +276,51 @@ private:
       cost = Budget::add(cost, node);
       if (failed(children(current)))
         return failure();
+    }
+    return cost;
+  }
+  // A sampled-admission dictionary is a frozen inventory of independently
+  // replayable schema fields.  Charging the complete dictionary through one
+  // explicit traversal makes the raw preflight peak proportional to every
+  // row in a large Rule, even though no later proof needs those rows live at
+  // once.  Preserve the complete saturated aggregate while bounding each
+  // top-level field (and each row of a top-level array) separately.
+  FailureOr<uint64_t> sampledStructureCost(Attribute attribute,
+                                           Operation *site) {
+    auto sampled = dyn_cast_or_null<DictionaryAttr>(attribute);
+    if (!sampled)
+      return structureCost(attribute, site);
+    uint64_t cost = 1;
+    {
+      Budget::LocalScope rootBudget(budget);
+      if (failed(budget.debit(1, site)))
+        return failure();
+    }
+    for (auto field : sampled) {
+      Budget::LocalScope fieldBudget(budget);
+      auto name = structureCost(field.getName(), site);
+      if (failed(name))
+        return failure();
+      cost = Budget::add(cost, *name);
+      Attribute value = field.getValue();
+      if (auto rows = dyn_cast<ArrayAttr>(value)) {
+        // Account for the array node itself, then replay each semantic row.
+        if (failed(budget.debit(1, site)))
+          return failure();
+        cost = Budget::add(cost, 1);
+        for (Attribute row : rows) {
+          Budget::LocalScope rowBudget(budget);
+          auto rowCost = structureCost(row, site);
+          if (failed(rowCost))
+            return failure();
+          cost = Budget::add(cost, *rowCost);
+        }
+        continue;
+      }
+      auto valueCost = structureCost(value, site);
+      if (failed(valueCost))
+        return failure();
+      cost = Budget::add(cost, *valueCost);
     }
     return cost;
   }
@@ -490,6 +595,50 @@ private:
     }
     return cost;
   }
+  // Mirror payAttribute's complete downstream reservation for the sampled
+  // inventory without making all schema rows simultaneously live in the raw
+  // preflight budget.  Completed row measurements remain cached facts; no
+  // structural-comparison verdict is shared by this partitioning.
+  FailureOr<uint64_t> sampledInventoryCost(Attribute attribute,
+                                           Operation *site) {
+    auto sampled = dyn_cast_or_null<DictionaryAttr>(attribute);
+    if (!sampled)
+      return sampledAttributeCost(attribute, site);
+    uint64_t cost = 1;
+    {
+      Budget::LocalScope rootBudget(budget);
+      if (failed(budget.debit(1, site)))
+        return failure();
+    }
+    for (auto field : sampled) {
+      Budget::LocalScope fieldBudget(budget);
+      uint64_t fieldCost =
+          Budget::add(1, Budget::bytes(field.getName().getValue().size()));
+      if (failed(budget.debit(fieldCost, site)))
+        return failure();
+      cost = Budget::add(cost, fieldCost);
+      Attribute value = field.getValue();
+      if (auto rows = dyn_cast<ArrayAttr>(value)) {
+        // fieldCost is the parent's push of the array; each row measurement
+        // starts with the corresponding child push.
+        for (Attribute row : rows) {
+          Budget::LocalScope rowBudget(budget);
+          auto rowCost = sampledAttributeCost(row, site);
+          if (failed(rowCost))
+            return failure();
+          cost = Budget::add(cost, *rowCost);
+        }
+        continue;
+      }
+      if (auto text = dyn_cast<StringAttr>(value)) {
+        uint64_t textCost = Budget::bytes(text.getValue().size());
+        if (failed(budget.debit(textCost, site)))
+          return failure();
+        cost = Budget::add(cost, textCost);
+      }
+    }
+    return cost;
+  }
   FailureOr<uint64_t> sampledSchemaCost(Attribute attribute, Operation *site) {
     auto sampled = dyn_cast_or_null<DictionaryAttr>(attribute);
     auto controls = sampled ? sampled.getAs<ArrayAttr>("controls") : ArrayAttr();
@@ -642,15 +791,22 @@ private:
     // The raw census itself reads each slot, shape, ID and location. Its work
     // is separate from the native parser reservation returned in cost.
     constexpr uint64_t rawRequiredRecordWork = 2 + 3 * (3 + 1);
-    if (failed(budget.debit(multiply(required.size(), rawRequiredRecordWork),
-                            site)))
-      return failure();
+    for (Attribute raw : required) {
+      Budget::LocalScope rowBudget(budget);
+      if (failed(budget.debit(rawRequiredRecordWork, site)))
+        return failure();
+      (void)raw;
+    }
     cost = add(cost, multiply(required.size(), requiredRecordWork));
-    if (failed(attributeCost(sampled)) ||
-        failed(attributeCost(site->getAttr("occurrence"))))
+    auto inventory = sampledInventoryCost(sampled, site);
+    if (failed(inventory))
+      return failure();
+    cost = add(cost, *inventory);
+    if (failed(attributeCost(site->getAttr("occurrence"))))
       return failure();
     uint64_t frames = 0, k = 0, checkBase = add(*fire, 1);
     for (auto [ordinal, raw] : llvm::enumerate(controls)) {
+      Budget::LocalScope rowBudget(budget);
       if (failed(budget.debit(1, site)))
         return failure();
       auto row = dyn_cast<DictionaryAttr>(raw);
@@ -698,6 +854,7 @@ private:
     for (StringRef key : {"body_checks", "observations"}) {
       auto rows = sampled.getAs<ArrayAttr>(key);
       for (auto [ordinal, raw] : llvm::enumerate(rows)) {
+        Budget::LocalScope rowBudget(budget);
         if (failed(budget.debit(1, site)))
           return failure();
         auto row = dyn_cast<DictionaryAttr>(raw);
@@ -739,6 +896,7 @@ private:
       if (requirements.empty()) return fail();
       cost = add(cost, multiply(requirements.size(), schemaRecordCost<SampledValueRequirement>()));
       for (Attribute raw : requirements) {
+        Budget::LocalScope rowBudget(budget);
         auto row = dyn_cast<DictionaryAttr>(raw);
         auto control = rawIndex(row, "control"), operand = rawIndex(row, "operand");
         if (!row || row.size() != 5 || !control || *control >= g || !operand ||
@@ -751,6 +909,7 @@ private:
       cost = add(cost, multiply(resources.size(), schemaRecordCost<SampledResourceView>()));
       uint64_t nextResource = 0;
       for (auto [ordinal, rawControl] : llvm::enumerate(controls)) {
+        Budget::LocalScope rowBudget(budget);
         auto control = cast<DictionaryAttr>(rawControl);
         if (kindOf(control).getValue() != "resource_available") continue;
         if (nextResource == resources.size()) return fail();
@@ -800,6 +959,7 @@ private:
       if (proposals.empty()) return fail();
       cost = add(cost, multiply(proposals.size(), schemaRecordCost<SampledQueueProposalView>()));
       for (auto [ordinal, raw] : llvm::enumerate(proposals)) {
+        Budget::LocalScope rowBudget(budget);
         auto row = dyn_cast<DictionaryAttr>(raw);
         auto kind = kindOf(row);
         auto queue = row ? row.getAs<DictionaryAttr>("queue") : DictionaryAttr();
@@ -842,6 +1002,7 @@ private:
       if (memoryProposals.empty()) return fail();
       cost = add(cost, multiply(memoryProposals.size(), schemaRecordCost<SampledMemoryProposalView>()));
       for (Attribute raw : memoryProposals) {
+        Budget::LocalScope rowBudget(budget);
         auto row = dyn_cast<DictionaryAttr>(raw);
         auto kind = kindOf(row);
         auto memory = row ? row.getAs<DictionaryAttr>("memory") : DictionaryAttr();
@@ -867,6 +1028,7 @@ private:
       if (domains.empty()) return fail();
       cost = add(cost, multiply(domains.size(), schemaRecordCost<SampledWriteDomainView>()));
       for (Attribute raw : domains) {
+        Budget::LocalScope rowBudget(budget);
         if (failed(budget.debit(1, site))) return failure();
         auto row = dyn_cast<DictionaryAttr>(raw);
         auto candidate = rawIndex(row, "candidate"), mask = rawIndex(row, "mask");
@@ -1075,7 +1237,20 @@ private:
       return failure();
     Operation *lastDefinition = nullptr;
     RawDefinitionWork *lastWork = nullptr;
+    SmallVector<Operation *> *lastOperations = nullptr;
     auto counted = analysis.getPackage().walk([&](Operation *op) {
+      // Raw operation structure is independently replayable into its owning
+      // definition accumulator. Bound each operation's structural/metadata
+      // inspection separately; the definition-level reserve below still
+      // rejects an unaffordable aggregate plan.
+      Budget::LocalScope operationBudget(budget);
+      if (metrics) {
+        if (op == analysis.getPackage().getOperation())
+          ++metrics->irWalks;
+        ++metrics->visitedNodes;
+        metrics->instances += isa<InstanceOp, CollectionOp>(op);
+        metrics->calls += isa<SourceMethodCallOp>(op);
+      }
       if (failed(budget.debit(1, op)))
         return WalkResult::interrupt();
       Operation *definition = isa<ModuleOp>(op) ? op : nullptr;
@@ -1089,6 +1264,7 @@ private:
       if (!definition) {
         lastDefinition = nullptr;
         lastWork = nullptr;
+        lastOperations = nullptr;
         return WalkResult::advance();
       }
       if (failed(budget.debit(1, op)))
@@ -1109,7 +1285,21 @@ private:
         }
         lastDefinition = definition;
         lastWork = &found->second;
+        auto inventory = definitionOperations.find(definition);
+        if (inventory == definitionOperations.end()) {
+          if (failed(budget.debit(
+                  Budget::bytes(
+                      sizeof(decltype(definitionOperations)::value_type) +
+                      2 * sizeof(void *)),
+                  op)))
+            return WalkResult::interrupt();
+          inventory = definitionOperations.try_emplace(definition).first;
+        }
+        lastOperations = &inventory->second;
       }
+      if (failed(budget.debit(2 * Budget::bytes(sizeof(Operation *)), op)))
+        return WalkResult::interrupt();
+      lastOperations->push_back(op);
       auto &local = *lastWork;
       local.operations = Budget::add(local.operations, 1);
       bool directRule = isa<RuleOp>(op) && op->getParentOp() == definition;
@@ -1144,7 +1334,9 @@ private:
             "ac.lexical_registration", "ac.registration_owner",
             "ac.transaction_returns"}) {
         Attribute attribute = op->getAttr(key);
-        auto cost = structureCost(attribute, op);
+        auto cost = key == "ac.sampled_admission"
+                        ? sampledStructureCost(attribute, op)
+                        : structureCost(attribute, op);
         if (failed(cost))
           return WalkResult::interrupt();
         local.metadata = Budget::add(local.metadata, *cost);
@@ -1205,6 +1397,7 @@ private:
     if (counted.wasInterrupted())
       return failure();
     for (const auto &[definition, local] : work) {
+      Budget::LocalScope definitionBudget(budget);
       if (failed(budget.debit(1, definition)))
         return failure();
       auto comparisons = checkComparisonAllowance(local.checkKeys, definition);
@@ -1260,11 +1453,6 @@ private:
           Budget::add(local.obligations,
                       Budget::multiply(local.sampledRules,
                                        schemaRecordCost<Operation *>())));
-      uint64_t cost = Budget::add(
-          local.operations,
-          Budget::add(records,
-                      Budget::add(validationMetadata,
-                                  Budget::add(mapCost, local.carriers))));
       const uint64_t n = local.observations;
       const uint64_t j = local.observationMetadata;
       const uint64_t s = Budget::add(
@@ -1281,13 +1469,25 @@ private:
           Budget::add(
               Budget::multiply(n, schemaRecordCost<ObservationLocalKey>()),
               Budget::add(Budget::multiply(6, pairs), Budget::multiply(2, n))));
-      cost = Budget::add(cost, observationReserve);
       // Opaque native association/metadata scans are prepaid here. Sampled
       // schema, identity and prefix proofs debit their actual work through the
       // synchronous NativeSourceCheckScope; no speculative duplicate reserve.
       // Native operation verifiers still traverse the raw operand inventories.
-      if (local.hasSamplingMetadata) cost = Budget::add(cost, local.operands);
-      if (failed(budget.debit(cost, definition))) return failure();
+      // These are distinct, independently replayable consumers. Preserve the
+      // complete aggregate work metric without making unrelated record
+      // storage, metadata replay, indexes, carriers and observations live in
+      // one artificial definition-wide peak.
+      auto reserve = [&](uint64_t units) -> LogicalResult {
+        Budget::LocalScope consumerBudget(budget);
+        return budget.debit(units, definition);
+      };
+      for (uint64_t units :
+           {local.operations, records, validationMetadata, mapCost,
+            local.carriers, observationReserve})
+        if (failed(reserve(units)))
+          return failure();
+      if (local.hasSamplingMetadata && failed(reserve(local.operands)))
+        return failure();
       if (failed(budget.debit(Budget::bytes(sizeof(std::pair<Operation *, uint64_t>)),
                               definition))) return failure();
       // Different bound invocations still repeat opaque local validation;
@@ -1330,14 +1530,13 @@ private:
         check.samplingBindingIndex = known->second;
         continue;
       }
-      auto sampled =
-          parseSampledAdmission(check.rule, analysis, bindings, budget);
+      auto sampled = (*prepared)->getAdmission(check.rule, budget);
       if (failed(sampled))
         return failure();
       auto clock =
-          makeIdentityEndpoint(sampled->clock, scope, analysis, budget);
+          makeIdentityEndpoint((*sampled)->clock, scope, analysis, budget);
       auto reset =
-          makeIdentityEndpoint(sampled->reset, scope, analysis, budget);
+          makeIdentityEndpoint((*sampled)->reset, scope, analysis, budget);
       if (failed(clock) || failed(reset))
         return failure();
       auto normalizedClock =
@@ -1346,21 +1545,24 @@ private:
           normalizeIdentityEndpoint(*reset, stops, analysis, budget);
       if (failed(normalizedClock) || failed(normalizedReset))
         return failure();
-      std::optional<uint64_t> found;
-      for (uint64_t index : indices) {
-        if (failed(budget.debit(1, definition)))
-          return failure();
-        const auto &binding = plan.samplingBindings[index];
-        if (binding.clock == normalizedClock->value &&
-            binding.reset == normalizedReset->value) {
-          found = index;
-          break;
-        }
-      }
+      if (failed(budget.debit(1, definition)))
+        return failure();
+      auto signalKey =
+          std::make_pair(normalizedClock->value, normalizedReset->value);
+      auto knownBinding = samplingBindingBySignals.find(signalKey);
+      std::optional<uint64_t> found =
+          knownBinding == samplingBindingBySignals.end()
+              ? std::optional<uint64_t>()
+              : std::optional<uint64_t>(knownBinding->second);
       if (!found) {
         if (failed(budget.debit(
-                Budget::add(Budget::bytes(sizeof(HardwareCheckSamplingBinding)),
-                            Budget::bytes(sizeof(uint64_t))),
+                Budget::add(
+                    Budget::bytes(sizeof(HardwareCheckSamplingBinding)),
+                    Budget::add(Budget::bytes(sizeof(uint64_t)),
+                                Budget::bytes(
+                                    sizeof(decltype(samplingBindingBySignals)::
+                                               value_type) +
+                                    2 * sizeof(void *)))),
                 definition)))
           return failure();
         found = plan.samplingBindings.size();
@@ -1368,6 +1570,7 @@ private:
                                          normalizedReset->value,
                                          indices.size()});
         indices.push_back(*found);
+        samplingBindingBySignals.try_emplace(signalKey, *found);
       }
       if (failed(budget.debit(
               Budget::bytes(sizeof(std::pair<Operation *, uint64_t>)),
@@ -1380,16 +1583,23 @@ private:
   }
   LogicalResult catalog() {
     for (auto definition : analysis.getPackage().getOps<ModuleOp>()) {
+      definitionCount = Budget::add(definitionCount, 1);
       HardwareBindings local;
       local.owner = definition;
       if (failed(budget.debit(
               Budget::add(
                   Budget::bindings(local),
-                  Budget::bytes(sizeof(std::pair<ModuleOp, HardwareBindings>) +
-                                sizeof(uint64_t))),
+                  Budget::add(
+                      Budget::bytes(
+                          sizeof(std::pair<ModuleOp, HardwareBindings>) +
+                          sizeof(uint64_t)),
+                      Budget::bytes(
+                          sizeof(decltype(catalogBindings)::value_type) +
+                          2 * sizeof(void *)))),
               definition)))
         return failure();
       catalogScopes.emplace_back(definition, local);
+      catalogBindings.try_emplace(definition, local);
       if (failed(budget.debit(1, definition))) return failure();
       auto native = nativeChecks.find(definition);
       if (native == nativeChecks.end())
@@ -1428,7 +1638,13 @@ private:
       // independent of instance bindings (r8 review fix): the tolerant
       // family entries re-run over every retained definition, so an
       // uninstantiated module cannot bypass the original rejection boundary.
-      auto lexical = definition.walk([&](Operation *op) {
+      auto operations = definitionOperations.find(definition);
+      if (operations == definitionOperations.end())
+        return definition.emitOpError()
+               << "source-check catalog lacks frozen operation inventory";
+      for (Operation *op : operations->second) {
+        if (metrics)
+          ++metrics->visitedNodes;
         LogicalResult result = success();
         if (isa<EnumCreateOp, EnumToBitsOp, EnumFromBitsOp>(op))
           result = analysis.verifyEnumValueOperation(op, local);
@@ -1441,11 +1657,8 @@ private:
         else if (isa<BitsUnaryOp, BitsBinaryOp, BitsCompareOp, BitsSelectOp>(op))
           result = analysis.verifyBitsSymbolicWidths(op);
         if (failed(result))
-          return WalkResult::interrupt();
-        return WalkResult::advance();
-      });
-      if (lexical.wasInterrupted())
-        return failure();
+          return failure();
+      }
       auto sampling = catalogSampling(definition, local, bindings);
       if (failed(sampling))
         return failure();
@@ -1495,11 +1708,17 @@ private:
     node->checkIndices = localIndices[definition];
     auto sampling = localSamplingIndices.find(definition);
     if (sampling != localSamplingIndices.end()) {
-      if (failed(budget.debit(Budget::multiply(sampling->second.size(),
-                                               Budget::bytes(sizeof(uint64_t))),
-                              definition)))
+      uint64_t storage = Budget::multiply(
+          sampling->second.size(),
+          Budget::add(Budget::bytes(sizeof(uint64_t)),
+                      Budget::bytes(
+                          sizeof(decltype(node->samplingOrdinals)::value_type) +
+                          2 * sizeof(void *))));
+      if (failed(budget.debit(storage, definition)))
         return failure();
       node->samplingIndices = sampling->second;
+      for (auto [ordinal, binding] : llvm::enumerate(node->samplingIndices))
+        node->samplingOrdinals.try_emplace(binding, ordinal);
     }
     node->hasChecks = !node->checkIndices.empty();
     size_t index = nodes.size();
@@ -1531,31 +1750,32 @@ private:
                << "source check reset input must have width one";
       bound.reset = static_cast<unsigned>(*ordinal);
     }
-    auto resolved = definition.walk([&](Operation *op) {
+    auto operations = definitionOperations.find(definition);
+    if (operations == definitionOperations.end())
+      return definition.emitOpError()
+             << "bound source-check proof lacks frozen operation inventory";
+    for (Operation *op : operations->second) {
+      if (metrics)
+        ++metrics->visitedNodes;
       if (failed(budget.debit(1, op)))
-        return WalkResult::interrupt();
+        return failure();
       if (op == definition.getOperation() || isa<YieldOp>(op))
-        return WalkResult::advance();
-      return failed(analysis.verifyResolvedOperation(op, scope))
-                 ? WalkResult::interrupt()
-                 : WalkResult::advance();
-    });
-    if (resolved.wasInterrupted())
-      return failure();
+        continue;
+      if (failed(analysis.verifyResolvedOperation(op, scope)))
+        return failure();
+    }
     // Catalog proofs are complete before visit, and the package stays
     // immutable. Reuse only the same definition with exactly equal bindings.
     bool catalogProved = false;
-    for (const auto &[catalogDefinition, catalogBindings] : catalogScopes) {
-      if (failed(budget.debit(1, definition)))
-        return failure();
-      if (catalogDefinition != definition)
-        continue;
+    if (failed(budget.debit(1, definition)))
+      return failure();
+    auto catalog = catalogBindings.find(definition);
+    if (catalog != catalogBindings.end()) {
       if (failed(budget.debit(Budget::add(Budget::bindings(scope),
-                                          Budget::bindings(catalogBindings)),
+                                          Budget::bindings(catalog->second)),
                               definition)))
         return failure();
-      catalogProved = sameHardwareBindings(scope, catalogBindings);
-      break;
+      catalogProved = sameHardwareBindings(scope, catalog->second);
     }
     if (!catalogProved) {
       if (failed(budget.debit(localValidationCost[definition], definition)))
@@ -1778,18 +1998,13 @@ private:
       std::optional<uint64_t> samplingOccurrence;
       if (auto samplingBinding =
               plan.bindings[bindingIndex].samplingBindingIndex) {
-        for (auto [localOrdinal, index] :
-             llvm::enumerate(node.samplingIndices)) {
-          if (failed(budget.debit(1, node.definition)))
-            return failure();
-          if (index == *samplingBinding) {
-            samplingOccurrence = firstSamplingOccurrence + localOrdinal;
-            break;
-          }
-        }
-        if (!samplingOccurrence)
+        if (failed(budget.debit(1, node.definition)))
+          return failure();
+        auto local = node.samplingOrdinals.find(*samplingBinding);
+        if (local == node.samplingOrdinals.end())
           return node.definition->emitOpError()
                  << "sampled check lacks its owner sampling occurrence";
+        samplingOccurrence = firstSamplingOccurrence + local->second;
       }
       plan.checks.push_back(
           {bindingIndex, owner, reset, plan.checks.size(), samplingOccurrence});
@@ -1837,22 +2052,47 @@ private:
   PackageStagePolicy policy;
   SourceCheckBudget budget;
   SampledAdmissionValidation validation;
+  SourceCheckBuildMetrics *metrics;
+  uint64_t definitionCount = 0;
   HardwareSourceCheckPlan plan;
   llvm::DenseMap<Operation *, SmallVector<uint64_t>> localIndices;
   llvm::DenseMap<Operation *, SmallVector<uint64_t>> localSamplingIndices;
+  llvm::DenseMap<std::pair<Value, Value>, uint64_t> samplingBindingBySignals;
   NativeSourceCheckScope::Definitions nativeChecks;
   llvm::DenseMap<Operation *, uint64_t> localValidationCost;
+  llvm::DenseMap<Operation *, SmallVector<Operation *>> definitionOperations;
   std::map<const void *, uint64_t> sampledAttributeCosts;
   llvm::DenseSet<Operation *> active;
   SmallVector<std::unique_ptr<BoundDefinition>> nodes;
   std::multimap<Operation *, size_t> boundIndices;
   SmallVector<std::pair<ModuleOp, HardwareBindings>> catalogScopes;
+  llvm::DenseMap<Operation *, HardwareBindings> catalogBindings;
 };
 } // namespace
-FailureOr<HardwareSourceCheckPlan>
-buildSourceCheckPlan(const HardwareAnalysis &analysis,
-                     HardwareSourceCheckLimits limits,
-                     const PackageStagePolicy &policy) {
-  return Builder(analysis, limits, policy).build();
+FailureOr<HardwareSourceCheckPlan> buildSourceCheckPlan(
+    const HardwareAnalysis &analysis, HardwareSourceCheckLimits limits,
+    const PackageStagePolicy &policy, SourceCheckBuildMetrics *metrics) {
+  return Builder(analysis, limits, policy, metrics).build();
+}
+void publishSourceCheckMetrics(const SourceCheckBuildMetrics &source,
+                               acir::metrics::CompilerPhaseMetrics &target) {
+  target.work += source.workUnits;
+  target.definitions += source.definitions;
+  target.occurrences += source.ownerOccurrences;
+  target.calls += source.calls;
+  target.instances += source.instances;
+  target.irWalks += source.irWalks;
+  target.visitedNodes += source.visitedNodes;
+  target.planEntries += source.planEntries;
+  target.planBytes += source.planBytes;
+  target.details["bound_definitions"] += source.boundDefinitions;
+  target.details["prepared_sampled_contexts"] +=
+      source.preparedSampledContexts;
+  target.details["sampled_rule_parses"] += source.sampledRuleParses;
+  target.details["sampled_admission_proofs"] +=
+      source.sampledAdmissionProofs;
+  target.details["resolved_checks"] += source.resolvedChecks;
+  target.details["source_check_plan_entries"] += source.planEntries;
+  target.details["source_check_plan_bytes"] += source.planBytes;
 }
 } // namespace acir::ac::detail

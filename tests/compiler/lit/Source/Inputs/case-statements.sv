@@ -9,6 +9,7 @@ module tb;
   wire pyc_5f5f7079635f76616c69645f6f75745f30;
 `endif
   task automatic host_reset;
+    #1; // Let primitive initializers and combinational init pins settle.
     pyc_phase=4;#1;pyc_root_commit_ok=1;pyc_phase=2;#1;
     pyc_phase=0;pyc_root_commit_ok=0;#1;
   endtask
@@ -35,6 +36,7 @@ module tb;
         $display("WORK %0d %b",row,result);
 `ifdef CASE_STATEMENTS_STATE
         pyc_7079635f636c6b=next_clock;
+        #1; // Settle the new clock pin before PREPARE samples it.
         managed_commit();
 `endif
 

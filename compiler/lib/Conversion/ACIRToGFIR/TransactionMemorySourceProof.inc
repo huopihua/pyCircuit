@@ -4,6 +4,11 @@
         record.memoryReadPrefixes.size() != plan.memoryAccesses.size())
       return reject("original Memory path inventory differs");
     for (auto [accessId, access] : llvm::enumerate(plan.memoryAccesses)) {
+      // A frozen Memory access is independently replayable. Keep candidate
+      // coverage and proposal order package-wide, but bound each access proof
+      // separately so unrelated accesses do not consume one another's work
+      // allowance.
+      SourceCheckBudget::LocalScope accessBudget(budget);
       if (failed(rawStatementPathProof(record.memoryPaths[accessId], access.authoredPath,
                                        access.point.path, access.operation))) return failure();
       const auto &owner = plan.memoryOwners[access.owner];

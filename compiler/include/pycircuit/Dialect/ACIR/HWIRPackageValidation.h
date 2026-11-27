@@ -2,6 +2,7 @@
 #define PYCIRCUIT_DIALECT_ACIR_HWIRPACKAGEVALIDATION_H
 
 #include "pycircuit/Dialect/ACIR/HardwareAnalysisContext.h"
+#include "pycircuit/Analysis/CompilerPhaseMetrics.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Support/LogicalResult.h"
 #include <memory>
@@ -12,7 +13,9 @@ class Pass;
 
 namespace acir::ac {
 /// Verify common hardware shape, binding, dependency and execution contracts.
-mlir::LogicalResult verifyHardwarePackage(mlir::ModuleOp package);
+mlir::LogicalResult verifyHardwarePackage(
+    mlir::ModuleOp package,
+    acir::metrics::CompilerPhaseMetrics *metrics = nullptr);
 } // namespace acir::ac
 
 namespace acir {

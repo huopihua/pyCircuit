@@ -1,4 +1,5 @@
 #include "Compiler/SourceUnit.h"
+#include "pycircuit/Analysis/CompilerPhaseMetrics.h"
 #include "pycircuit/Dialect/ACIR/ACIRDialect.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -12,6 +13,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/SHA256.h"
 #include "llvm/Support/ToolOutputFile.h"
 
 #include <algorithm>
@@ -33,6 +35,19 @@ llvm::cl::opt<std::string> depsOutput("deps-out", llvm::cl::init(""));
 llvm::cl::opt<std::string> sourceImportOutput(
     "source-import-out", llvm::cl::init(""),
     llvm::cl::desc("Retain reproduction post-Lower, pre-Simplify IR text"));
+llvm::cl::opt<std::string> metricsOutput(
+    "metrics-out", llvm::cl::init(""),
+    llvm::cl::desc(
+        "Write non-authoritative phase metrics to a fresh JSON file"));
+
+std::string sha256(llvm::StringRef path) {
+  auto buffer = llvm::MemoryBuffer::getFile(path);
+  if (!buffer)
+    return {};
+  return llvm::toHex(
+      llvm::SHA256::hash(llvm::arrayRefFromStringRef((*buffer)->getBuffer())),
+      /*LowerCase=*/true);
+}
 
 void printNonfatalDiagnostic(const mlir::Diagnostic &diagnostic) {
   llvm::errs() << diagnostic.getLocation() << ": ";
@@ -123,8 +138,7 @@ std::string jsonString(llvm::StringRef value) {
 
 // Writes the consumed interface closure as a strict JSON array of
 // {"package","path"} objects, excluding the unit's own owner.
-bool writeConsumedDependencies(mlir::ModuleOp body,
-                               mlir::DictionaryAttr owner,
+bool writeConsumedDependencies(mlir::ModuleOp body, mlir::DictionaryAttr owner,
                                llvm::StringRef path) {
   auto interfaces = body->getAttrOfType<mlir::ArrayAttr>("ac.interfaces");
   auto ownerPackage = owner.getAs<mlir::StringAttr>("package");
@@ -134,8 +148,8 @@ bool writeConsumedDependencies(mlir::ModuleOp body,
   std::vector<std::pair<llvm::StringRef, llvm::StringRef>> consumed;
   for (mlir::Attribute raw : interfaces) {
     auto entry = llvm::dyn_cast<mlir::DictionaryAttr>(raw);
-    auto package = entry ? entry.getAs<mlir::StringAttr>("package")
-                         : mlir::StringAttr();
+    auto package =
+        entry ? entry.getAs<mlir::StringAttr>("package") : mlir::StringAttr();
     auto sourcePath =
         entry ? entry.getAs<mlir::StringAttr>("path") : mlir::StringAttr();
     if (!package || !sourcePath)
@@ -252,6 +266,18 @@ int main(int argc, char **argv) {
       });
   context.loadAllAvailableDialects();
 
+  const bool measure = !metricsOutput.empty();
+  acir::metrics::CompilerMetricsReport metrics;
+  acir::metrics::CompilerPhaseMetrics *importMetrics = nullptr;
+  if (measure) {
+    metrics.inputPath = capturePath;
+    metrics.inputSha256 = sha256(capturePath);
+    importMetrics = &metrics.phase("import");
+  }
+  acir::metrics::CompilerMetricsGuard metricsGuard(
+      metricsOutput, metrics, acir::metrics::CompilerTimingKind::Compile,
+      importMetrics);
+
   auto capture = parseModule(capturePath, context);
   if (!capture)
     return 1;
@@ -267,8 +293,8 @@ int main(int argc, char **argv) {
   auto emitError = [&] {
     return mlir::emitError(mlir::UnknownLoc::get(&context));
   };
-  auto registry =
-      acir::compiler::SourceHeaderRegistry::create(&context, headers, emitError);
+  auto registry = acir::compiler::SourceHeaderRegistry::create(
+      &context, headers, emitError);
   if (mlir::failed(registry))
     return 1;
   mlir::Builder builder(&context);
@@ -278,12 +304,14 @@ int main(int argc, char **argv) {
   });
   bool retainSourceImport = sourceImportOutput.getNumOccurrences() != 0;
   auto result = acir::compiler::compilePythonSourceUnit(
-      *capture, owner, *registry, emitError, retainSourceImport);
+      *capture, owner, *registry, emitError, retainSourceImport,
+      importMetrics);
   if (mlir::failed(result) || mlir::failed(mlir::verify(*result->body)) ||
       mlir::failed(mlir::verify(*result->interface)))
     return 1;
   if ((*result->body).getOperation()->getAttr("ac.source_owner") != owner ||
-      (*result->interface).getOperation()->getAttr("ac.source_owner") != owner) {
+      (*result->interface).getOperation()->getAttr("ac.source_owner") !=
+          owner) {
     llvm::errs() << "compiled source unit does not carry the requested owner\n";
     return 1;
   }
@@ -314,5 +342,5 @@ int main(int argc, char **argv) {
     return 1;
   if (sourceImportFile)
     sourceImportFile->keep();
-  return 0;
+  return metricsGuard.finish(true) ? 0 : 1;
 }

@@ -1141,7 +1141,8 @@ LogicalResult Importer::emitSourceTransactions(ModuleDecl &decl) {
       OpBuilder thenAt = OpBuilder::atBlockEnd(&branch.getThenRegion().front());
       BranchEnvironment yes = environment, no = environment;
       if (failed(emitBody(statement, "orelse", thenAt, yes, true))) return failure();
-      auto joined = joinBranches(*predicate, environment, yes, no, statement, at, decl.symbol, branch);
+      auto joined = joinBranches(*predicate, std::move(environment), yes, &no,
+                                 statement, at, decl.symbol, branch);
       if (failed(joined)) return failure();
       environment = std::move(*joined);
       return success();
@@ -1177,7 +1178,8 @@ LogicalResult Importer::emitSourceTransactions(ModuleDecl &decl) {
             OpBuilder thenAt = OpBuilder::atBlockEnd(&branch.getThenRegion().front());
             BranchEnvironment yes = environment, no = environment;
             if (failed(emitRange(parent, field, thenAt, yes, inBranch, i, true))) return failure();
-            auto joined = joinBranches(*predicate, environment, yes, no, statement,
+            auto joined = joinBranches(*predicate, std::move(environment), yes,
+                                        &no, statement,
                                         inside, decl.symbol, branch);
             if (failed(joined)) return failure();
             environment = std::move(*joined);

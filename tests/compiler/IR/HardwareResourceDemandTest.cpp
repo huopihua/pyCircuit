@@ -169,7 +169,7 @@ output.write_text(_emit_source_transport(_capture_source_file(source, source_roo
   struct StagedQueue {
     OwningOpRef<ModuleOp> original;
     std::unique_ptr<ac::SourceTransactionStateAnalysis> analysis;
-    acir::detail::PreparedTransactionLowering prepared;
+    acir::detail::FrozenRoutingFacts prepared;
     acir::detail::MaterializedTransactionLowering candidate;
   };
   std::unique_ptr<StagedQueue> stageQueue(bool prospective, bool rawBound) {

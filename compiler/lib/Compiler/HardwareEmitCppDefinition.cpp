@@ -3,8 +3,10 @@
 #include "HardwareEmitCommon.h"
 #include "HardwareEmitCppChecks.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringSwitch.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include <array>
 #include <deque>
 #include <tuple>
@@ -106,11 +108,9 @@ public:
       }
       return success();
     }
-    auto partitions =
-        ctx.analysis.getIndependentWorkSubtrees(scopes.front().definition);
-    if (failed(partitions))
-      return failure();
-    delegated = std::move(*partitions);
+    llvm::append_range(
+        delegated,
+        ctx.definitionPlan(scopes.front().definition).independentWorkSubtrees);
     // Prepare immutable task inputs through the existing pure SSA schedule.
     // Self-feedback reads temporal outputs; no leaf Work runs in this step.
     for (Operation *task : delegated)
@@ -560,6 +560,68 @@ private:
   void memoize(Scope &s, Value v, Path p, std::string text) {
     memo.push_back({&s, v, p, std::move(text)});
   }
+  bool simpleScalarDependencies(Value value, Path path,
+                                SmallVectorImpl<Value> &dependencies) {
+    if (!path.empty())
+      return false;
+    Operation *op = value.getDefiningOp();
+    if (!op)
+      return false;
+    if (isa<ac::BitsConstantOp, ac::BitsConstant4Op, ac::EnumCreateOp>(op))
+      return true;
+    if (!isa<ac::BitsUnaryOp, ac::BitsBinaryOp, ac::BitsCompareOp,
+             ac::BitsSelectOp, ac::BitsConcatOp, ac::BitsExtractOp,
+             ac::BitsResizeOp, ac::EnumToBitsOp, ac::EnumFromBitsOp,
+             ac::ValueRequireOp>(op))
+      return false;
+    llvm::append_range(dependencies, op->getOperands());
+    return true;
+  }
+  LogicalResult materializeDeepScalarDependencies(Scope &s, Value root,
+                                                   Path path) {
+    if (!path.empty())
+      return success();
+    struct Frame {
+      Value value;
+      bool expanded = false;
+    };
+    SmallVector<Frame, 64> stack;
+    llvm::DenseSet<Value> visited;
+    SmallVector<Value, 64> order;
+    stack.push_back({root});
+    while (!stack.empty()) {
+      Frame frame = stack.pop_back_val();
+      if (frame.expanded) {
+        order.push_back(frame.value);
+        continue;
+      }
+      if (!visited.insert(frame.value).second)
+        continue;
+      SmallVector<Value> dependencies;
+      if (!simpleScalarDependencies(frame.value, {}, dependencies))
+        continue;
+      stack.push_back({frame.value, true});
+      for (Value dependency : llvm::reverse(dependencies))
+        if (!visited.contains(dependency))
+          stack.push_back({dependency});
+    }
+    // The root is already being emitted by the caller. Every other node is in
+    // dependency-first order, so the ordinary emitter only observes memo hits
+    // and cannot rebuild the original unbounded C++ call stack.
+    for (Value value : order)
+      iterativeScalarValues.insert(value);
+    llvm::scope_exit cleanup([&] {
+      for (Value value : order)
+        iterativeScalarValues.erase(value);
+    });
+    for (Value value : order) {
+      if (value == root)
+        continue;
+      if (failed(emit(s, value)))
+        return failure();
+    }
+    return success();
+  }
   FailureOr<std::string> emit(Scope &s, Value v, Path path = {}) {
     if (probeSize && out.tell() > CppWorkOutlining::outlineTriggerBytes) {
       exceededSize = true;
@@ -571,6 +633,10 @@ private:
     for (auto &n : memo)
       if (n.scope == &s && n.value == v && n.path == path)
         return n.name;
+    llvm::SaveAndRestore depthGuard(emitDepth, emitDepth + 1);
+    if (emitDepth >= 128 && !iterativeScalarValues.contains(v) &&
+        failed(materializeDeepScalarDependencies(s, v, path)))
+      return failure();
     for (auto &n : active)
       if (n.scope == &s && n.value == v && n.path == path)
         return s.definition.emitOpError()
@@ -1748,6 +1814,8 @@ private:
   SmallVector<Leaf> storage;
   SmallVector<Node> memo, active;
   unsigned nextName = 0;
+  unsigned emitDepth = 0;
+  llvm::DenseSet<Value> iterativeScalarValues;
 };
 struct ChildInfo {
   Operation *op;
@@ -1764,8 +1832,9 @@ FailureOr<SmallVector<ChildInfo>> childInfo(HardwareEmitContext &ctx,
   unsigned observationIndex = 0;
   ac::HardwareBindings parent;
   parent.owner = definition;
-  for (Operation &op : definition.getBody().front())
-    if (isa<ac::InstanceOp, ac::CollectionOp>(op)) {
+  for (const HardwareEmissionChild &planned :
+       ctx.definitionPlan(definition).children) {
+      Operation &op = *planned.occurrence;
       bool observed = true;
       auto name = legalizeIdentifier(
           op.getAttrOfType<StringAttr>("instance_name").getValue(),
@@ -1792,7 +1861,7 @@ FailureOr<SmallVector<ChildInfo>> childInfo(HardwareEmitContext &ctx,
         return failure();
       result.push_back({&op, *b, ownerPrefix(&op).str() + *name, count, *type,
                         leaf, observed ? observationIndex++ : 0});
-    }
+  }
   return result;
 }
 } // namespace

@@ -2,6 +2,7 @@
 #define ACIR_LIB_COMPILER_SOURCEMEMORYBINDINGS_H
 #include "PythonImportAST.h"
 #include "SourceUnit.h"
+#include "pycircuit/Analysis/CompilerPhaseMetrics.h"
 #include "mlir/Pass/Pass.h"
 #include <memory>
 
@@ -44,6 +45,7 @@ public:
   bool isValid() const { return valid; }
   llvm::ArrayRef<MemoryCallPlan> memoryCalls() const;
   llvm::ArrayRef<ModuleDomainPlan> moduleDomains() const;
+  void collectMetrics(acir::metrics::CompilerPhaseMetrics &metrics) const;
   mlir::FailureOr<mlir::OwningOpRef<mlir::ModuleOp>> lower(
       mlir::DictionaryAttr owner, const SourceHeaderRegistry &headers);
 private:
@@ -56,7 +58,8 @@ private:
   bool initialized = false, valid = false, consumed = false;
 };
 std::unique_ptr<mlir::Pass> createInferSourceBindingsPass(
-    mlir::DictionaryAttr owner, const SourceHeaderRegistry &headers);
+    mlir::DictionaryAttr owner, const SourceHeaderRegistry &headers,
+    acir::metrics::CompilerPhaseMetrics *metrics = nullptr);
 void registerSourceBindingsPass();
 } // namespace acir::compiler::detail
 #endif

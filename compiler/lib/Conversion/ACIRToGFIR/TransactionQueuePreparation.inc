@@ -178,7 +178,8 @@
           b.getNamedAttr("unbound_push", b.getBoolAttr(queue->hasAttr("ac.source_unbound_push"))),
           b.getNamedAttr("unbound_pop", b.getBoolAttr(queue->hasAttr("ac.source_unbound_pop")))}));
     }
-    uint64_t input = definition.sourceInputs + 2 * definition.downward.size();
+    uint64_t input = definition.sourceInputs + 2 * definition.downward.size() +
+                     2 * definition.memoryReadOutputs.size();
     for (const auto &route : definition.queueIncoming) {
       if (!charge(budget, definition.module, 32 + 8 * route.path.size())) return failure();
       NamedAttrList row;
@@ -241,17 +242,51 @@
 
   FailureOr<bool> resourcePathsDisjoint(const ac::TransactionStatePlan &plan,
       ac::TransactionSourcePath left, ac::TransactionSourcePath right, Operation *site) {
+    auto encode = [](ac::TransactionSourcePath path) -> uint64_t {
+      return path.branch ? 1 + 2 * uint64_t(*path.branch) + path.whenTrue : 0;
+    };
+    auto key = std::make_pair(encode(left), encode(right));
+    if (key.second < key.first)
+      std::swap(key.first, key.second);
+    if (auto found = resourcePathDisjoint.find(key);
+        found != resourcePathDisjoint.end()) {
+      if (!charge(budget, site)) return failure();
+      return found->second;
+    }
+    bool disjoint = false;
     for (unsigned depth = 0; left.branch; ++depth) {
       if (depth > 128 || !charge(budget, site)) return failure();
       auto other = right;
       for (unsigned otherDepth = 0; other.branch; ++otherDepth) {
         if (otherDepth > 128 || !charge(budget, site)) return failure();
-        if (left.branch == other.branch && left.whenTrue != other.whenTrue) return true;
+        if (left.branch == other.branch && left.whenTrue != other.whenTrue) {
+          disjoint = true;
+          break;
+        }
         other = plan.branches[*other.branch].entry.path;
       }
+      if (disjoint) break;
       left = plan.branches[*left.branch].entry.path;
     }
-    return false;
+    using Cache = decltype(resourcePathDisjoint);
+    using Bucket = Cache::value_type;
+    uint64_t count = resourcePathDisjoint.size() + 1;
+    uint64_t oldCapacity = resourcePathDisjoint.getMemorySize() / sizeof(Bucket);
+    uint64_t capacity = std::max(uint64_t(64), oldCapacity);
+    while (SourceCheckBudget::multiply(count, 4) >=
+           SourceCheckBudget::multiply(capacity, 3))
+      capacity = SourceCheckBudget::multiply(capacity, 2);
+    if (!charge(budget, site) ||
+        (capacity > oldCapacity &&
+         !charge(budget, site,
+                 SourceCheckBudget::add(
+                     oldCapacity,
+                     SourceCheckBudget::bytes(SourceCheckBudget::multiply(
+                         capacity - oldCapacity, sizeof(Bucket)))))))
+      return failure();
+    resourcePathDisjoint.reserve(count);
+    resourcePathDisjoint.try_emplace(key, disjoint);
+    return disjoint;
   }
 
   LogicalResult resourceExclusions(const TransactionPreparation &prepared,
@@ -278,6 +313,7 @@
 
   LogicalResult resourceSpecializations(TransactionPreparation &prepared) {
     const auto &plan = *prepared.plan;
+    resourcePathDisjoint.clear();
     for (auto &proposal : prepared.queueProposals) {
       const auto &access = plan.queueAccesses[proposal.access];
       if (failed(resourceExclusions(prepared, access.point.path, access.operation,

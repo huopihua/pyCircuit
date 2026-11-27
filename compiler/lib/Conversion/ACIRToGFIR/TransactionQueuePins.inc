@@ -71,12 +71,15 @@ public:
       auto module = cast<ac::ModuleOp>(candidate.packageMap.lookup(definition.module.operator->()));
       auto yield = cast<ac::YieldOp>(module.getBody().front().getTerminator());
       OpBuilder builder(yield);
-      SmallVector<Value> outputs(yield.getValues());
+      uint64_t summaryBase = definition.sourceOutputs + definition.upward.size();
+      if (summaryBase > yield.getNumOperands()) return failure();
+      SmallVector<Value> outputs(yield.getValues().take_front(summaryBase));
       for (const auto &route : definition.queuePopSummaries) {
         auto value = subtree(definition.module, route.path, route.allocation, builder);
         if (failed(value)) return failure();
         outputs.push_back(*value);
       }
+      llvm::append_range(outputs, yield.getValues().drop_front(summaryBase));
       yield->setOperands(outputs);
     }
     for (auto [index, transaction] : llvm::enumerate(prepared.transactions)) {

@@ -26,6 +26,7 @@ def _cmd_emit(args: argparse.Namespace) -> int:
             rtl_mode=args.rtl_mode,
             output=args.output,
             replace=args.replace,
+            metrics_out=args.metrics_out,
         )
     except (
         _DriverError,
@@ -55,6 +56,7 @@ def _cmd_compile(args: argparse.Namespace) -> int:
             package_prefix=args.package_prefix,
             interface_units=args.interface_units,
             replace=args.replace,
+            metrics_out=args.metrics_out,
         )
     except (
         _DriverError,
@@ -86,6 +88,7 @@ def _cmd_link(args: argparse.Namespace) -> int:
             target=args.target,
             from_anchor=args.from_anchor,
             verify_only=args.verify_only,
+            metrics_out=args.metrics_out,
         )
     except (
         _DriverError,
@@ -249,6 +252,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Republish the target under the same owner and artifact kind",
     )
+    compile_units.add_argument("--metrics-out", help="Fresh phase metrics JSON file")
     compile_units.set_defaults(fn=_cmd_compile)
 
     link_program = sub.add_parser(
@@ -288,6 +292,7 @@ def main(argv: list[str] | None = None) -> int:
         "--from-anchor", help="Reload a self-contained saved anchor"
     )
     link_program.add_argument("--verify-only", action="store_true")
+    link_program.add_argument("--metrics-out", help="Fresh phase metrics JSON file")
     link_program.set_defaults(fn=_cmd_link)
 
     emit = sub.add_parser("emit", help="Emit C++ or Verilog from a saved final design.")
@@ -296,6 +301,7 @@ def main(argv: list[str] | None = None) -> int:
     emit.add_argument("--rtl-mode", choices=("managed", "physical"), default="managed")
     emit.add_argument("-o", dest="output", required=True)
     emit.add_argument("--replace", action="store_true")
+    emit.add_argument("--metrics-out", help="Fresh phase metrics JSON file")
     emit.set_defaults(fn=_cmd_emit)
     run = sub.add_parser(
         "run", help="Build and simulate a closed source system.", allow_abbrev=False

@@ -263,51 +263,7 @@ protected:
     for (const auto &candidate : plan.events) {
       if (candidate.kind != kind)
         continue;
-      std::optional<uint64_t> actual;
-      switch (kind) {
-      case TransactionStateEventKind::Read:
-        actual = candidate.read;
-        break;
-      case TransactionStateEventKind::Write:
-        actual = candidate.write;
-        break;
-      case TransactionStateEventKind::GuardEnter:
-      case TransactionStateEventKind::GuardExit:
-        actual = candidate.guard;
-        break;
-      case TransactionStateEventKind::SelectionEnter:
-      case TransactionStateEventKind::SelectionExit:
-        actual = candidate.selection;
-        break;
-      case TransactionStateEventKind::CallEnter:
-      case TransactionStateEventKind::CallExit:
-        actual = candidate.call;
-        break;
-      case TransactionStateEventKind::BodyCheck:
-        actual = candidate.bodyCheck;
-        break;
-      case TransactionStateEventKind::Observe:
-        actual = candidate.observation;
-        break;
-      case TransactionStateEventKind::BranchEnter:
-      case TransactionStateEventKind::ThenEnter:
-      case TransactionStateEventKind::ThenExit:
-      case TransactionStateEventKind::ElseEnter:
-      case TransactionStateEventKind::ElseExit:
-      case TransactionStateEventKind::BranchExit:
-        actual = candidate.branch;
-        break;
-      case TransactionStateEventKind::StateJoin:
-        actual = candidate.join;
-        break;
-      case TransactionStateEventKind::BranchResult:
-        actual = candidate.branchResult;
-        break;
-      case TransactionStateEventKind::TransactionEnter:
-      case TransactionStateEventKind::TransactionExit:
-        break;
-      }
-      if (!record || actual == record)
+      if (!record || candidate.record == record)
         return &candidate;
     }
     ADD_FAILURE() << "missing transaction event";
@@ -398,6 +354,27 @@ TEST_F(TransactionStateSSATest,
   ASSERT_EQ(plan->owners.size(), 3u);
   ASSERT_EQ(plan->writes.size(), 4u);
   ASSERT_EQ(plan->calls.size(), 6u); // relay includes one nested bump.
+  auto bumpDefinition = analysis->lookupDefinitionPlan(method(*file));
+  ASSERT_NE(bumpDefinition, nullptr);
+  ASSERT_FALSE(bumpDefinition->operations.empty());
+  EXPECT_EQ(bumpDefinition->operations.front(), method(*file).getOperation());
+  for (const auto &call : plan->calls) {
+    auto definitionPlan = plan->frames[call.callee].definitionPlan;
+    ASSERT_LT(definitionPlan, analysis->getDefinitionPlans().size());
+    EXPECT_EQ(call.calleeDefinitionPlan, definitionPlan);
+    EXPECT_EQ(analysis->getDefinitionPlans()[definitionPlan].callable,
+              plan->frames[call.callee].method.operator->());
+    auto callOwner = analysis->lookupDefinitionPlanId(call.operation);
+    ASSERT_TRUE(callOwner);
+    EXPECT_EQ(*callOwner, plan->frames[call.caller].definitionPlan);
+  }
+  for (const auto &event : plan->events) {
+    ASSERT_LT(event.definitionPlan, analysis->getDefinitionPlans().size());
+    if (event.kind == TransactionStateEventKind::CallEnter ||
+        event.kind == TransactionStateEventKind::CallExit)
+      EXPECT_EQ(event.definitionPlan,
+                plan->frames[plan->calls[*event.record].caller].definitionPlan);
+  }
   ASSERT_EQ(plan->versions.size(), 7u);
   for (unsigned i = 0; i < plan->versions.size(); ++i) {
     auto &version = plan->versions[i];
@@ -428,7 +405,7 @@ TEST_F(TransactionStateSSATest,
       ADD_FAILURE() << "straight-line fixture unexpectedly produced a join";
     }
   }
-  std::vector<const TransactionCallBinding *> bumps;
+  std::vector<const TransactionCallDelta *> bumps;
   for (auto &call : plan->calls)
     if (plan->frames[call.callee]
             .method->template getAttrOfType<mlir::StringAttr>("sym_name")
@@ -476,6 +453,81 @@ TEST_F(TransactionStateSSATest,
   ASSERT_EQ(relay->exitVersions.size(), 1u);
   EXPECT_EQ(ordinal(*plan, relay->entryVersions[0].version), 1u);
   EXPECT_EQ(ordinal(*plan, relay->exitVersions[0].version), 2u);
+}
+
+TEST_F(TransactionStateSSATest, NestedSelectionUsesOneFrozenDefinitionSummary) {
+  auto file = parse();
+  ASSERT_TRUE(file);
+  auto run = transaction(*file);
+  auto &body = run.getBody().front();
+  constexpr unsigned depth = 32;
+  constexpr unsigned payloadSize = 256;
+  auto *leaf = &body;
+  SourceBranchOp outer;
+  for (unsigned level = 0; level < depth; ++level) {
+    auto split =
+        branch(*leaf, leaf->getTerminator()->getIterator(), body.getArgument(0),
+               std::nullopt, std::nullopt, 40 + level);
+    if (!outer)
+      outer = split;
+    leaf = &split.getThenRegion().front();
+  }
+  builder.setInsertionPoint(outer);
+  std::array<mlir::Operation *, payloadSize> payload;
+  mlir::Value value = body.getArgument(1);
+  for (auto &operation : payload) {
+    mlir::OperationState add(run.getLoc(), BitsBinaryOp::getOperationName());
+    add.addOperands({value, value});
+    add.addTypes(value.getType());
+    add.addAttribute("opcode", builder.getStringAttr("add"));
+    operation = builder.create(add);
+    value = operation->getResult(0);
+  }
+  auto *call = first<SourceMethodCallOp>(run.getBody())->clone();
+  call->setOperand(1, value);
+  call->setAttr("occurrence", occurrence("Root", 40 + depth));
+  leaf->getOperations().insert(leaf->getTerminator()->getIterator(), call);
+
+  auto outside = analyze(*file);
+  ASSERT_TRUE(outside->isValid()) << diagnostics;
+  uint64_t outsideOperations = 0;
+  for (const auto &definition : outside->getDefinitionPlans())
+    outsideOperations += definition.operations.size();
+  metrics::CompilerPhaseMetrics outsideMetrics;
+  outside->collectMetrics(outsideMetrics);
+  EXPECT_EQ(outsideMetrics.details["definition_summary_builds"],
+            outside->getDefinitionPlans().size());
+  EXPECT_EQ(outsideMetrics.details["definition_summary_operation_visits"],
+            outsideOperations);
+  auto outsideVisits =
+      outsideMetrics.details["definition_summary_operation_visits"];
+  outside.reset();
+  for (auto *operation : payload)
+    operation->moveBefore(call);
+
+  auto nested = analyze(*file);
+  ASSERT_TRUE(nested->isValid()) << diagnostics;
+  auto *plan = nested->lookup(run);
+  ASSERT_NE(plan, nullptr);
+  EXPECT_EQ(plan->selections.size(), depth);
+  auto definition = nested->lookupDefinitionPlan(run);
+  ASSERT_NE(definition, nullptr);
+  EXPECT_EQ(definition->branchSelections.size(), depth);
+  EXPECT_TRUE(llvm::all_of(definition->branchSelections,
+                           [](const auto &entry) { return entry.second; }));
+  uint64_t nestedOperations = 0;
+  for (const auto &entry : nested->getDefinitionPlans())
+    nestedOperations += entry.operations.size();
+  // The same definition inventory is summarized exactly once whether the
+  // payload is outside or beneath every enclosing branch.
+  metrics::CompilerPhaseMetrics nestedMetrics;
+  nested->collectMetrics(nestedMetrics);
+  EXPECT_EQ(nestedMetrics.details["definition_summary_builds"],
+            nested->getDefinitionPlans().size());
+  EXPECT_EQ(nestedMetrics.details["definition_summary_operation_visits"],
+            nestedOperations);
+  EXPECT_EQ(nestedMetrics.details["definition_summary_operation_visits"],
+            outsideVisits);
 }
 
 TEST_F(TransactionStateSSATest,
@@ -559,8 +611,17 @@ TEST_F(TransactionStateSSATest,
 
   std::vector<TransactionStateEventKind> branchEvents;
   for (const auto &entry : plan->events)
-    if (entry.branch == 0 || entry.join == record.joins[0] ||
-        entry.branchResult == record.results[0])
+    if (((entry.kind == TransactionStateEventKind::BranchEnter ||
+          entry.kind == TransactionStateEventKind::ThenEnter ||
+          entry.kind == TransactionStateEventKind::ThenExit ||
+          entry.kind == TransactionStateEventKind::ElseEnter ||
+          entry.kind == TransactionStateEventKind::ElseExit ||
+          entry.kind == TransactionStateEventKind::BranchExit) &&
+         entry.record == 0) ||
+        (entry.kind == TransactionStateEventKind::StateJoin &&
+         entry.record == record.joins[0]) ||
+        (entry.kind == TransactionStateEventKind::BranchResult &&
+         entry.record == record.results[0]))
       branchEvents.push_back(entry.kind);
   const std::vector<TransactionStateEventKind> expected = {
       TransactionStateEventKind::BranchEnter,
@@ -935,13 +996,7 @@ TEST_F(TransactionStateSSATest,
       EXPECT_GE(event.point.prefix, previous);
       EXPECT_LE(event.point.prefix, plan->controls.size());
       previous = event.point.prefix;
-      unsigned payloads =
-          unsigned(bool(event.read)) + unsigned(bool(event.write)) +
-          unsigned(bool(event.guard)) + unsigned(bool(event.call)) +
-          unsigned(bool(event.selection)) + unsigned(bool(event.bodyCheck)) +
-          unsigned(bool(event.observation)) + unsigned(bool(event.branch)) +
-          unsigned(bool(event.join)) + unsigned(bool(event.branchResult));
-      EXPECT_EQ(payloads,
+      EXPECT_EQ(unsigned(event.record.has_value()),
                 event.kind == TransactionStateEventKind::TransactionEnter ||
                         event.kind == TransactionStateEventKind::TransactionExit
                     ? 0u
@@ -1388,7 +1443,9 @@ TEST_F(TransactionStateSSATest,
     for (auto &call : plan->calls) {
       bool entered = false, guarded = false, exited = false;
       for (auto &event : plan->events) {
-        if (event.call && &plan->calls[*event.call] == &call) {
+        if ((event.kind == TransactionStateEventKind::CallEnter ||
+             event.kind == TransactionStateEventKind::CallExit) &&
+            event.record && &plan->calls[*event.record] == &call) {
           EXPECT_EQ(event.frame, call.caller);
           if (event.kind == TransactionStateEventKind::CallEnter)
             entered = true;
@@ -1398,7 +1455,9 @@ TEST_F(TransactionStateSSATest,
             exited = true;
           }
         }
-        if (event.guard && *event.guard == plan->frames[call.callee].guard) {
+        if ((event.kind == TransactionStateEventKind::GuardEnter ||
+             event.kind == TransactionStateEventKind::GuardExit) &&
+            event.record && *event.record == plan->frames[call.callee].guard) {
           EXPECT_TRUE(entered);
           EXPECT_FALSE(exited);
           EXPECT_EQ(event.frame, call.callee);
@@ -2050,26 +2109,13 @@ TEST_F(TransactionStateSSATest,
   ObservationId nextObservation = 0;
   for (const auto &entry : plan->events) {
     if (entry.kind == TransactionStateEventKind::BodyCheck) {
-      ASSERT_TRUE(entry.bodyCheck);
-      EXPECT_EQ(*entry.bodyCheck, nextCheck++);
-      EXPECT_EQ(entry.frame, plan->bodyChecks[*entry.bodyCheck].frame);
-      EXPECT_FALSE(entry.observation);
-      EXPECT_FALSE(entry.read);
-      EXPECT_FALSE(entry.write);
-      EXPECT_FALSE(entry.guard);
-      EXPECT_FALSE(entry.call);
+      ASSERT_TRUE(entry.record);
+      EXPECT_EQ(*entry.record, nextCheck++);
+      EXPECT_EQ(entry.frame, plan->bodyChecks[*entry.record].frame);
     } else if (entry.kind == TransactionStateEventKind::Observe) {
-      ASSERT_TRUE(entry.observation);
-      EXPECT_EQ(*entry.observation, nextObservation++);
-      EXPECT_EQ(entry.frame, plan->observations[*entry.observation].frame);
-      EXPECT_FALSE(entry.bodyCheck);
-      EXPECT_FALSE(entry.read);
-      EXPECT_FALSE(entry.write);
-      EXPECT_FALSE(entry.guard);
-      EXPECT_FALSE(entry.call);
-    } else {
-      EXPECT_FALSE(entry.bodyCheck);
-      EXPECT_FALSE(entry.observation);
+      ASSERT_TRUE(entry.record);
+      EXPECT_EQ(*entry.record, nextObservation++);
+      EXPECT_EQ(entry.frame, plan->observations[*entry.record].frame);
     }
   }
   EXPECT_EQ(nextCheck, plan->bodyChecks.size());
@@ -2078,11 +2124,7 @@ TEST_F(TransactionStateSSATest,
   auto eventIndex = [&](TransactionStateEventKind kind,
                         uint64_t record) -> size_t {
     for (auto [index, entry] : llvm::enumerate(plan->events)) {
-      if (entry.kind == kind &&
-          ((kind == TransactionStateEventKind::BodyCheck && entry.bodyCheck &&
-            *entry.bodyCheck == record) ||
-           (kind == TransactionStateEventKind::Observe && entry.observation &&
-            *entry.observation == record)))
+      if (entry.kind == kind && entry.record == record)
         return index;
     }
     ADD_FAILURE() << "missing projected body-effect event";
@@ -2106,8 +2148,8 @@ TEST_F(TransactionStateSSATest,
           entry.kind == TransactionStateEventKind::Read &&
           index < observationEvent)
         sawRead = true;
-      if (entry.kind == TransactionStateEventKind::CallExit && entry.call &&
-          plan->calls[*entry.call].callee == observation->frame) {
+      if (entry.kind == TransactionStateEventKind::CallExit && entry.record &&
+          plan->calls[*entry.record].callee == observation->frame) {
         EXPECT_GT(index, checkEvent);
         sawCallExit = true;
       }
@@ -2184,8 +2226,8 @@ TEST_F(TransactionStateSSATest,
   for (auto [index, entry] : llvm::enumerate(plan->events)) {
     if (entry.kind == TransactionStateEventKind::Observe)
       observationEvent = index;
-    if (entry.kind == TransactionStateEventKind::GuardEnter && entry.guard &&
-        *entry.guard == 1)
+    if (entry.kind == TransactionStateEventKind::GuardEnter && entry.record &&
+        *entry.record == 1)
       falseGuardEnter = index;
   }
   ASSERT_LT(observationEvent, plan->events.size());
@@ -2885,8 +2927,8 @@ TEST_F(TransactionStateSSATest,
   unsigned eventCount = 0;
   for (const auto &event : plan->events)
     if (event.kind == TransactionStateEventKind::QueueAccess) {
-      ASSERT_TRUE(event.queueAccess);
-      EXPECT_EQ(*event.queueAccess, eventCount++);
+      ASSERT_TRUE(event.record);
+      EXPECT_EQ(*event.record, eventCount++);
     }
   EXPECT_EQ(eventCount, 4u);
   std::string dump;
@@ -3069,7 +3111,7 @@ TEST_F(TransactionStateSSATest,
   auto *plan = analysis->lookup(run);
   ASSERT_NE(plan, nullptr);
   ASSERT_EQ(plan->owners.size(), 3u);
-  std::vector<const TransactionCallBinding *> bumps;
+  std::vector<const TransactionCallDelta *> bumps;
   for (const auto &call : plan->calls)
     if (plan->frames[call.callee].method == method(*file))
       bumps.push_back(&call);
@@ -3110,8 +3152,10 @@ TEST_F(TransactionStateSSATest,
   auto before = print(file->getOperation());
   auto operations = identities(*file);
   EXPECT_TRUE(mlir::failed(capture([&] { return mlir::verify(*file); })));
-  EXPECT_NE(diagnostics.find("static instance reference cannot bypass lexical scope"),
-            std::string::npos) << diagnostics;
+  EXPECT_NE(
+      diagnostics.find("static instance reference cannot bypass lexical scope"),
+      std::string::npos)
+      << diagnostics;
   EXPECT_EQ(before, print(file->getOperation()));
   EXPECT_EQ(operations, identities(*file));
   auto analysis = analyze(*file);
@@ -3149,8 +3193,10 @@ TEST_F(TransactionStateSSATest,
   auto before = print(file->getOperation());
   auto operations = identities(*file);
   EXPECT_TRUE(mlir::failed(capture([&] { return mlir::verify(*file); })));
-  EXPECT_NE(diagnostics.find("static instance reference cannot bypass lexical scope"),
-            std::string::npos) << diagnostics;
+  EXPECT_NE(
+      diagnostics.find("static instance reference cannot bypass lexical scope"),
+      std::string::npos)
+      << diagnostics;
   EXPECT_EQ(before, print(file->getOperation()));
   EXPECT_EQ(operations, identities(*file));
   auto analysis = analyze(*file);
@@ -3185,8 +3231,10 @@ TEST_F(TransactionStateSSATest,
   auto before = print(file->getOperation());
   auto operations = identities(*file);
   EXPECT_TRUE(mlir::failed(capture([&] { return mlir::verify(*file); })));
-  EXPECT_NE(diagnostics.find("static instance reference cannot bypass lexical scope"),
-            std::string::npos) << diagnostics;
+  EXPECT_NE(
+      diagnostics.find("static instance reference cannot bypass lexical scope"),
+      std::string::npos)
+      << diagnostics;
   EXPECT_EQ(before, print(file->getOperation()));
   EXPECT_EQ(operations, identities(*file));
   auto analysis = analyze(*file);
@@ -3240,8 +3288,10 @@ TEST_F(TransactionStateSSATest,
     auto before = print(file->getOperation());
     auto operations = identities(*file);
     EXPECT_TRUE(mlir::failed(capture([&] { return mlir::verify(*file); })));
-    EXPECT_NE(diagnostics.find("static instance reference cannot bypass lexical scope"),
-              std::string::npos) << diagnostics;
+    EXPECT_NE(diagnostics.find(
+                  "static instance reference cannot bypass lexical scope"),
+              std::string::npos)
+        << diagnostics;
     EXPECT_EQ(before, print(file->getOperation()));
     EXPECT_EQ(operations, identities(*file));
     auto analysis = analyze(*file);
@@ -3274,16 +3324,19 @@ TEST_F(TransactionStateSSATest,
   auto before = print(file->getOperation());
   auto operations = identities(*file);
   EXPECT_TRUE(mlir::failed(capture([&] { return mlir::verify(*file); })));
-  EXPECT_NE(diagnostics.find("static instance reference cannot bypass lexical scope"),
-            std::string::npos) << diagnostics;
+  EXPECT_NE(
+      diagnostics.find("static instance reference cannot bypass lexical scope"),
+      std::string::npos)
+      << diagnostics;
   EXPECT_EQ(before, print(file->getOperation()));
   EXPECT_EQ(operations, identities(*file));
   auto analysis = analyze(*file);
   EXPECT_FALSE(analysis->isValid()) << diagnostics;
 }
 
-TEST_F(TransactionStateSSATest,
-       OccurrenceVerifierPreservesCompletePlansAndSelectsCostFromFreshTopology) {
+TEST_F(
+    TransactionStateSSATest,
+    OccurrenceVerifierPreservesCompletePlansAndSelectsCostFromFreshTopology) {
   for (bool relative : {false, true}) {
     SCOPED_TRACE(relative);
     auto file = parse();
@@ -3307,7 +3360,8 @@ TEST_F(TransactionStateSSATest,
     EXPECT_FALSE(run->values.empty());
     EXPECT_FALSE(run->events.empty());
     llvm::SmallVector<const TransactionStatePlan *, 0> expected;
-    for (const auto &plan : analysis->getPlans()) expected.push_back(&plan);
+    for (const auto &plan : analysis->getPlans())
+      expected.push_back(&plan);
     auto sourceText = print(file->getOperation());
     auto sourceObjects = identities(*file);
     auto planText = dump(*analysis);
@@ -3331,8 +3385,9 @@ TEST_F(TransactionStateSSATest,
   }
 }
 
-TEST_F(TransactionStateSSATest,
-       OccurrenceVerifierRejectsInventoryAndEveryLexicalRoutingIdentityMutation) {
+TEST_F(
+    TransactionStateSSATest,
+    OccurrenceVerifierRejectsInventoryAndEveryLexicalRoutingIdentityMutation) {
   auto file = parse();
   ASSERT_TRUE(file);
   auto analysis = analyze(*file);
@@ -3344,24 +3399,47 @@ TEST_F(TransactionStateSSATest,
   for (unsigned mutation = 0; mutation != 12; ++mutation) {
     SCOPED_TRACE(mutation);
     llvm::SmallVector<const TransactionStatePlan *, 0> expected;
-    for (const auto &plan : analysis->getPlans()) expected.push_back(&plan);
+    for (const auto &plan : analysis->getPlans())
+      expected.push_back(&plan);
     TransactionStatePlan forged = *expected[0];
     expected[0] = &forged;
     switch (mutation) {
-    case 0: expected.pop_back(); break;
-    case 1: expected.push_back(expected.back()); break;
-    case 2: std::swap(expected[0], expected[1]); break;
-    case 3: expected[0] = nullptr; break;
-    case 4: expected[1] = expected[0]; break;
-    case 5: forged.transaction = transaction(*file, "watch"); break;
-    case 6: forged.lexicalModule = module(*file, "Child"); break;
-    case 7: forged.routingModule = module(*file, "Child"); break;
-    case 8: forged.registrationPath = mlir::ArrayAttr(); break;
+    case 0:
+      expected.pop_back();
+      break;
+    case 1:
+      expected.push_back(expected.back());
+      break;
+    case 2:
+      std::swap(expected[0], expected[1]);
+      break;
+    case 3:
+      expected[0] = nullptr;
+      break;
+    case 4:
+      expected[1] = expected[0];
+      break;
+    case 5:
+      forged.transaction = transaction(*file, "watch");
+      break;
+    case 6:
+      forged.lexicalModule = module(*file, "Child");
+      break;
+    case 7:
+      forged.routingModule = module(*file, "Child");
+      break;
+    case 8:
+      forged.registrationPath = mlir::ArrayAttr();
+      break;
     case 9:
       forged.registrationPath = builder.getArrayAttr({occurrence("Root", 1)});
       break;
-    case 10: forged.lexicalAnchor = 1; break;
-    case 11: forged.ordinal = 1; break;
+    case 10:
+      forged.lexicalAnchor = 1;
+      break;
+    case 11:
+      forged.ordinal = 1;
+      break;
     }
     auto forgedIdentity = std::make_tuple(
         forged.transaction, forged.lexicalModule, forged.routingModule,
@@ -3371,12 +3449,15 @@ TEST_F(TransactionStateSSATest,
           file->getOperation(), expected);
     });
     EXPECT_TRUE(mlir::failed(verified));
-    EXPECT_NE(diagnostics.find(mutation < 2 ? "transaction occurrence inventory differs"
-                                           : "transaction occurrence routing differs"),
-              std::string::npos) << diagnostics;
-    EXPECT_EQ(forgedIdentity, std::make_tuple(
-        forged.transaction, forged.lexicalModule, forged.routingModule,
-        forged.registrationPath, forged.lexicalAnchor, forged.ordinal));
+    EXPECT_NE(diagnostics.find(mutation < 2
+                                   ? "transaction occurrence inventory differs"
+                                   : "transaction occurrence routing differs"),
+              std::string::npos)
+        << diagnostics;
+    EXPECT_EQ(forgedIdentity,
+              std::make_tuple(forged.transaction, forged.lexicalModule,
+                              forged.routingModule, forged.registrationPath,
+                              forged.lexicalAnchor, forged.ordinal));
     EXPECT_EQ(sourceText, print(file->getOperation()));
     EXPECT_EQ(sourceObjects, identities(*file));
     EXPECT_EQ(planText, dump(*analysis));
@@ -3406,7 +3487,8 @@ TEST_F(TransactionStateSSATest,
     auto analysis = analyze(*file);
     ASSERT_TRUE(analysis->isValid()) << diagnostics;
     llvm::SmallVector<const TransactionStatePlan *, 0> expected;
-    for (const auto &plan : analysis->getPlans()) expected.push_back(&plan);
+    for (const auto &plan : analysis->getPlans())
+      expected.push_back(&plan);
     ASSERT_EQ(expected.size(), 2u);
     auto valid = capture([&] {
       return SourceTransactionStateAnalysis::verifyOccurrences(
@@ -3420,8 +3502,10 @@ TEST_F(TransactionStateSSATest,
       category = "after ordering is retired";
       break;
     case 1:
-      nested->setAttr("callee", mlir::SymbolRefAttr::get(
-          &context, "Child", {mlir::FlatSymbolRefAttr::get(&context, "uncalled")}));
+      nested->setAttr(
+          "callee", mlir::SymbolRefAttr::get(
+                        &context, "Child",
+                        {mlir::FlatSymbolRefAttr::get(&context, "uncalled")}));
       category = "recursive Method call graph";
       break;
     case 2:
@@ -3436,7 +3520,8 @@ TEST_F(TransactionStateSSATest,
       // this uncalled declaration cannot hide a duplicated actual allocation.
       nested->setAttr("receiver_kind", builder.getStringAttr("reference"));
       nested->setAttr("ancestor_depth", builder.getI64IntegerAttr(0));
-      auto instances = module(*file, "Root").getBody().front().getOps<InstanceOp>();
+      auto instances =
+          module(*file, "Root").getBody().front().getOps<InstanceOp>();
       auto left = *instances.begin();
       auto right = *std::next(instances.begin());
       right->setAttr("occurrence", left.getOccurrence());
@@ -3452,7 +3537,8 @@ TEST_F(TransactionStateSSATest,
           file->getOperation(), expected);
     });
     EXPECT_TRUE(mlir::failed(rejected));
-    EXPECT_NE(diagnostics.find(category.str()), std::string::npos) << diagnostics;
+    EXPECT_NE(diagnostics.find(category.str()), std::string::npos)
+        << diagnostics;
     EXPECT_EQ(sourceText, print(file->getOperation()));
     EXPECT_EQ(sourceObjects, identities(*file));
     EXPECT_EQ(planText, dump(*analysis));

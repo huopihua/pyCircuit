@@ -49,7 +49,8 @@ FailureOr<SourceUnitArtifacts>
 compilePythonSourceUnit(ModuleOp transport, DictionaryAttr sourceOwner,
                         const SourceHeaderRegistry &headers,
                         ac::detail::EmitError emitError,
-                        bool retainSourceImport) {
+                        bool retainSourceImport,
+                        acir::metrics::CompilerPhaseMetrics *metrics) {
   if (failed(ac::detail::verifySourceOwner(sourceOwner, emitError)))
     return failure();
   OwningOpRef<ModuleOp> body(cast<ModuleOp>(transport->clone()));
@@ -57,12 +58,22 @@ compilePythonSourceUnit(ModuleOp transport, DictionaryAttr sourceOwner,
   SourceImportCapture capture;
   PassManager lowering(transport.getContext());
   lowering.addPass(detail::createAnalyzeRuleWritesPass());
-  lowering.addPass(detail::createInferSourceBindingsPass(sourceOwner, headers));
-  lowering.addPass(detail::createLowerPythonSourcePass(sourceOwner, headers));
+  lowering.addPass(
+      detail::createInferSourceBindingsPass(sourceOwner, headers, metrics));
+  lowering.addPass(
+      detail::createLowerPythonSourcePass(sourceOwner, headers, metrics));
   lowering.addPass(acir::createNormalizeSourceControlFlowPass());
   lowering.addPass(acir::createAnalyzeSourceMethodSummariesPass());
   if (failed(lowering.run(*body)))
     return failure();
+  if (metrics) {
+    ++metrics->irWalks;
+    body->walk([&](Operation *operation) {
+      ++metrics->visitedNodes;
+      metrics->instances += isa<ac::InstanceOp, ac::CollectionOp>(operation);
+      metrics->calls += isa<ac::SourceMethodCallOp>(operation);
+    });
+  }
   bool transactions = false;
   body->walk([&](Operation *operation) {
     if (isa<ac::SourceStateOp, ac::SourceStateReadOp, ac::SourceStateWriteOp,

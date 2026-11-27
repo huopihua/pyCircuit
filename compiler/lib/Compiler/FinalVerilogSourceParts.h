@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 namespace acir::compiler {
+class HardwareEmitContext;
 struct FinalVerilogSourceGroup {
   mlir::DictionaryAttr sourceOwner;
   llvm::SmallVector<mlir::FlatSymbolRefAttr> definitions;
@@ -20,6 +21,10 @@ struct FinalVerilogSourceParts {
 mlir::FailureOr<FinalVerilogSourceParts>
 emitVerilogSourceParts(mlir::ModuleOp package, ac::HardwareAnalysis &analysis,
                        bool physical = false);
+mlir::FailureOr<FinalVerilogSourceParts>
+emitPreparedVerilogSourceParts(HardwareEmitContext &context);
+void renderVerilogSourceParts(const FinalVerilogSourceParts &parts,
+                              llvm::raw_ostream &out);
 mlir::LogicalResult emitVerilog(mlir::ModuleOp package,
                                 ac::HardwareAnalysis &analysis,
                                 llvm::raw_ostream &out, bool physical = false);

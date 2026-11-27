@@ -2,6 +2,7 @@
 #define ACIR_LIB_COMPILER_SOURCEUNIT_H
 
 #include "Dialect/ACIR/ACIRSourceContracts.h"
+#include "pycircuit/Analysis/CompilerPhaseMetrics.h"
 #include "pycircuit/Dialect/ACIR/ACIROps.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -111,7 +112,8 @@ private:
 mlir::FailureOr<SourceUnitArtifacts> compilePythonSourceUnit(
     mlir::ModuleOp transport, mlir::DictionaryAttr sourceOwner,
     const SourceHeaderRegistry &headers, ac::detail::EmitError emitError,
-    bool retainSourceImport = false);
+    bool retainSourceImport = false,
+    acir::metrics::CompilerPhaseMetrics *metrics = nullptr);
 
 mlir::LogicalResult
 verifyPublishedDependencies(ac::ModuleOp definition,

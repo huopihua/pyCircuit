@@ -253,6 +253,7 @@ def emit_command(
     output: str | Path,
     replace: bool = False,
     rtl_mode: str = "managed",
+    metrics_out: str | Path | None = None,
 ):
     if target not in {"cpp", "verilog"}:
         raise _DriverError("emit target must be cpp or verilog")
@@ -272,6 +273,7 @@ def emit_command(
     control = _paths_for(source, fs).control
     with tempfile.TemporaryDirectory(prefix="pycircuit-emit-") as temporary:
         saved = Path(temporary) / "design_top.ac"
+        metrics_path = Path(temporary) / "emit-metrics.json"
         while True:
             inputs = []
             snapshot = None
@@ -305,13 +307,20 @@ def emit_command(
                 elif fs.kind(control) is not None:
                     continue
                 saved.write_bytes(snapshot)
+                command = [str(helper), str(saved), "--target", target]
+                command += ["--rtl-mode", rtl_mode] if target == "verilog" else []
+                if metrics_out is not None:
+                    command += ["--metrics-out", str(metrics_path)]
                 emitted = subprocess.run(
-                    [str(helper), str(saved), "--target", target]
-                    + (["--rtl-mode", rtl_mode] if target == "verilog" else []),
+                    command,
                     capture_output=True,
                     text=True,
                     check=False,
                 )
+                if metrics_out is not None:
+                    from ._metrics import publish_metrics
+
+                    publish_metrics(metrics_path, metrics_out)
                 if emitted.returncode:
                     detail = " ".join((emitted.stderr or emitted.stdout).split())
                     raise _DriverError(f"native emit rejected final design: {detail}")

@@ -1,11 +1,12 @@
 #ifndef PYCIRCUIT_DIALECT_ACIR_SOURCETRANSACTIONSTATEANALYSIS_H
 #define PYCIRCUIT_DIALECT_ACIR_SOURCETRANSACTIONSTATEANALYSIS_H
 
+#include "pycircuit/Analysis/CompilerPhaseMetrics.h"
 #include "pycircuit/Dialect/ACIR/ACIROps.h"
 #include "pycircuit/Dialect/ACIR/HardwareAnalysis.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdint>
 #include <optional>
@@ -15,29 +16,59 @@ namespace acir::ac {
 
 // These indices refer only to vectors in one TransactionStatePlan. They are
 // analysis identities, not hardware values or published source identities.
-using LexicalInstanceId = uint64_t;
-using InvocationFrameId = uint64_t;
-using BoundValueId = uint64_t;
-using StateOwnerId = uint64_t;
-using QueueOwnerId = uint64_t;
-using QueueAccessId = uint64_t;
-using MemoryOwnerId = uint64_t;
-using MemoryAccessId = uint64_t;
-using StateVersionId = uint64_t;
-using StateReadId = uint64_t;
-using StateWriteId = uint64_t;
-using FormalWriteId = uint64_t;
-using GuardBoundaryId = uint64_t;
-using AdmissionControlId = uint64_t;
-using SelectionBoundaryId = uint64_t;
-using CallBindingId = uint64_t;
-using BodyCheckId = uint64_t;
-using ObservationId = uint64_t;
-using BranchId = uint64_t;
-using BranchResultId = uint64_t;
-using StateJoinId = uint64_t;
+using LexicalInstanceId = uint32_t;
+using InvocationFrameId = uint32_t;
+using BoundValueId = uint32_t;
+using StateOwnerId = uint32_t;
+using QueueOwnerId = uint32_t;
+using QueueAccessId = uint32_t;
+using MemoryOwnerId = uint32_t;
+using MemoryAccessId = uint32_t;
+using StateVersionId = uint32_t;
+using StateReadId = uint32_t;
+using StateWriteId = uint32_t;
+using FormalWriteId = uint32_t;
+using GuardBoundaryId = uint32_t;
+using AdmissionControlId = uint32_t;
+using SelectionBoundaryId = uint32_t;
+using CallBindingId = uint32_t;
+using BodyCheckId = uint32_t;
+using ObservationId = uint32_t;
+using BranchId = uint32_t;
+using BranchResultId = uint32_t;
+using StateJoinId = uint32_t;
+using TransactionDefinitionPlanId = uint32_t;
 /// Number of completed admission controls; zero is unconditional.
-using AdmissionPrefix = uint64_t;
+using AdmissionPrefix = uint32_t;
+
+/// Definition-local structure shared by every invocation and physical
+/// occurrence in one immutable analysis. Operations are inventoried once in
+/// source order. Branch selection summaries depend only on nested source
+/// structure; bindings, state versions, values and proof conclusions never
+/// enter this object. All borrowed handles expire with the owning analysis or
+/// any IR mutation.
+struct TransactionDefinitionPlan {
+  mlir::Operation *callable = nullptr;
+  ModuleOp lexicalModule;
+  llvm::SmallVector<mlir::Operation *, 0> operations;
+  llvm::DenseMap<mlir::Operation *, bool> branchSelections;
+  uint64_t readCount = 0;
+  uint64_t writeCount = 0;
+  uint64_t formalWriteCount = 0;
+  uint64_t callCount = 0;
+  uint64_t bodyCheckCount = 0;
+  uint64_t observationCount = 0;
+  uint64_t branchCount = 0;
+  uint64_t branchResultCount = 0;
+  uint64_t selectionCount = 0;
+
+  std::optional<bool> needsSelection(SourceBranchOp branch) const {
+    auto found = branchSelections.find(branch);
+    if (found == branchSelections.end())
+      return std::nullopt;
+    return found->second;
+  }
+};
 
 /// Full source-region ancestry, including branches with no admission control.
 struct TransactionSourcePath {
@@ -104,6 +135,7 @@ struct TransactionValueBinding {
 
 struct InvocationFrame {
   SourceTransactionOp transaction;
+  TransactionDefinitionPlanId definitionPlan = 0;
   std::optional<InvocationFrameId> parent;
   SourceMethodCallOp call;
   SourceMethodOp method;
@@ -320,11 +352,19 @@ struct TransactionStateJoin {
 /// Both arms restore the same candidates while control prefixes advance.
 struct TransactionBranch {
   SourceBranchOp operation;
+  /// Frozen identity of the definition that owns this source branch. This may
+  /// differ from the dynamic frame during source-loop expansion.
+  TransactionDefinitionPlanId definitionPlan = 0;
   InvocationFrameId frame;
   BoundValueId condition;
   TransactionPoint entry;
   std::optional<SelectionBoundaryId> selection;
   AdmissionPrefix thenExitPrefix = 0, elseExitPrefix = 0;
+  /// Half-open preorder ranges of nested branches in each arm. The then arm
+  /// owns [this + 1, thenEndBranch); the else arm owns
+  /// [thenEndBranch, elseEndBranch). These replace repeated parent chasing
+  /// without changing the dynamic branch/result records.
+  BranchId thenEndBranch = 0, elseEndBranch = 0;
   mlir::BoolAttr conditionFact;
   llvm::SmallVector<OwnerVersionBinding> entryVersions, thenVersions,
       elseVersions;
@@ -368,8 +408,10 @@ struct TransactionResultBinding {
 /// calls. They do not inventory all known state. Entry candidates are frozen at
 /// CallEnter; a lazily discovered owner absent at entry uses Q0, even if its
 /// first access later writes it. Exit versions reflect the completed body.
-struct TransactionCallBinding {
+struct TransactionCallDelta {
   SourceMethodCallOp operation;
+  /// Frozen identity of the invoked callable's shared definition plan.
+  TransactionDefinitionPlanId calleeDefinitionPlan = 0;
   InvocationFrameId caller = 0;
   InvocationFrameId callee = 0;
   BoundValueId authoredPath = 0;
@@ -444,21 +486,16 @@ enum class TransactionStateEventKind {
 /// their operation, and transaction boundaries use rootFrame.
 struct TransactionStateEvent {
   TransactionStateEventKind kind = TransactionStateEventKind::TransactionEnter;
+  /// Frozen identity of the source definition that owns this event's operation
+  /// or structural boundary. The frame keeps occurrence history; consumers do
+  /// not recover static identity by walking an operation's parent chain.
+  TransactionDefinitionPlanId definitionPlan = 0;
   InvocationFrameId frame = 0;
-  std::optional<StateReadId> read;
-  std::optional<StateWriteId> write;
-  std::optional<FormalWriteId> formalWrite;
-  std::optional<GuardBoundaryId> guard;
-  std::optional<CallBindingId> call;
   TransactionPoint point;
-  std::optional<SelectionBoundaryId> selection;
-  std::optional<BodyCheckId> bodyCheck;
-  std::optional<ObservationId> observation;
-  std::optional<QueueAccessId> queueAccess;
-  std::optional<MemoryAccessId> memoryAccess;
-  std::optional<BranchId> branch;
-  std::optional<StateJoinId> join;
-  std::optional<BranchResultId> branchResult;
+  /// The kind selects the record vector. Transaction boundaries have no
+  /// record; every other kind has exactly one. Keeping one tagged payload
+  /// avoids allocating all possible record alternatives at every event.
+  std::optional<uint64_t> record;
 };
 
 /// A borrowed, transaction-relative version/use-def plan. Each transaction
@@ -493,7 +530,7 @@ struct TransactionStatePlan {
   llvm::SmallVector<GuardBoundary, 0> guards;
   llvm::SmallVector<AdmissionControl, 0> controls;
   llvm::SmallVector<SelectionBoundary, 0> selections;
-  llvm::SmallVector<TransactionCallBinding, 0> calls;
+  llvm::SmallVector<TransactionCallDelta, 0> calls;
   llvm::SmallVector<TransactionBodyCheck, 0> bodyChecks;
   llvm::SmallVector<TransactionObservation, 0> observations;
   llvm::SmallVector<TransactionBranch, 0> branches;
@@ -512,21 +549,27 @@ namespace detail {
 mlir::FailureOr<bool> memoryAddressesEqual(
     const TransactionStatePlan &plan, BoundValueId left, BoundValueId right,
     TransactionPoint point, const HardwareAnalysis &hardware,
-    llvm::function_ref<mlir::FailureOr<BoundValueId>(BoundValueId, TransactionPoint)> identity,
+    llvm::function_ref<mlir::FailureOr<BoundValueId>(BoundValueId,
+                                                     TransactionPoint)>
+        identity,
     llvm::function_ref<mlir::LogicalResult(uint64_t)> pay);
 mlir::FailureOr<bool> memoryReadCoveredBy(
-    const TransactionStatePlan &plan, MemoryAccessId earlier, MemoryAccessId later,
-    llvm::function_ref<mlir::FailureOr<bool>(BoundValueId, BoundValueId, TransactionPoint)> same,
+    const TransactionStatePlan &plan, MemoryAccessId earlier,
+    MemoryAccessId later,
+    llvm::function_ref<mlir::FailureOr<bool>(BoundValueId, BoundValueId,
+                                             TransactionPoint)>
+        same,
     llvm::function_ref<mlir::LogicalResult(uint64_t)> pay);
 } // namespace detail
 
-/// Read-only analysis of every actual transaction occurrence in a builtin ModuleOp
-/// package owning its closure. Native verification and Method summaries remain
-/// authoritative. Whole-Bits effects retain source paths, ordered admission
-/// controls and candidate joins. False and unknown obligations remain explicit.
-/// Missing executable bodies, partial state and unproved domains fail closed.
-/// Construction neither mutates IR nor executes hardware values. Publication is
-/// atomic: any failure makes every lookup null and print fail without output.
+/// Read-only analysis of every actual transaction occurrence in a builtin
+/// ModuleOp package owning its closure. Native verification and Method
+/// summaries remain authoritative. Whole-Bits effects retain source paths,
+/// ordered admission controls and candidate joins. False and unknown
+/// obligations remain explicit. Missing executable bodies, partial state and
+/// unproved domains fail closed. Construction neither mutates IR nor executes
+/// hardware values. Publication is atomic: any failure makes every lookup null
+/// and print fail without output.
 class SourceTransactionStateAnalysis {
 public:
   explicit SourceTransactionStateAnalysis(mlir::Operation *package);
@@ -535,16 +578,26 @@ public:
   /// lexical-only packages need no state/effect plan reconstruction. Lifted
   /// packages retain complete canonical plan construction. This query publishes
   /// no plans and returns its bounded verification work on success.
-  static mlir::FailureOr<uint64_t> verifyOccurrences(
-      mlir::Operation *package,
-      llvm::ArrayRef<const TransactionStatePlan *> expected);
+  static mlir::FailureOr<uint64_t>
+  verifyOccurrences(mlir::Operation *package,
+                    llvm::ArrayRef<const TransactionStatePlan *> expected);
 
   bool isValid() const { return valid; }
   uint64_t getAnalysisWork() const { return analysisWork; }
+  llvm::ArrayRef<TransactionDefinitionPlan> getDefinitionPlans() const {
+    return valid ? llvm::ArrayRef<TransactionDefinitionPlan>(definitionPlans)
+                 : llvm::ArrayRef<TransactionDefinitionPlan>();
+  }
+  const TransactionDefinitionPlan *
+  lookupDefinitionPlan(mlir::Operation *callable) const;
+  std::optional<TransactionDefinitionPlanId>
+  lookupDefinitionPlanId(mlir::Operation *operation) const;
   const TransactionStatePlan *lookup(SourceTransactionOp transaction) const;
   const TransactionStatePlan *lookup(SourceTransactionOp transaction,
-      ModuleOp routingModule, mlir::ArrayAttr registrationPath) const;
+                                     ModuleOp routingModule,
+                                     mlir::ArrayAttr registrationPath) const;
   llvm::ArrayRef<TransactionStatePlan> getPlans() const { return plans; }
+  void collectMetrics(acir::metrics::CompilerPhaseMetrics &metrics) const;
 
   /// Print stable source/frame/value identities without pointer addresses or
   /// renewed semantic proof. Dump admission independently preflights every plan
@@ -554,8 +607,18 @@ public:
   mlir::LogicalResult print(llvm::raw_ostream &output) const;
 
 private:
+  llvm::SmallVector<TransactionDefinitionPlan, 0> definitionPlans;
+  llvm::DenseMap<mlir::Operation *, TransactionDefinitionPlanId>
+      definitionPlanIndex;
+  /// Every operation inventoried by a definition plan maps directly to its
+  /// owner. This is a structural index, not a proof cache.
+  llvm::DenseMap<mlir::Operation *, TransactionDefinitionPlanId>
+      definitionOperationIndex;
   llvm::SmallVector<TransactionStatePlan, 0> plans;
   uint64_t analysisWork = 0;
+  uint64_t definitionSummaryBuilds = 0;
+  uint64_t definitionSummaryOperationVisits = 0;
+  uint64_t irWalks = 0, visitedNodes = 0;
   bool valid = false;
 };
 

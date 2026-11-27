@@ -711,8 +711,13 @@ detail::definitionSourceChecks(const HardwareAnalysis &analysis,
   if (definition->getNumRegions() != 1 || !definition.getBody().hasOneBlock())
     return definition.emitOpError()
            << "source checks require one definition graph block";
-  if (failed(verifyObserverUses(analysis, definition, bindings, budget)))
-    return failure();
+  {
+    detail::SourceCheckBudget::PhaseScope observerPhase(
+        budget, "native observer-use proof");
+    detail::SourceCheckBudget::LocalScope observerBudget(budget);
+    if (failed(verifyObserverUses(analysis, definition, bindings, budget)))
+      return failure();
+  }
   SmallVector<HardwareCheckBinding> result;
   // Keep registration ordering once per registration. IDs within a group
   // have already proved that registration and compare only the remaining
@@ -735,7 +740,8 @@ detail::definitionSourceChecks(const HardwareAnalysis &analysis,
     SmallVector<size_t, 0> direct;
   };
   std::map<DictionaryAttr, CheckGroup, RegistrationLess> registrations;
-  llvm::DenseMap<Operation *, detail::SampledAdmissionView> sampledRules;
+  llvm::DenseMap<Operation *, const detail::SampledAdmissionView *>
+      sampledRules;
   auto prepared = validation.prepare(definition, bindings);
   if (failed(prepared))
     return failure();
@@ -745,6 +751,9 @@ detail::definitionSourceChecks(const HardwareAnalysis &analysis,
       return failure();
   }
   for (auto rule : definition.getBody().front().getOps<RuleOp>()) {
+    detail::SourceCheckBudget::PhaseScope rulePhase(
+        budget, "native Rule source checks");
+    detail::SourceCheckBudget::LocalScope ruleBudget(budget);
     auto error = [&] { return rule.emitOpError(); };
     if (failed(mlir::verify(rule)) ||
         failed(detail::verifyOccurrence(rule.getOccurrence(), error)))
@@ -757,16 +766,17 @@ detail::definitionSourceChecks(const HardwareAnalysis &analysis,
       if (failed(sampled))
         return failure();
       if (!required || required.size() != detail::SourceCheckBudget::add(
-                                              sampled->controls.size(),
-                                              sampled->bodyChecks.size()))
+                                              (*sampled)->controls.size(),
+                                              (*sampled)->bodyChecks.size()))
         return error() << "sampled Rule requires exactly its ordered "
                           "guard/assert obligations";
       if (failed(budget.debit(
               detail::SourceCheckBudget::bytes(
-                  sizeof(std::pair<Operation *, detail::SampledAdmissionView>)),
+                  sizeof(std::pair<Operation *,
+                                   const detail::SampledAdmissionView *>)),
               rule)))
         return failure();
-      sampledRules.try_emplace(rule, std::move(*sampled));
+      sampledRules.try_emplace(rule, *sampled);
     }
     if (!required)
       continue;
@@ -778,7 +788,7 @@ detail::definitionSourceChecks(const HardwareAnalysis &analysis,
     // The authenticated inventory, rather than the total result count, owns
     // the check base in that case.
     if (auto sampled = sampledRules.find(rule); sampled != sampledRules.end())
-      first = sampled->second.checkBase;
+      first = sampled->second->checkBase;
     CheckGroup *group = nullptr;
     if (!required.empty()) {
       auto [position, inserted] =
@@ -804,6 +814,9 @@ detail::definitionSourceChecks(const HardwareAnalysis &analysis,
       }
     }
     for (auto [index, raw] : llvm::enumerate(required)) {
+      detail::SourceCheckBudget::PhaseScope rowPhase(
+          budget, "native RequiredCheck row");
+      detail::SourceCheckBudget::LocalScope rowBudget(budget);
       auto record = dyn_cast<DictionaryAttr>(raw);
       auto id = record ? record.getAs<DictionaryAttr>("id") : DictionaryAttr();
       auto kind = record ? record.getAs<StringAttr>("kind") : StringAttr();
@@ -827,19 +840,19 @@ detail::definitionSourceChecks(const HardwareAnalysis &analysis,
       if (kind.getValue() == "guard_known") {
         if (sampled == sampledRules.end())
           return error() << "guard_known requires sampled admission";
-        if (index >= sampled->second.controls.size())
+        if (index >= sampled->second->controls.size())
           return error() << "guard_known is outside sampled control inventory";
-        const auto &guard = sampled->second.controls[index];
+        const auto &guard = sampled->second->controls[index];
         if (id != guard.id || conditionResult != guard.rawResult ||
             pathResult != guard.reachedResult)
           return error() << "guard_known differs from sampled control suffix";
       } else if (sampled != sampledRules.end()) {
-        uint64_t controlCount = sampled->second.controls.size();
+        uint64_t controlCount = sampled->second->controls.size();
         if (kind.getValue() != "assert" || index < controlCount ||
-            index - controlCount >= sampled->second.bodyChecks.size())
+            index - controlCount >= sampled->second->bodyChecks.size())
           return error() << "sampled admission only permits ordered "
                             "guard_known/assert checks";
-        const auto &body = sampled->second.bodyChecks[index - controlCount];
+        const auto &body = sampled->second->bodyChecks[index - controlCount];
         if (id != body.id || conditionResult != body.conditionResult ||
             pathResult != body.pathResult)
           return error() << "assert differs from sampled body check suffix";
@@ -876,6 +889,9 @@ detail::definitionSourceChecks(const HardwareAnalysis &analysis,
     }
   }
   for (auto expect : definition.getBody().front().getOps<SourceExpectOp>()) {
+    detail::SourceCheckBudget::PhaseScope expectPhase(
+        budget, "native expect binding");
+    detail::SourceCheckBudget::LocalScope expectBudget(budget);
     if (failed(detail::verifySourceExpectOperation(analysis, expect, bindings)))
       return failure();
     auto id = expect->getAttrOfType<DictionaryAttr>("ac.check_id");
@@ -927,7 +943,7 @@ detail::definitionSourceChecks(const HardwareAnalysis &analysis,
       detail::HardwareIdentityStopPolicy stops{
           detail::HardwareIdentityTraversal::DefinitionLocal,
           (*prepared)->getBoundaries()};
-      const Value captures[] = {sampled->second.clock, sampled->second.reset};
+      const Value captures[] = {sampled->second->clock, sampled->second->reset};
       for (auto [actual, capture] : llvm::zip(expect.getSampling(), captures)) {
         auto lhs = detail::makeIdentityEndpoint(actual, (*prepared)->getScope(),
                                                 analysis, budget);
@@ -952,10 +968,17 @@ detail::definitionSourceChecks(const HardwareAnalysis &analysis,
     found.path = expect.getPath();
     found.message = expect->getAttrOfType<StringAttr>("ac.message");
   }
-  for (const auto &binding : result)
+  for (const auto &binding : result) {
+    detail::SourceCheckBudget::PhaseScope coveragePhase(
+        budget, "native RequiredCheck coverage");
+    detail::SourceCheckBudget::LocalScope coverageBudget(budget);
     if (!binding.expect)
       return definition.emitOpError() << "RequiredCheck has no matching expect";
+  }
   // Reuse the structural map order instead of sorting/recomparing the IDs.
+  detail::SourceCheckBudget::PhaseScope publicationPhase(
+      budget, "native source-check catalog publication");
+  detail::SourceCheckBudget::LocalScope publicationBudget(budget);
   SmallVector<HardwareCheckBinding> ordered;
   if (failed(budget.debit(detail::SourceCheckBudget::multiply(
                               result.size(), detail::SourceCheckBudget::bytes(
@@ -986,7 +1009,7 @@ detail::definitionSourceChecks(const HardwareAnalysis &analysis,
       }
       if (!emitted.insert(binding.rule).second)
         continue;
-      const auto &sampled = sampledRules.find(binding.rule)->second;
+      const auto &sampled = *sampledRules.find(binding.rule)->second;
       uint64_t count = detail::SourceCheckBudget::add(
           sampled.controls.size(), sampled.bodyChecks.size());
       if (index < binding.requiredIndex)
@@ -1166,6 +1189,13 @@ detail::NativeSourceCheckScope::verify(ModuleOp definition) {
       definition->getParentOp() != active->analysis.getPackage().getOperation())
     return std::nullopt;
   auto &scope = *active;
+  SourceCheckBudget::PhaseScope phase(scope.budget,
+                                      "native definition source checks");
+  // Each immutable definition publishes an independently replayable check
+  // catalog.  The shared validation object may retain its frozen facts, but
+  // parsing/proving one definition never needs another definition's work live
+  // in the same peak.
+  SourceCheckBudget::LocalScope definitionBudget(scope.budget);
   if (failed(scope.budget.debit(1, definition)))
     return failure();
   // No transform can run inside this synchronous MLIR verification scope.

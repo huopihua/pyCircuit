@@ -15,6 +15,9 @@
     if (failed(charge(budget, rule, writeDomains.size(), sizeof(SampledWriteDomainView))))
       return failure();
     for (auto [ordinal, raw] : llvm::enumerate(writeDomains)) {
+      SourceCheckBudget::PhaseScope rowPhase(
+          budget, "sampled write-domain parsing");
+      SourceCheckBudget::LocalScope rowBudget(budget);
       auto domain = dyn_cast<DictionaryAttr>(raw);
       if (failed(exact(domain, {"candidate", "selectors", "mask"}, rule,
                        "sampled write domain"))) return failure();

@@ -1,4 +1,5 @@
 #include "pycircuit/Dialect/ACIR/HWIRPackageValidation.h"
+#include "HardwareSourceCheckPreflight.h"
 #include "pycircuit/Dialect/ACIR/HardwareAnalysis.h"
 
 #include "mlir/IR/BuiltinOps.h"
@@ -8,10 +9,19 @@
 using namespace mlir;
 
 namespace acir::ac {
-LogicalResult verifyHardwarePackage(mlir::ModuleOp package) {
+LogicalResult verifyHardwarePackage(
+    mlir::ModuleOp package,
+    acir::metrics::CompilerPhaseMetrics *metrics) {
   if (!package)
     return failure();
-  return HardwareAnalysis(package).verify();
+  HardwareAnalysis analysis(package);
+  detail::SourceCheckBuildMetrics buildMetrics;
+  auto plan = detail::buildSourceCheckPlan(
+      analysis, {}, detail::PackageStagePolicy::hardware(),
+      metrics ? &buildMetrics : nullptr);
+  if (metrics)
+    detail::publishSourceCheckMetrics(buildMetrics, *metrics);
+  return success(succeeded(plan));
 }
 } // namespace acir::ac
 

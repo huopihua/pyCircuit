@@ -322,6 +322,7 @@ public:
     std::unique_ptr<Instance[]> instances;
     size_t instanceCount = 0;
     std::unique_ptr<SourceMethodView[]> methods;
+    std::unique_ptr<bool[]> verifiedMethods;
     size_t methodCount = 0;
     bool hasSummary = false;
   };
@@ -332,7 +333,16 @@ public:
                                            llvm::StringRef name,
                                            mlir::Operation *site,
                                            const SourceReceiverProofFees &fees);
-
+  /// Freeze the direct Instance/Method inventory of one module after its
+  /// complete enclosing package has passed MLIR verification in this same
+  /// analysis. This publishes definition structure only: receiver paths,
+  /// occurrence bindings and call verdicts remain fresh at every use.
+  /// Payment failure publishes neither the inventory nor Method entries.
+  mlir::LogicalResult publishVerifiedModule(
+      mlir::Operation *module, mlir::ModuleOp verifiedPackage,
+      mlir::Operation *site,
+      llvm::function_ref<mlir::LogicalResult(mlir::Operation *, uint64_t,
+                                             uint64_t)> workStorage);
 private:
   std::map<mlir::Operation *, Inventory> complete;
 };

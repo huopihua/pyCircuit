@@ -86,6 +86,7 @@ private:
   }
 
   LogicalResult index(Operation *source, Operation *target) {
+    SourceCheckBudget::LocalScope operationBudget(budget);
     if (!charge(budget, routed, 16 + 4 * source->getNumResults()) ||
         source->getNumResults() != target->getNumResults() ||
         source->getNumRegions() != target->getNumRegions())
@@ -142,6 +143,7 @@ private:
   }
 
   LogicalResult exact(Operation *source, Operation *target) {
+    SourceCheckBudget::LocalScope operationBudget(budget);
     if (!charge(budget, source, 8 + 2 * source->getNumOperands() +
                                   source->getAttrs().size()))
       return failure();
@@ -166,6 +168,7 @@ private:
   }
 
   LogicalResult stateProof(const StatePair &pair) {
+    SourceCheckBudget::LocalScope stateBudget(budget);
     auto state = pair.source;
     auto update = logicalUpdate(state, budget);
     if (failed(update)) return failure();

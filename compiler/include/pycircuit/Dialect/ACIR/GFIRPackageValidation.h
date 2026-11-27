@@ -2,6 +2,7 @@
 #define PYCIRCUIT_DIALECT_ACIR_GFIRPACKAGEVALIDATION_H
 
 #include "pycircuit/Dialect/ACIR/HardwareAnalysisContext.h"
+#include "pycircuit/Analysis/CompilerPhaseMetrics.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Support/LogicalResult.h"
 #include <memory>
@@ -14,7 +15,8 @@ namespace acir::ac {
 /// Verify the versioned routed graph without requiring physical state refinement
 /// or an implementation for a declared ordinary external combinational module.
 mlir::LogicalResult verifyRoutedPackage(mlir::ModuleOp package,
-                                        HardwareSourceCheckLimits limits = {});
+                                        HardwareSourceCheckLimits limits = {},
+                                        acir::metrics::CompilerPhaseMetrics *metrics = nullptr);
 } // namespace acir::ac
 
 namespace acir {

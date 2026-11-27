@@ -10,91 +10,146 @@
 using namespace mlir;
 namespace acir::ac {
 namespace {
-FailureOr<Operation *> resolveReferenceReceiver(
-    Operation *module, DictionaryAttr receiver, SourceModuleLookup lookup,
-    Operation *site, uint64_t &work, bool formalsVerified) {
+FailureOr<Operation *> resolveReferenceReceiver(Operation *module,
+                                                DictionaryAttr receiver,
+                                                SourceModuleLookup lookup,
+                                                Operation *site, uint64_t &work,
+                                                bool formalsVerified) {
   auto charge = [&]() { return ++work <= 1024 * 1024; };
-  auto path = receiver ? receiver.getAs<ArrayAttr>("instance_path") : ArrayAttr();
-  auto reference = receiver ? receiver.getAs<StringAttr>("reference") : StringAttr();
-  if (!receiver || !path || receiver.size() != (reference ? 2u : 1u) || path.size() > 128)
+  auto path =
+      receiver ? receiver.getAs<ArrayAttr>("instance_path") : ArrayAttr();
+  auto reference =
+      receiver ? receiver.getAs<StringAttr>("reference") : StringAttr();
+  if (!receiver || !path || receiver.size() != (reference ? 2u : 1u) ||
+      path.size() > 128)
     return site->emitOpError() << "invalid Module reference receiver";
   if ((!reference && path.size() != 1) || (reference && !path.empty()))
-    return site->emitOpError() << "Module reference binding requires a direct child or a declared reference interface; descendant access is private";
+    return site->emitOpError()
+           << "Module reference binding requires a direct child or a declared "
+              "reference interface; descendant access is private";
   Operation *target = module;
   if (reference) {
-    if (!formalsVerified && failed(verifySourceReferenceParameters(module))) return failure();
+    if (!formalsVerified && failed(verifySourceReferenceParameters(module)))
+      return failure();
     FlatSymbolRefAttr callee;
     if (auto refs = module->getAttrOfType<ArrayAttr>("ac.reference_parameters"))
       for (Attribute raw : refs) {
-        if (!charge()) return site->emitOpError() << "Module reference receiver work budget exceeded";
+        if (!charge())
+          return site->emitOpError()
+                 << "Module reference receiver work budget exceeded";
         auto row = cast<DictionaryAttr>(raw);
-        if (row.getAs<StringAttr>("name") == reference) callee = row.getAs<FlatSymbolRefAttr>("callee");
+        if (row.getAs<StringAttr>("name") == reference)
+          callee = row.getAs<FlatSymbolRefAttr>("callee");
       }
-    if (!callee || !(target = lookup(callee)) || !isa<ModuleOp, ModuleImportOp>(target))
-      return site->emitOpError() << "Module reference must name a declared formal and available Module provider";
+    if (!callee || !(target = lookup(callee)) ||
+        !isa<ModuleOp, ModuleImportOp>(target))
+      return site->emitOpError() << "Module reference must name a declared "
+                                    "formal and available Module provider";
   } else if (path.empty())
-    return site->emitOpError() << "Module reference actual must identify an existing allocation";
+    return site->emitOpError()
+           << "Module reference actual must identify an existing allocation";
   for (Attribute endpoint : path) {
     FlatSymbolRefAttr callee;
-    auto consider = [&](DictionaryAttr occurrence, FlatSymbolRefAttr candidate) -> LogicalResult {
-      if (!charge()) return site->emitOpError() << "Module reference receiver work budget exceeded";
-      if (endpoint != occurrence) return success();
-      if (callee) return site->emitOpError() << "ambiguous Module reference allocation";
-      callee = candidate; return success();
+    auto consider = [&](DictionaryAttr occurrence,
+                        FlatSymbolRefAttr candidate) -> LogicalResult {
+      if (!charge())
+        return site->emitOpError()
+               << "Module reference receiver work budget exceeded";
+      if (endpoint != occurrence)
+        return success();
+      if (callee)
+        return site->emitOpError() << "ambiguous Module reference allocation";
+      callee = candidate;
+      return success();
     };
     if (auto body = dyn_cast<ModuleOp>(target)) {
-      if (!body.getBody().hasOneBlock()) return site->emitOpError() << "Module reference provider requires one body block";
+      if (!body.getBody().hasOneBlock())
+        return site->emitOpError()
+               << "Module reference provider requires one body block";
       for (auto instance : body.getBody().front().getOps<InstanceOp>())
-        if (failed(consider(instance.getOccurrence(), instance.getCalleeAttr()))) return failure();
-    } else if (auto summary = target->getAttrOfType<DictionaryAttr>("transaction_summary")) {
+        if (failed(
+                consider(instance.getOccurrence(), instance.getCalleeAttr())))
+          return failure();
+    } else if (auto summary = target->getAttrOfType<DictionaryAttr>(
+                   "transaction_summary")) {
       auto owners = summary.getAs<ArrayAttr>("owners");
-      if (!owners) return site->emitOpError() << "Module reference provider requires instance owners";
+      if (!owners)
+        return site->emitOpError()
+               << "Module reference provider requires instance owners";
       for (Attribute raw : owners) {
         auto row = dyn_cast<DictionaryAttr>(raw);
         auto kind = row ? row.getAs<StringAttr>("kind") : StringAttr();
-        if (!kind) return site->emitOpError() << "Module reference provider has an invalid owner row";
+        if (!kind)
+          return site->emitOpError()
+                 << "Module reference provider has an invalid owner row";
         if (kind.getValue() == "instance" &&
-            failed(consider(row.getAs<DictionaryAttr>("occurrence"), row.getAs<FlatSymbolRefAttr>("callee")))) return failure();
+            failed(consider(row.getAs<DictionaryAttr>("occurrence"),
+                            row.getAs<FlatSymbolRefAttr>("callee"))))
+          return failure();
       }
     }
     auto occurrence = dyn_cast<DictionaryAttr>(endpoint);
-    if (!occurrence || failed(detail::verifyOccurrence(occurrence, [&] { return site->emitOpError(); })) ||
-        failed(detail::verifyOriginDefinition(occurrence, FlatSymbolRefAttr::get(SymbolTable::getSymbolName(target)),
-                                             "Module reference allocation", [&] { return site->emitOpError(); })) ||
-        !callee || !(target = lookup(callee)) || !isa<ModuleOp, ModuleImportOp>(target))
-      return site->emitOpError() << "Module reference path must identify an existing allocation and provider";
+    if (!occurrence ||
+        failed(detail::verifyOccurrence(occurrence,
+                                        [&] { return site->emitOpError(); })) ||
+        failed(detail::verifyOriginDefinition(
+            occurrence,
+            FlatSymbolRefAttr::get(SymbolTable::getSymbolName(target)),
+            "Module reference allocation",
+            [&] { return site->emitOpError(); })) ||
+        !callee || !(target = lookup(callee)) ||
+        !isa<ModuleOp, ModuleImportOp>(target))
+      return site->emitOpError() << "Module reference path must identify an "
+                                    "existing allocation and provider";
   }
   return target;
 }
 } // namespace
-FailureOr<Operation *> resolveSourceReferenceReceiver(
-    Operation *module, DictionaryAttr receiver, SourceModuleLookup lookup, Operation *site) {
+FailureOr<Operation *> resolveSourceReferenceReceiver(Operation *module,
+                                                      DictionaryAttr receiver,
+                                                      SourceModuleLookup lookup,
+                                                      Operation *site) {
   uint64_t work = 0;
   return resolveReferenceReceiver(module, receiver, lookup, site, work, false);
 }
-LogicalResult verifySourceReferenceBindings(Operation *module, Operation *callee,
-    Attribute raw, SourceModuleLookup lookup, Operation *site) {
-  if (!callee) return site->emitOpError() << "Module reference binding requires an available callee provider";
-  if (failed(verifySourceReferenceParameters(callee))) return failure();
+LogicalResult verifySourceReferenceBindings(Operation *module,
+                                            Operation *callee, Attribute raw,
+                                            SourceModuleLookup lookup,
+                                            Operation *site) {
+  if (!callee)
+    return site->emitOpError()
+           << "Module reference binding requires an available callee provider";
+  if (failed(verifySourceReferenceParameters(callee)))
+    return failure();
   auto refs = callee->getAttrOfType<ArrayAttr>("ac.reference_parameters");
   auto bindings = dyn_cast_or_null<ArrayAttr>(raw);
   if (!refs) {
-    if (raw) return site->emitOpError() << "unexpected Module reference bindings";
+    if (raw)
+      return site->emitOpError() << "unexpected Module reference bindings";
     return success();
   }
   if (!bindings || bindings.size() != refs.size())
-    return site->emitOpError() << "Module reference bindings must bind every declared formal exactly once";
-  if (failed(verifySourceReferenceParameters(module))) return failure();
+    return site->emitOpError() << "Module reference bindings must bind every "
+                                  "declared formal exactly once";
+  if (failed(verifySourceReferenceParameters(module)))
+    return failure();
   uint64_t work = 0;
   for (auto [formal, actual] : llvm::zip(refs, bindings)) {
     auto ref = cast<DictionaryAttr>(formal);
     auto row = dyn_cast<DictionaryAttr>(actual);
-    if (!row || row.size() != 2 || row.getAs<StringAttr>("name") != ref.getAs<StringAttr>("name"))
-      return site->emitOpError() << "Module reference bindings must follow unique formal declaration order";
-    auto target = resolveReferenceReceiver(module, row.getAs<DictionaryAttr>("receiver"), lookup, site, work, true);
-    if (failed(target)) return failure();
-    if (SymbolTable::getSymbolName(*target).getValue() != ref.getAs<FlatSymbolRefAttr>("callee").getValue())
-      return site->emitOpError() << "Module reference binding has the wrong nominal Module provider";
+    if (!row || row.size() != 2 ||
+        row.getAs<StringAttr>("name") != ref.getAs<StringAttr>("name"))
+      return site->emitOpError() << "Module reference bindings must follow "
+                                    "unique formal declaration order";
+    auto target =
+        resolveReferenceReceiver(module, row.getAs<DictionaryAttr>("receiver"),
+                                 lookup, site, work, true);
+    if (failed(target))
+      return failure();
+    if (SymbolTable::getSymbolName(*target).getValue() !=
+        ref.getAs<FlatSymbolRefAttr>("callee").getValue())
+      return site->emitOpError() << "Module reference binding has the wrong "
+                                    "nominal Module provider";
   }
   return success();
 }
@@ -121,6 +176,129 @@ LogicalResult receiverHeader(Operation *module, Operation *site) {
     return failure();
   return imported.verify();
 }
+
+enum class ReceiverInventoryProof { Fresh, PackageVerified };
+
+LogicalResult buildReceiverInventory(
+    Operation *module, Operation *site, ReceiverInventoryProof proof,
+    llvm::function_ref<LogicalResult(Operation *, uint64_t, uint64_t)>
+        workStorage,
+    SourceReceiverProofContext::Inventory &inventory,
+    uint64_t publicationWork = 0, uint64_t publicationBytes = 0) {
+  bool validate = proof == ReceiverInventoryProof::Fresh;
+  auto body = dyn_cast<ModuleOp>(module);
+  DictionaryAttr summary;
+  if (body) {
+    for (Operation &op : body.getBody().front()) {
+      if (validate && failed(workStorage(site, 1, 0)))
+        return failure();
+      inventory.instanceCount += isa<InstanceOp>(op);
+      inventory.methodCount += isa<SourceMethodOp>(op);
+    }
+  } else {
+    summary = module->getAttrOfType<DictionaryAttr>("transaction_summary");
+    if (summary) {
+      if (validate && failed(verifySourceTransactionSummary(module, summary)))
+        return failure();
+      inventory.hasSummary = true;
+      for (Attribute raw : summary.getAs<ArrayAttr>("owners")) {
+        if (validate && failed(workStorage(site, 1, 0)))
+          return failure();
+        inventory.instanceCount +=
+            cast<DictionaryAttr>(raw).getAs<StringAttr>("kind").getValue() ==
+            "instance";
+      }
+      inventory.methodCount = summary.getAs<ArrayAttr>("methods").size();
+    }
+  }
+
+  uint64_t bytes =
+      inventory.instanceCount * sizeof(SourceReceiverProofContext::Instance) +
+      inventory.methodCount * (sizeof(SourceMethodView) + sizeof(bool));
+  if (failed(workStorage(site,
+                         inventory.instanceCount + inventory.methodCount +
+                             publicationWork,
+                         bytes + publicationBytes)))
+    return failure();
+  if (inventory.instanceCount)
+    inventory.instances =
+        std::make_unique<SourceReceiverProofContext::Instance[]>(
+            inventory.instanceCount);
+  if (inventory.methodCount)
+    inventory.methods =
+        std::make_unique<SourceMethodView[]>(inventory.methodCount);
+  if (inventory.methodCount)
+    inventory.verifiedMethods = std::make_unique<bool[]>(inventory.methodCount);
+
+  size_t instanceIndex = 0, methodIndex = 0;
+  auto appendInstance = [&](StringAttr name, DictionaryAttr occurrence,
+                            Operation *allocation,
+                            DictionaryAttr row) -> LogicalResult {
+    if (validate) {
+      if (!name || !occurrence ||
+          failed(detail::verifyOccurrence(
+              occurrence, [&] { return site->emitOpError(); })) ||
+          failed(detail::verifyOriginDefinition(
+              occurrence,
+              FlatSymbolRefAttr::get(SymbolTable::getSymbolName(module)),
+              "Method receiver instance", [&] { return site->emitOpError(); })))
+        return failure();
+      for (size_t i = 0; i < instanceIndex; ++i) {
+        if (failed(workStorage(site, 3, 0)))
+          return failure();
+        if (inventory.instances[i].name == name ||
+            inventory.instances[i].occurrence == occurrence)
+          return site->emitOpError()
+                 << "Method receiver instances require distinct names and "
+                    "occurrence identities";
+      }
+    }
+    inventory.instances[instanceIndex++] = {name, occurrence, allocation, row};
+    return success();
+  };
+  if (body) {
+    for (Operation &op : body.getBody().front()) {
+      if (validate && failed(workStorage(site, 1, 0)))
+        return failure();
+      if (auto allocation = dyn_cast<InstanceOp>(op)) {
+        if ((validate && (failed(allocation.verifyInvariantsImpl()) ||
+                          failed(allocation.verify()))) ||
+            failed(appendInstance(allocation.getInstanceNameAttr(),
+                                  allocation.getOccurrence(), allocation, {})))
+          return failure();
+      } else if (auto method = dyn_cast<SourceMethodOp>(op)) {
+        if (validate) {
+          if (method->getNumRegions() != 2)
+            return method.emitOpError()
+                   << "method requires guard and body regions";
+          for (Region &region : method->getRegions())
+            if (!region.hasOneBlock() || region.front().empty())
+              return method.emitOpError()
+                     << "method guard and body require one nonempty block";
+          if (failed(method.verifyInvariantsImpl()))
+            return failure();
+        }
+        inventory.methods[methodIndex] = {module, method, {}};
+        inventory.verifiedMethods[methodIndex++] = !validate;
+      }
+    }
+  } else if (summary) {
+    for (Attribute raw : summary.getAs<ArrayAttr>("owners")) {
+      auto row = cast<DictionaryAttr>(raw);
+      if (row.getAs<StringAttr>("kind").getValue() == "instance" &&
+          failed(appendInstance(row.getAs<StringAttr>("name"),
+                                row.getAs<DictionaryAttr>("occurrence"),
+                                nullptr, row)))
+        return failure();
+    }
+    for (Attribute raw : summary.getAs<ArrayAttr>("methods")) {
+      inventory.methods[methodIndex] = {
+          module, {}, cast<DictionaryAttr>(raw)};
+      inventory.verifiedMethods[methodIndex++] = !validate;
+    }
+  }
+  return success();
+}
 } // namespace
 FailureOr<const SourceReceiverProofContext::Inventory *>
 SourceReceiverProofContext::prepare(Operation *module, Operation *site,
@@ -139,101 +317,9 @@ SourceReceiverProofContext::prepare(Operation *module, Operation *site,
       failed(receiverHeader(module, site)))
     return failure();
   Inventory inventory;
-  auto body = dyn_cast<ModuleOp>(module);
-  DictionaryAttr summary;
-  if (body) {
-    for (Operation &op : body.getBody().front()) {
-      if (failed(fees.workStorage(site, 1, 0)))
-        return failure();
-      inventory.instanceCount += isa<InstanceOp>(op);
-      inventory.methodCount += isa<SourceMethodOp>(op);
-    }
-  } else {
-    summary = module->getAttrOfType<DictionaryAttr>("transaction_summary");
-    if (summary) {
-      if (failed(verifySourceTransactionSummary(module, summary)))
-        return failure();
-      inventory.hasSummary = true;
-      for (Attribute raw : summary.getAs<ArrayAttr>("owners")) {
-        if (failed(fees.workStorage(site, 1, 0)))
-          return failure();
-        inventory.instanceCount +=
-            cast<DictionaryAttr>(raw).getAs<StringAttr>("kind").getValue() ==
-            "instance";
-      }
-      inventory.methodCount = summary.getAs<ArrayAttr>("methods").size();
-    }
-  }
-  uint64_t bytes = inventory.instanceCount * sizeof(Instance) +
-                   inventory.methodCount * sizeof(SourceMethodView);
-  if (failed(fees.workStorage(
-          site, inventory.instanceCount + inventory.methodCount, bytes)))
+  if (failed(buildReceiverInventory(module, site, ReceiverInventoryProof::Fresh,
+                                    fees.workStorage, inventory)))
     return failure();
-  if (inventory.instanceCount)
-    inventory.instances = std::make_unique<Instance[]>(inventory.instanceCount);
-  if (inventory.methodCount)
-    inventory.methods =
-        std::make_unique<SourceMethodView[]>(inventory.methodCount);
-  size_t instanceIndex = 0, methodIndex = 0;
-  auto instance = [&](StringAttr name, DictionaryAttr occurrence,
-                      Operation *allocation,
-                      DictionaryAttr row) -> LogicalResult {
-    if (!name || !occurrence ||
-        failed(detail::verifyOccurrence(occurrence,
-                                        [&] { return site->emitOpError(); })) ||
-        failed(detail::verifyOriginDefinition(
-            occurrence,
-            FlatSymbolRefAttr::get(SymbolTable::getSymbolName(module)),
-            "Method receiver instance", [&] { return site->emitOpError(); })))
-      return failure();
-    for (size_t i = 0; i < instanceIndex; ++i) {
-      if (failed(fees.workStorage(site, 3, 0)))
-        return failure();
-      if (inventory.instances[i].name == name ||
-          inventory.instances[i].occurrence == occurrence)
-        return site->emitOpError()
-               << "Method receiver instances require distinct names and "
-                  "occurrence identities";
-    }
-    inventory.instances[instanceIndex++] = {name, occurrence, allocation, row};
-    return success();
-  };
-  if (body) {
-    for (Operation &op : body.getBody().front()) {
-      if (failed(fees.workStorage(site, 1, 0)))
-        return failure();
-      if (auto allocation = dyn_cast<InstanceOp>(op)) {
-        if (failed(allocation.verifyInvariantsImpl()) ||
-            failed(allocation.verify()) ||
-            failed(instance(allocation.getInstanceNameAttr(),
-                            allocation.getOccurrence(), allocation, {})))
-          return failure();
-      } else if (auto method = dyn_cast<SourceMethodOp>(op)) {
-        if (method->getNumRegions() != 2)
-          return method.emitOpError()
-                 << "method requires guard and body regions";
-        for (Region &region : method->getRegions())
-          if (!region.hasOneBlock() || region.front().empty())
-            return method.emitOpError()
-                   << "method guard and body require one nonempty block";
-        if (failed(method.verifyInvariantsImpl()))
-          return failure();
-        inventory.methods[methodIndex++] = {module, method, {}};
-      }
-    }
-  } else if (summary) {
-    for (Attribute raw : summary.getAs<ArrayAttr>("owners")) {
-      auto row = cast<DictionaryAttr>(raw);
-      if (row.getAs<StringAttr>("kind").getValue() == "instance" &&
-          failed(instance(row.getAs<StringAttr>("name"),
-                          row.getAs<DictionaryAttr>("occurrence"), nullptr,
-                          row)))
-        return failure();
-    }
-    for (Attribute raw : summary.getAs<ArrayAttr>("methods"))
-      inventory.methods[methodIndex++] = {
-          module, {}, cast<DictionaryAttr>(raw)};
-  }
   // A failed proof or payment publishes neither an entry nor any IR changes.
   if (failed(fees.workStorage(site, lookupWork + 1,
                               sizeof(decltype(complete)::value_type) +
@@ -265,16 +351,45 @@ SourceReceiverProofContext::method(Operation *module, StringRef name,
       continue;
     if (selected.definition || selected.row)
       return site->emitOpError() << "callee receiver method is ambiguous";
-    if (candidate.definition &&
-        (failed(fees.selectedMethod(candidate.definition, site)) ||
-         failed(candidate.definition.verify())))
-      return failure();
+    if (candidate.definition && !(**inventory).verifiedMethods[i]) {
+      // The Method body is immutable definition structure. Publish its proof
+      // only after complete validation; receiver paths and actual bindings
+      // remain fresh for every call occurrence.
+      if (failed(fees.selectedMethod(candidate.definition, site)) ||
+          failed(candidate.definition.verify()))
+        return failure();
+      (**inventory).verifiedMethods[i] = true;
+    }
     selected = candidate;
   }
   if (!selected.definition && !selected.row)
     return site->emitOpError()
            << "callee must resolve to a direct receiver method";
   return selected;
+}
+
+LogicalResult SourceReceiverProofContext::publishVerifiedModule(
+    Operation *module, mlir::ModuleOp verifiedPackage, Operation *site,
+    llvm::function_ref<LogicalResult(Operation *, uint64_t, uint64_t)>
+        workStorage) {
+  if (!module || !verifiedPackage || module->getParentOp() != verifiedPackage ||
+      !isa<ModuleOp, ModuleImportOp>(module))
+    return site->emitOpError()
+           << "verified receiver inventory publication requires package-owned "
+              "Module structure";
+  if (complete.contains(module))
+    return success();
+
+  // The package verifier already traversed and authenticated each declaration.
+  // Pay only the frozen inventory traversal and retained storage here.
+  Inventory inventory;
+  if (failed(buildReceiverInventory(
+          module, site, ReceiverInventoryProof::PackageVerified, workStorage,
+          inventory, 1,
+          sizeof(decltype(complete)::value_type) + 4 * sizeof(void *))))
+    return failure();
+  complete.emplace(module, std::move(inventory));
+  return success();
 }
 
 Type SourceQueueView::getPayloadType() const {
@@ -315,13 +430,16 @@ static FailureOr<DictionaryAttr> getSourceNativeOwnerRow(InstanceOp queue) {
     return failure();
   auto owner = dyn_cast_or_null<ModuleOp>(queue->getParentOp());
   if (!owner)
-    return queue.emitOpError() << "queue owner requires direct module placement";
+    return queue.emitOpError()
+           << "queue owner requires direct module placement";
   // Source publication and effects require a unique actual allocation identity.
   for (Operation &other : owner.getBody().front())
     if (&other != queue.getOperation() &&
         isa<SourceStateOp, InstanceOp, CollectionOp>(other) &&
-        other.getAttrOfType<DictionaryAttr>("occurrence") == queue.getOccurrence())
-      return queue.emitOpError() << "source queue allocations require distinct occurrence identities";
+        other.getAttrOfType<DictionaryAttr>("occurrence") ==
+            queue.getOccurrence())
+      return queue.emitOpError() << "source queue allocations require distinct "
+                                    "occurrence identities";
   Builder builder(queue->getContext());
   HardwareAnalysis hardware(queue->getParentOfType<mlir::ModuleOp>());
   HardwareBindings bindings;
@@ -329,42 +447,49 @@ static FailureOr<DictionaryAttr> getSourceNativeOwnerRow(InstanceOp queue) {
   auto endpoint = [&](Value value) -> FailureOr<DictionaryAttr> {
     if (auto argument = dyn_cast<BlockArgument>(value)) {
       if (argument.getOwner()->getParentOp() == owner)
-        return builder.getDictionaryAttr({
-            builder.getNamedAttr("kind", builder.getStringAttr("input")),
-            builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(argument.getArgNumber()))});
+        return builder.getDictionaryAttr(
+            {builder.getNamedAttr("kind", builder.getStringAttr("input")),
+             builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(
+                                                 argument.getArgNumber()))});
     }
     if (auto constant = value.getDefiningOp<BitsConstantOp>()) {
-      auto literal = hardware.evaluateStatic(constant.getValue(), bindings, queue);
-      auto number = succeeded(literal) ? dyn_cast<MathIntAttr>(*literal) : MathIntAttr();
+      auto literal =
+          hardware.evaluateStatic(constant.getValue(), bindings, queue);
+      auto number =
+          succeeded(literal) ? dyn_cast<MathIntAttr>(*literal) : MathIntAttr();
       if (number) {
         llvm::APSInt integer(number.getCanonicalValue());
         if (integer.isZero() || integer == 1)
-          return builder.getDictionaryAttr({
-              builder.getNamedAttr("kind", builder.getStringAttr("constant")),
-              builder.getNamedAttr("value", builder.getBoolAttr(!integer.isZero()))});
+          return builder.getDictionaryAttr(
+              {builder.getNamedAttr("kind", builder.getStringAttr("constant")),
+               builder.getNamedAttr("value",
+                                    builder.getBoolAttr(!integer.isZero()))});
       }
     }
-    return queue.emitOpError() << "queue domain requires a direct one-bit module input or literal";
+    return queue.emitOpError()
+           << "queue domain requires a direct one-bit module input or literal";
   };
   auto clock = endpoint(queue->getOperand(0)),
        reset = endpoint(queue->getOperand(1));
   if (failed(clock) || failed(reset))
     return failure();
-  NamedAttrList fields({
-      builder.getNamedAttr("kind", builder.getStringAttr("instance")),
-      builder.getNamedAttr("name", queue.getInstanceNameAttr()),
-      builder.getNamedAttr("occurrence", queue.getOccurrence()),
-      builder.getNamedAttr("callee", queue.getCalleeAttr()),
-      builder.getNamedAttr("parameters", queue.getParameters()),
-      builder.getNamedAttr("type_arguments", queue.getTypeArguments()),
-      builder.getNamedAttr("input_types", builder.getArrayAttr(llvm::to_vector(
-          llvm::map_range(queue.getOperandTypes(), [](Type type) {
-            return Attribute(TypeAttr::get(type));
-          })))),
-      builder.getNamedAttr("result_types", builder.getArrayAttr(llvm::to_vector(
-          llvm::map_range(queue.getResultTypes(), [](Type type) {
-            return Attribute(TypeAttr::get(type));
-          }))))});
+  NamedAttrList fields(
+      {builder.getNamedAttr("kind", builder.getStringAttr("instance")),
+       builder.getNamedAttr("name", queue.getInstanceNameAttr()),
+       builder.getNamedAttr("occurrence", queue.getOccurrence()),
+       builder.getNamedAttr("callee", queue.getCalleeAttr()),
+       builder.getNamedAttr("parameters", queue.getParameters()),
+       builder.getNamedAttr("type_arguments", queue.getTypeArguments()),
+       builder.getNamedAttr(
+           "input_types",
+           builder.getArrayAttr(llvm::to_vector(llvm::map_range(
+               queue.getOperandTypes(),
+               [](Type type) { return Attribute(TypeAttr::get(type)); })))),
+       builder.getNamedAttr(
+           "result_types", builder.getArrayAttr(llvm::to_vector(llvm::map_range(
+                               queue.getResultTypes(), [](Type type) {
+                                 return Attribute(TypeAttr::get(type));
+                               }))))});
   if (Attribute constraint = queue->getAttr("ac.payload_constraint"))
     fields.append("payload_constraint", constraint);
   if (queue->hasAttr("ac.source_unbound_push"))
@@ -377,38 +502,47 @@ static FailureOr<DictionaryAttr> getSourceNativeOwnerRow(InstanceOp queue) {
 }
 FailureOr<DictionaryAttr> getSourceQueueOwnerRow(InstanceOp queue) {
   if (!isQueueInstance(queue))
-    return queue.emitOpError() << "source queue owner requires a canonical FIFO instance";
+    return queue.emitOpError()
+           << "source queue owner requires a canonical FIFO instance";
   return getSourceNativeOwnerRow(queue);
 }
 FailureOr<DictionaryAttr> getSourceMemoryOwnerRow(InstanceOp memory) {
   if (!isMemoryInstance(memory) ||
       !isa_and_nonnull<UnitAttr>(memory->getAttr("ac.source_memory")))
-    return memory.emitOpError() << "native Memory calls require a source-owned canonical allocation";
+    return memory.emitOpError()
+           << "native Memory calls require a source-owned canonical allocation";
   auto layout = getMemoryPrimitiveLayout(memory);
-  if (failed(layout)) return failure();
+  if (failed(layout))
+    return failure();
   HardwareAnalysis hardware(memory->getParentOfType<mlir::ModuleOp>());
   HardwareBindings bindings;
   bindings.owner = memory->getParentOp();
   auto zero = [&](Value value) -> LogicalResult {
     auto constant = value.getDefiningOp<BitsConstantOp>();
     if (!constant)
-      return memory.emitOpError() << "source Memory idle operands must be known zero literals";
-    auto evaluated = hardware.evaluateStatic(constant.getValue(), bindings, memory);
-    auto integer = succeeded(evaluated) ? dyn_cast<MathIntAttr>(*evaluated) : MathIntAttr();
+      return memory.emitOpError()
+             << "source Memory idle operands must be known zero literals";
+    auto evaluated =
+        hardware.evaluateStatic(constant.getValue(), bindings, memory);
+    auto integer = succeeded(evaluated) ? dyn_cast<MathIntAttr>(*evaluated)
+                                        : MathIntAttr();
     if (!integer || integer.getCanonicalValue() != "0")
-      return memory.emitOpError() << "source Memory cannot mix raw pin bindings with Method calls";
+      return memory.emitOpError()
+             << "source Memory cannot mix raw pin bindings with Method calls";
     return success();
   };
   for (unsigned ordinal : layout->readEnableOperands)
-    if (failed(zero(memory.getOperand(ordinal)))) return failure();
-  if (failed(zero(memory.getOperand(layout->writeEnableOperand)))) return failure();
+    if (failed(zero(memory.getOperand(ordinal))))
+      return failure();
+  if (failed(zero(memory.getOperand(layout->writeEnableOperand))))
+    return failure();
   if (!layout->isSynchronous() &&
       failed(zero(memory.getOperand(layout->readAddressOperands.front()))))
     return failure();
   return getSourceNativeOwnerRow(memory);
 }
 FailureOr<SourceQueueView> lookupSourceQueue(Operation *module, StringRef name,
-                                            Operation *site) {
+                                             Operation *site) {
   if (failed(receiverHeader(module, site)))
     return failure();
   SourceQueueView result{module, {}, {}};
@@ -429,7 +563,8 @@ FailureOr<SourceQueueView> lookupSourceQueue(Operation *module, StringRef name,
   } else {
     auto summary = module->getAttrOfType<DictionaryAttr>("transaction_summary");
     if (!summary || failed(verifySourceTransactionSummary(module, summary)))
-      return site->emitOpError() << "imported queue requires a verified transaction summary";
+      return site->emitOpError()
+             << "imported queue requires a verified transaction summary";
     for (Attribute raw : summary.getAs<ArrayAttr>("owners")) {
       auto row = cast<DictionaryAttr>(raw);
       if (row.getAs<StringAttr>("kind").getValue() == "instance" &&
@@ -445,13 +580,14 @@ FailureOr<SourceQueueView> lookupSourceQueue(Operation *module, StringRef name,
     }
   }
   if (!result.row)
-    return site->emitOpError() << "queue effect must identify an actual lexical allocation";
+    return site->emitOpError()
+           << "queue effect must identify an actual lexical allocation";
   return result;
 }
-LogicalResult
-verifySourceMethodFormalProposals(const SourceMethodView &method,
-                                  Operation *site) {
-  if (method.isNativeTerminal()) return success();
+LogicalResult verifySourceMethodFormalProposals(const SourceMethodView &method,
+                                                Operation *site) {
+  if (method.isNativeTerminal())
+    return success();
   Attribute raw = method.definition
                       ? method.definition->getAttr("ac.formal_proposals")
                       : method.row.get("ac.formal_proposals");
@@ -485,9 +621,8 @@ verifySourceMethodFormalProposals(const SourceMethodView &method,
     unsigned dataIndex = publicCount + 2 * ordinal;
     unsigned intentIndex = dataIndex + 1;
     auto parameter = dyn_cast<DictionaryAttr>(parameters[previous]);
-    auto input = parameter
-                     ? parameter.getAs<DictionaryAttr>("constraint")
-                     : DictionaryAttr();
+    auto input = parameter ? parameter.getAs<DictionaryAttr>("constraint")
+                           : DictionaryAttr();
     auto data = dyn_cast<DictionaryAttr>(results[dataIndex]);
     auto intent = dyn_cast<DictionaryAttr>(results[intentIndex]);
     if (!input || !data || !intent ||
@@ -548,7 +683,8 @@ LogicalResult verifySourceFormalOwnerBindings(
              << "owner binding must identify a callee writable formal";
     if (auto state = row.getAs<StringAttr>("state")) {
       if (!stateTargets.insert(state.getValue()).second)
-        return site->emitOpError() << "writable owner bindings overlap the same caller state";
+        return site->emitOpError()
+               << "writable owner bindings overlap the same caller state";
       if (failed(detail::verifyPythonAstIdentifier(
               state.getValue(), true, [&] { return site->emitOpError(); })) ||
           !hasCallerState(state.getValue()))
@@ -556,13 +692,15 @@ LogicalResult verifySourceFormalOwnerBindings(
                << "formal owner binding requires a caller lexical state";
     } else if (auto formal = row.getAs<IntegerAttr>("caller_formal")) {
       if (!formal.getType().isSignlessInteger(64) || formal.getInt() < 0 ||
-          !callerSignature || static_cast<uint64_t>(formal.getInt()) >=
-                                  callerSignature.getNumInputs() ||
+          !callerSignature ||
+          static_cast<uint64_t>(formal.getInt()) >=
+              callerSignature.getNumInputs() ||
           !callerProposals || !llvm::is_contained(callerProposals, formal))
         return site->emitOpError()
                << "forwarded owner binding requires a caller writable formal";
       if (!formalTargets.insert(formal.getInt()).second)
-        return site->emitOpError() << "writable owner bindings overlap the same caller formal";
+        return site->emitOpError()
+               << "writable owner bindings overlap the same caller formal";
     } else
       return site->emitOpError()
              << "formal owner binding requires state or caller_formal";
@@ -636,46 +774,55 @@ LogicalResult admitDependency(Operation *caller, Operation *target,
   return success();
 }
 // Relative declarations cannot rely on a provider's default parameter values.
-// Walk the complete payload/constraint contract under the existing finite limits.
+// Walk the complete payload/constraint contract under the existing finite
+// limits.
 LogicalResult concreteRelativeMethod(const SourceMethodView &method,
                                      Operation *site,
                                      const SourceReceiverProofFees *fees) {
   if (!method.module || method.isNativeTerminal() ||
       method.module->hasAttr("primitive_kind") ||
       method.module->hasAttr("ac.root_kind"))
-    return site->emitOpError() << "relative Method target requires an ordinary Module provider";
+    return site->emitOpError()
+           << "relative Method target requires an ordinary Module provider";
   HardwareAnalysis hardware(method.module->getParentOfType<mlir::ModuleOp>());
   HardwareBindings bindings;
   bindings.owner = method.module;
   uint64_t work = 0;
   auto enter = [&](unsigned depth) -> LogicalResult {
     if (depth > 128 || ++work > 1024 * 1024)
-      return site->emitOpError() << "relative Method contract work/depth budget exceeded";
+      return site->emitOpError()
+             << "relative Method contract work/depth budget exceeded";
     return fees ? fees->workStorage(site, 1, sizeof(Attribute) + sizeof(Type))
                 : success();
   };
   std::function<LogicalResult(Attribute, unsigned)> attribute;
   std::function<LogicalResult(Type, unsigned)> type;
   type = [&](Type value, unsigned depth) -> LogicalResult {
-    if (failed(enter(depth))) return failure();
+    if (failed(enter(depth)))
+      return failure();
     if (isa<TypeParamType>(value))
-      return site->emitOpError() << "relative Method signature requires a concrete type without provider defaults";
+      return site->emitOpError() << "relative Method signature requires a "
+                                    "concrete type without provider defaults";
     if (auto bits = dyn_cast<BitsType>(value)) {
-      if (failed(attribute(bits.getWidth(), depth + 1))) return failure();
+      if (failed(attribute(bits.getWidth(), depth + 1)))
+        return failure();
     } else if (auto table = dyn_cast<TableType>(value)) {
       if (failed(attribute(table.getShape(), depth + 1)) ||
-          failed(type(table.getElementType(), depth + 1))) return failure();
+          failed(type(table.getElementType(), depth + 1)))
+        return failure();
     } else if (auto record = dyn_cast<StructType>(value)) {
       auto declaration = hardware.lookupStruct(record);
       if (!declaration || failed(attribute(declaration.getFields(), depth + 1)))
         return failure();
     } else if (!isa<EnumType>(value))
-      return site->emitOpError() << "relative Method requires an admitted finite payload type";
+      return site->emitOpError()
+             << "relative Method requires an admitted finite payload type";
     auto width = hardware.getPackedWidth(value, bindings, site);
     return success(succeeded(width) && *width != 0);
   };
   attribute = [&](Attribute value, unsigned depth) -> LogicalResult {
-    if (failed(enter(depth))) return failure();
+    if (failed(enter(depth)))
+      return failure();
     if (auto expression = dyn_cast_or_null<StaticExprAttr>(value))
       return attribute(expression.getTree(), depth + 1);
     if (auto payload = dyn_cast_or_null<TypeAttr>(value))
@@ -685,33 +832,39 @@ LogicalResult concreteRelativeMethod(const SourceMethodView &method,
     if (auto row = dyn_cast_or_null<DictionaryAttr>(value)) {
       auto kind = row.getAs<StringAttr>("kind");
       if (kind && kind.getValue() == "reference")
-        return site->emitOpError() << "relative Method signature must be concrete without contextual Module parameters or provider defaults";
+        return site->emitOpError()
+               << "relative Method signature must be concrete without "
+                  "contextual Module parameters or provider defaults";
       for (NamedAttribute field : row)
-        if (failed(attribute(field.getValue(), depth + 1))) return failure();
+        if (failed(attribute(field.getValue(), depth + 1)))
+          return failure();
     } else if (auto values = dyn_cast_or_null<ArrayAttr>(value))
       for (Attribute child : values)
-        if (failed(attribute(child, depth + 1))) return failure();
+        if (failed(attribute(child, depth + 1)))
+          return failure();
     return success();
   };
   auto signature = method.getFunctionType();
   for (Type value : signature.getInputs())
-    if (failed(type(value, 0))) return failure();
+    if (failed(type(value, 0)))
+      return failure();
   for (Type value : signature.getResults())
-    if (failed(type(value, 0))) return failure();
+    if (failed(type(value, 0)))
+      return failure();
   if (failed(attribute(method.getParameters(), 0)) ||
       failed(attribute(method.getResultConstraints(), 0)) ||
-      failed(attribute(method.getFormalProposals(), 0))) return failure();
+      failed(attribute(method.getFormalProposals(), 0)))
+    return failure();
   return success();
 }
-FailureOr<ResolvedSourceMethod> resolve(Operation *caller, SymbolRefAttr symbol,
-                                        ArrayAttr path, bool names,
-                                        const HardwareBindings &parent,
-                                        SourceModuleLookup lookup,
-                                        Operation *site,
-                                        SourceReceiverProofContext *context = nullptr,
-                                        const SourceReceiverProofFees *fees = nullptr,
-                                        StringAttr reference = {}) {
-  if (context && !fees) return failure();
+FailureOr<ResolvedSourceMethod>
+resolve(Operation *caller, SymbolRefAttr symbol, ArrayAttr path, bool names,
+        const HardwareBindings &parent, SourceModuleLookup lookup,
+        Operation *site, SourceReceiverProofContext *context = nullptr,
+        const SourceReceiverProofFees *fees = nullptr,
+        StringAttr reference = {}) {
+  if (context && !fees)
+    return failure();
   auto header = [&](Operation *module) -> LogicalResult {
     return context ? success(succeeded(context->prepare(module, site, *fees)))
                    : receiverHeader(module, site);
@@ -720,7 +873,9 @@ FailureOr<ResolvedSourceMethod> resolve(Operation *caller, SymbolRefAttr symbol,
     return site->emitOpError()
            << "Method call requires a qualified callee and receiver path";
   if (path.size() > 1 || (reference && !path.empty()))
-    return site->emitOpError() << "Method receiver requires lexical self, a direct child or a declared reference interface";
+    return site->emitOpError()
+           << "Method receiver requires lexical self, a direct child or a "
+              "declared reference interface";
   if (failed(header(caller)))
     return failure();
   auto package = caller->getParentOfType<mlir::ModuleOp>();
@@ -734,12 +889,16 @@ FailureOr<ResolvedSourceMethod> resolve(Operation *caller, SymbolRefAttr symbol,
     bindings.owner = caller;
   if (reference) {
     Builder builder(site->getContext());
-    auto symbolic = builder.getDictionaryAttr({builder.getNamedAttr("reference", reference),
-        builder.getNamedAttr("instance_path", builder.getArrayAttr({}))});
+    auto symbolic = builder.getDictionaryAttr(
+        {builder.getNamedAttr("reference", reference),
+         builder.getNamedAttr("instance_path", builder.getArrayAttr({}))});
     auto start = resolveSourceReferenceReceiver(caller, symbolic, lookup, site);
-    if (failed(start) || failed(header(*start)) || failed(admitDependency(caller, *start, site))) return failure();
+    if (failed(start) || failed(header(*start)) ||
+        failed(admitDependency(caller, *start, site)))
+      return failure();
     owner = *start;
-    bindings = HardwareBindings(); bindings.owner = owner;
+    bindings = HardwareBindings();
+    bindings.owner = owner;
   }
   SmallVector<Attribute> occurrences;
   InstanceOp terminalInstance;
@@ -780,15 +939,19 @@ FailureOr<ResolvedSourceMethod> resolve(Operation *caller, SymbolRefAttr symbol,
     };
     if (context) {
       auto inventory = context->prepare(owner, site, *fees);
-      if (failed(inventory)) return failure();
+      if (failed(inventory))
+        return failure();
       if (isa<ModuleImportOp>(owner) && !(**inventory).hasSummary)
-        return site->emitOpError() << "Method receiver suffix requires published instance owners";
+        return site->emitOpError()
+               << "Method receiver suffix requires published instance owners";
       for (size_t i = 0; i < (**inventory).instanceCount; ++i) {
         if (++work > 1024 * 1024)
           return site->emitOpError() << "Method receiver work budget exceeded";
-        if (failed(fees->workStorage(site, 1, 0))) return failure();
+        if (failed(fees->workStorage(site, 1, 0)))
+          return failure();
         const auto &candidate = (**inventory).instances[i];
-        if (endpoint != (names ? Attribute(candidate.name) : Attribute(candidate.occurrence)))
+        if (endpoint != (names ? Attribute(candidate.name)
+                               : Attribute(candidate.occurrence)))
           continue;
         allocation = candidate.allocation;
         selected = candidate.row;
@@ -849,14 +1012,16 @@ FailureOr<ResolvedSourceMethod> resolve(Operation *caller, SymbolRefAttr symbol,
       if (!target || !isa<ModuleImportOp>(bindingTarget))
         return site->emitOpError()
                << "Method receiver provider snapshot is invalid";
-      for (StringRef field : {"source_owner", "function_type", "parameters",
-                              "type_parameters", "primitive_kind", "ac.reference_parameters"})
+      for (StringRef field :
+           {"source_owner", "function_type", "parameters", "type_parameters",
+            "primitive_kind", "ac.reference_parameters"})
         if (bindingTarget->getAttr(field) != target->getAttr(field))
           return site->emitOpError()
                  << "Method receiver provider snapshot differs from authority: "
                  << field;
     }
-    if (context && failed(fees->instanceBinding(owner, allocation, bindingTarget, site)))
+    if (context &&
+        failed(fees->instanceBinding(owner, allocation, bindingTarget, site)))
       return failure();
     auto bound = hardware.bindCallee(bindingTarget, actualParameters,
                                      actualTypes, bindings, site);
@@ -915,37 +1080,57 @@ FailureOr<ResolvedSourceMethod> resolve(Operation *caller, SymbolRefAttr symbol,
         terminalOwnerRow.getAs<FlatSymbolRefAttr>("callee").getValue() ==
             "pycircuit.__builtins__.fifo_downstream_pop"));
   StringRef memoryKind = hardware.getPrimitiveKind(owner);
-  bool nativeMemory = memoryKind == "sync_mem" || memoryKind == "sync_mem_dp" || memoryKind == "byte_mem";
+  bool nativeMemory = memoryKind == "sync_mem" || memoryKind == "sync_mem_dp" ||
+                      memoryKind == "byte_mem";
   if (nativeMemory) {
-    bool owned = terminalInstance
-        ? isa_and_nonnull<UnitAttr>(terminalInstance->getAttr("ac.source_memory"))
-        : terminalOwnerRow && terminalOwnerRow.getAs<BoolAttr>("source_memory") &&
-          terminalOwnerRow.getAs<BoolAttr>("source_memory").getValue();
-    if (!owned) return site->emitOpError() << "native Memory calls require source-owned pins";
+    bool owned =
+        terminalInstance
+            ? isa_and_nonnull<UnitAttr>(
+                  terminalInstance->getAttr("ac.source_memory"))
+            : terminalOwnerRow &&
+                  terminalOwnerRow.getAs<BoolAttr>("source_memory") &&
+                  terminalOwnerRow.getAs<BoolAttr>("source_memory").getValue();
+    if (!owned)
+      return site->emitOpError()
+             << "native Memory calls require source-owned pins";
     NativeMemoryAction action = NativeMemoryAction::None;
     unsigned port = 0;
-    if (methodName == "write") action = NativeMemoryAction::Write;
-    else if (memoryKind == "byte_mem" && methodName == "read") action = NativeMemoryAction::Read;
+    if (methodName == "write")
+      action = NativeMemoryAction::Write;
+    else if (memoryKind == "byte_mem" && methodName == "read")
+      action = NativeMemoryAction::Read;
     else if (memoryKind != "byte_mem") {
-      if (methodName == "request0" || methodName == "request1") action = NativeMemoryAction::Request;
-      if (methodName == "result0" || methodName == "result1") action = NativeMemoryAction::Result;
+      if (methodName == "request0" || methodName == "request1")
+        action = NativeMemoryAction::Request;
+      if (methodName == "result0" || methodName == "result1")
+        action = NativeMemoryAction::Result;
       port = methodName.ends_with("1") ? 1 : 0;
     }
-    if (action == NativeMemoryAction::None || (port && memoryKind != "sync_mem_dp"))
-      return site->emitOpError() << "native Memory action or static port is invalid";
+    if (action == NativeMemoryAction::None ||
+        (port && memoryKind != "sync_mem_dp"))
+      return site->emitOpError()
+             << "native Memory action or static port is invalid";
     DictionaryAttr ownerRow = terminalOwnerRow;
     if (terminalInstance) {
       auto checked = getSourceMemoryOwnerRow(terminalInstance);
-      if (failed(checked)) return failure();
+      if (failed(checked))
+        return failure();
       ownerRow = *checked;
     }
-    Type payload = terminalInstance ? terminalInstance.getResult(0).getType()
-        : cast<TypeAttr>(ownerRow.getAs<ArrayAttr>("result_types")[0]).getValue();
-    Attribute constraint = terminalInstance ? terminalInstance->getAttr("ac.payload_constraint")
-                                           : ownerRow.get("payload_constraint");
+    Type payload =
+        terminalInstance
+            ? terminalInstance.getResult(0).getType()
+            : cast<TypeAttr>(ownerRow.getAs<ArrayAttr>("result_types")[0])
+                  .getValue();
+    Attribute constraint =
+        terminalInstance ? terminalInstance->getAttr("ac.payload_constraint")
+                         : ownerRow.get("payload_constraint");
     if (!constraint || failed(detail::verifySourceCallHardwareConstraint(
-            constraint, payload, hardware, caller, site, "native Memory payload")))
-      return site->emitOpError() << "native Memory requires its checked logical payload constraint";
+                           constraint, payload, hardware, caller, site,
+                           "native Memory payload",
+                           detail::SourceCallWidthMode::SymbolicFixedBits)))
+      return site->emitOpError()
+             << "native Memory requires its checked logical payload constraint";
     method.module = owner;
     method.nativeMemoryAction = action;
     method.nativeMemoryPort = port;
@@ -954,27 +1139,22 @@ FailureOr<ResolvedSourceMethod> resolve(Operation *caller, SymbolRefAttr symbol,
     method.nativeMemoryPayloadType = payload;
     method.nativeMemoryPayloadConstraint = constraint;
   } else if (nativeQueue) {
-    NativeQueueAction action = methodName == "push"
-                                   ? NativeQueueAction::Push
-                                   : methodName == "pop"
-                                         ? NativeQueueAction::Pop
-                                         : methodName == "peek"
-                                               ? NativeQueueAction::Peek
-                                               : NativeQueueAction::None;
+    NativeQueueAction action = methodName == "push"   ? NativeQueueAction::Push
+                               : methodName == "pop"  ? NativeQueueAction::Pop
+                               : methodName == "peek" ? NativeQueueAction::Peek
+                                                      : NativeQueueAction::None;
     if (action == NativeQueueAction::None)
       return site->emitOpError() << "unknown native Queue action";
-    bool pushUnbound = terminalInstance
-                           ? terminalInstance->hasAttr(
-                                 "ac.source_unbound_push")
-                           : (terminalOwnerRow.getAs<BoolAttr>("unbound_push") &&
-                              terminalOwnerRow.getAs<BoolAttr>("unbound_push")
-                                  .getValue());
-    bool popUnbound = terminalInstance
-                          ? terminalInstance->hasAttr(
-                                "ac.source_unbound_pop")
-                          : (terminalOwnerRow.getAs<BoolAttr>("unbound_pop") &&
-                             terminalOwnerRow.getAs<BoolAttr>("unbound_pop")
-                                 .getValue());
+    bool pushUnbound =
+        terminalInstance
+            ? terminalInstance->hasAttr("ac.source_unbound_push")
+            : (terminalOwnerRow.getAs<BoolAttr>("unbound_push") &&
+               terminalOwnerRow.getAs<BoolAttr>("unbound_push").getValue());
+    bool popUnbound =
+        terminalInstance
+            ? terminalInstance->hasAttr("ac.source_unbound_pop")
+            : (terminalOwnerRow.getAs<BoolAttr>("unbound_pop") &&
+               terminalOwnerRow.getAs<BoolAttr>("unbound_pop").getValue());
     if (action == NativeQueueAction::Push && !pushUnbound)
       return site->emitOpError()
              << "Queue push conflicts with an externally bound raw input";
@@ -983,24 +1163,25 @@ FailureOr<ResolvedSourceMethod> resolve(Operation *caller, SymbolRefAttr symbol,
              << "Queue pop conflicts with an externally bound raw output";
     Type payload = terminalInstance
                        ? terminalInstance.getResult(2).getType()
-                       : cast<TypeAttr>(terminalOwnerRow
-                                            .getAs<ArrayAttr>("result_types")[2])
+                       : cast<TypeAttr>(terminalOwnerRow.getAs<ArrayAttr>(
+                                            "result_types")[2])
                              .getValue();
-    Attribute constraint = terminalInstance
-                               ? terminalInstance->getAttr(
-                                     "ac.payload_constraint")
-                               : terminalOwnerRow.get("payload_constraint");
-    if (!constraint ||
-        failed(detail::verifySourceCallHardwareConstraint(
-            constraint, payload, hardware, caller, site,
-            "native Queue payload")))
-      return site->emitOpError()
-             << "native Queue method requires its checked logical payload constraint";
-    method = SourceMethodView{owner, {}, {}, action, terminalInstance,
-                              terminalOwnerRow, payload, constraint};
+    Attribute constraint =
+        terminalInstance ? terminalInstance->getAttr("ac.payload_constraint")
+                         : terminalOwnerRow.get("payload_constraint");
+    if (!constraint || failed(detail::verifySourceCallHardwareConstraint(
+                           constraint, payload, hardware, caller, site,
+                           "native Queue payload",
+                           detail::SourceCallWidthMode::SymbolicFixedBits)))
+      return site->emitOpError() << "native Queue method requires its checked "
+                                    "logical payload constraint";
+    method = SourceMethodView{
+        owner,   {},        {}, action, terminalInstance, terminalOwnerRow,
+        payload, constraint};
   } else {
-    auto resolvedMethod = context ? context->method(owner, methodName, site, *fees)
-                                  : lookupSourceMethod(owner, methodName, site);
+    auto resolvedMethod = context
+                              ? context->method(owner, methodName, site, *fees)
+                              : lookupSourceMethod(owner, methodName, site);
     if (failed(resolvedMethod))
       return failure();
     method = *resolvedMethod;
@@ -1014,21 +1195,30 @@ FailureOr<ResolvedSourceMethod> resolve(Operation *caller, SymbolRefAttr symbol,
   // A source-global template registration has a distinct Call occurrence and
   // remains callable from an enclosing transaction.
   if (auto body = dyn_cast<ModuleOp>(owner)) {
-    for (auto transaction : body.getBody().front().getOps<SourceTransactionOp>()) {
+    for (auto transaction :
+         body.getBody().front().getOps<SourceTransactionOp>()) {
       if (++work > 1024 * 1024)
-        return site->emitOpError() << "autonomous Rule registration work budget exceeded";
-      if (context && failed(fees->workStorage(site, 1, 0))) return failure();
+        return site->emitOpError()
+               << "autonomous Rule registration work budget exceeded";
+      if (context && failed(fees->workStorage(site, 1, 0)))
+        return failure();
       if (transaction.getOccurrence() != transaction.getDeclaration() ||
-          transaction.getDeclaration() != method.getDeclaration()) continue;
-      if (context && failed(fees->workStorage(site,
-            8 + transaction.getCaptures().size() +
-                method.getFunctionType().getNumInputs() +
-                method.getFunctionType().getNumResults(), 0))) return failure();
+          transaction.getDeclaration() != method.getDeclaration())
+        continue;
+      if (context &&
+          failed(fees->workStorage(site,
+                                   8 + transaction.getCaptures().size() +
+                                       method.getFunctionType().getNumInputs() +
+                                       method.getFunctionType().getNumResults(),
+                                   0)))
+        return failure();
       auto entry = getSourceRegistrationEntry(transaction);
-      if (failed(entry)) return failure();
+      if (failed(entry))
+        return failure();
       if (!*entry || (**entry).method != method.definition ||
           (**entry).call.getOperation() != site)
-        return site->emitOpError() << "autonomous Rule body is private to its declaration registration";
+        return site->emitOpError() << "autonomous Rule body is private to its "
+                                      "declaration registration";
     }
   }
   auto receiver = DictionaryAttr::get(
@@ -1036,7 +1226,8 @@ FailureOr<ResolvedSourceMethod> resolve(Operation *caller, SymbolRefAttr symbol,
       {NamedAttribute(StringAttr::get(site->getContext(), "instance_path"),
                       ArrayAttr::get(site->getContext(), occurrences))});
   if (reference) {
-    NamedAttrList symbolic(receiver); symbolic.append("reference", reference);
+    NamedAttrList symbolic(receiver);
+    symbolic.append("reference", reference);
     receiver = symbolic.getDictionary(site->getContext());
   }
   return ResolvedSourceMethod{method, bindings, receiver};
@@ -1046,26 +1237,38 @@ FailureOr<ResolvedSourceMethod> resolveSourceRelativeMethodContract(
     Operation *caller, SymbolRefAttr callee, DictionaryAttr receiver,
     SourceModuleLookup lookup, Operation *site,
     SourceReceiverProofContext *context, const SourceReceiverProofFees *fees) {
-  if (failed(verifySourceRelativeReceiver(receiver, site, fees))) return failure();
+  if (failed(verifySourceRelativeReceiver(receiver, site, fees)))
+    return failure();
   if (!caller || !callee || callee.getNestedReferences().size() != 1 ||
       (context && !fees))
-    return site->emitOpError() << "relative Method requires a qualified Module::Method declaration";
+    return site->emitOpError()
+           << "relative Method requires a qualified Module::Method declaration";
   auto target = lookup(FlatSymbolRefAttr::get(callee.getRootReference()));
   if (context) {
-    if (failed(context->prepare(target, site, *fees))) return failure();
-  } else if (failed(receiverHeader(target, site))) return failure();
-  if (failed(admitDependency(caller, target, site))) return failure();
+    if (failed(context->prepare(target, site, *fees)))
+      return failure();
+  } else if (failed(receiverHeader(target, site)))
+    return failure();
+  if (failed(admitDependency(caller, target, site)))
+    return failure();
   if (target->hasAttr("primitive_kind") || target->hasAttr("ac.root_kind"))
-    return site->emitOpError() << "relative Method target requires an ordinary Module provider";
-  auto method = context
-      ? context->method(target, callee.getNestedReferences().front().getValue(), site, *fees)
-      : lookupSourceMethod(target, callee.getNestedReferences().front().getValue(), site);
-  if (failed(method)) return failure();
+    return site->emitOpError()
+           << "relative Method target requires an ordinary Module provider";
+  auto method =
+      context
+          ? context->method(target,
+                            callee.getNestedReferences().front().getValue(),
+                            site, *fees)
+          : lookupSourceMethod(
+                target, callee.getNestedReferences().front().getValue(), site);
+  if (failed(method))
+    return failure();
   auto visibility = method->getVisibility();
   if (visibility && visibility.getValue() == "private")
     return site->emitOpError() << "relative target requires a public Method";
   if (failed(concreteRelativeMethod(*method, site, fees)) ||
-      failed(verifySourceMethodFormalProposals(*method, site))) return failure();
+      failed(verifySourceMethodFormalProposals(*method, site)))
+    return failure();
   HardwareBindings bindings;
   bindings.owner = target;
   return ResolvedSourceMethod{*method, bindings, receiver};
@@ -1075,8 +1278,10 @@ LogicalResult verifySourceRelativeMethodBinding(
     const HardwareBindings &actualBindings, Operation *site,
     const SourceReceiverProofFees *fees) {
   if (failed(verifySourceRelativeReceiver(expected.receiver, site, fees)) ||
-      failed(concreteRelativeMethod(actual, site, fees))) return failure();
-  if (fees && failed(fees->workStorage(site, 16, 0))) return failure();
+      failed(concreteRelativeMethod(actual, site, fees)))
+    return failure();
+  if (fees && failed(fees->workStorage(site, 16, 0)))
+    return failure();
   const auto &declaration = expected.method;
   if (actual.getSymbol() != declaration.getSymbol() ||
       actual.getParameters() != declaration.getParameters() ||
@@ -1088,24 +1293,32 @@ LogicalResult verifySourceRelativeMethodBinding(
       actual.getDeclaration() != declaration.getDeclaration() ||
       actual.getGuardLocation() != declaration.getGuardLocation() ||
       actual.getNumPublicResults() != declaration.getNumPublicResults())
-    return site->emitOpError() << "actual relative Method contract differs from the compiled declaration";
+    return site->emitOpError() << "actual relative Method contract differs "
+                                  "from the compiled declaration";
   auto a = actual.getFunctionType(), e = declaration.getFunctionType();
-  if (a.getNumInputs() != e.getNumInputs() || a.getNumResults() != e.getNumResults())
-    return site->emitOpError() << "actual relative Method signature arity differs";
+  if (a.getNumInputs() != e.getNumInputs() ||
+      a.getNumResults() != e.getNumResults())
+    return site->emitOpError()
+           << "actual relative Method signature arity differs";
   HardwareAnalysis hardware(site->getParentOfType<mlir::ModuleOp>());
-  auto compare = [&](TypeRange actualTypes, TypeRange expectedTypes) -> LogicalResult {
+  auto compare = [&](TypeRange actualTypes,
+                     TypeRange expectedTypes) -> LogicalResult {
     for (auto [at, et] : llvm::zip(actualTypes, expectedTypes)) {
-      if (fees && failed(fees->workStorage(site, 2, 0))) return failure();
+      if (fees && failed(fees->workStorage(site, 2, 0)))
+        return failure();
       auto bound = hardware.resolveType(at, actualBindings, site);
       auto compiled = hardware.resolveType(et, expected.bindings, site);
-      if (failed(bound) || failed(compiled)) return failure();
+      if (failed(bound) || failed(compiled))
+        return failure();
       if (!areEquivalentHardwareTypes(*bound, *compiled))
-        return site->emitOpError() << "actual relative Method bound payload contract differs";
+        return site->emitOpError()
+               << "actual relative Method bound payload contract differs";
     }
     return success();
   };
   if (failed(compare(a.getInputs(), e.getInputs())) ||
-      failed(compare(a.getResults(), e.getResults()))) return failure();
+      failed(compare(a.getResults(), e.getResults())))
+    return failure();
   return success();
 }
 FailureOr<ResolvedSourceMethod>
@@ -1121,8 +1334,7 @@ resolveSourceMethodCall(SourceMethodCallOp call) {
   return resolveSourceMethodCall(call, parent, lookup);
 }
 FailureOr<ResolvedSourceMethod>
-resolveSourceMethodCall(SourceMethodCallOp call,
-                        const HardwareBindings &parent,
+resolveSourceMethodCall(SourceMethodCallOp call, const HardwareBindings &parent,
                         SourceModuleLookup lookup,
                         SourceReceiverProofContext *context,
                         const SourceReceiverProofFees *fees) {
@@ -1132,15 +1344,19 @@ resolveSourceMethodCall(SourceMethodCallOp call,
            << "Method call parent bindings must belong to its lexical module";
   if (call->hasAttr("receiver_kind") || call->hasAttr("ancestor_depth")) {
     if (call->hasAttr("ac.reference"))
-      return call.emitOpError() << "relative and formal receivers cannot be mixed";
+      return call.emitOpError()
+             << "relative and formal receivers cannot be mixed";
     NamedAttrList selector;
     for (StringRef name : {"receiver_kind", "ancestor_depth", "instance_path"})
-      if (auto value = call->getAttr(name)) selector.append(name, value);
-    return resolveSourceRelativeMethodContract(caller, call.getCalleeAttr(),
-        selector.getDictionary(call.getContext()), lookup, call, context, fees);
+      if (auto value = call->getAttr(name))
+        selector.append(name, value);
+    return resolveSourceRelativeMethodContract(
+        caller, call.getCalleeAttr(), selector.getDictionary(call.getContext()),
+        lookup, call, context, fees);
   }
   return resolve(caller, call.getCalleeAttr(), call.getInstancePath(), true,
-                 parent, lookup, call, context, fees, call->getAttrOfType<StringAttr>("ac.reference"));
+                 parent, lookup, call, context, fees,
+                 call->getAttrOfType<StringAttr>("ac.reference"));
 }
 FailureOr<ResolvedSourceMethod>
 resolveSourceMethodCall(Operation *caller, DictionaryAttr row,
@@ -1150,23 +1366,25 @@ resolveSourceMethodCall(Operation *caller, DictionaryAttr row,
   if (!row)
     return site->emitOpError() << "Method call requires a summary call row";
   auto receiver = row.getAs<DictionaryAttr>("receiver");
-  bool relative = receiver && (receiver.get("receiver_kind") || receiver.get("ancestor_depth"));
-  auto resolved = relative
-      ? resolveSourceRelativeMethodContract(caller, row.getAs<SymbolRefAttr>("callee"),
-                                            receiver, lookup, site, nullptr, fees)
-      : resolve(caller, row.getAs<SymbolRefAttr>("callee"),
-                          receiver ? receiver.getAs<ArrayAttr>("instance_path")
-                                   : ArrayAttr(),
-                          false, parent, lookup, site, nullptr, nullptr,
-                          receiver ? receiver.getAs<StringAttr>("reference") : StringAttr());
+  bool relative = receiver && (receiver.get("receiver_kind") ||
+                               receiver.get("ancestor_depth"));
+  auto resolved =
+      relative ? resolveSourceRelativeMethodContract(
+                     caller, row.getAs<SymbolRefAttr>("callee"), receiver,
+                     lookup, site, nullptr, fees)
+               : resolve(caller, row.getAs<SymbolRefAttr>("callee"),
+                         receiver ? receiver.getAs<ArrayAttr>("instance_path")
+                                  : ArrayAttr(),
+                         false, parent, lookup, site, nullptr, nullptr,
+                         receiver ? receiver.getAs<StringAttr>("reference")
+                                  : StringAttr());
   if (failed(resolved))
     return failure();
   if (auto rows = row.getAs<ArrayAttr>("ac.formal_owner_bindings")) {
     auto proposals = resolved->method.getFormalProposals();
     for (Attribute raw : rows) {
       auto binding = cast<DictionaryAttr>(raw);
-      if (!proposals ||
-          !llvm::is_contained(proposals, binding.get("formal")))
+      if (!proposals || !llvm::is_contained(proposals, binding.get("formal")))
         return site->emitOpError()
                << "owner binding must identify a callee writable formal";
     }

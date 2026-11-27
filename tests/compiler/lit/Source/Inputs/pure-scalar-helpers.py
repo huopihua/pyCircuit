@@ -357,6 +357,7 @@ for control in controls:
     registration_counts = {}
     for field, operation, artifact in (
         ("expected_source_transactions", "ac.transaction", payload(unit, "body")),
+        ("expected_source_binary_adds", "ac.bits.binary", payload(unit, "body")),
         ("expected_final_rules", "ac.rule", final),
     ):
         if field in control:

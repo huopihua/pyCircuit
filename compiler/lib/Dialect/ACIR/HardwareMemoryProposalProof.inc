@@ -1,16 +1,19 @@
-  // Each argument has an actual required-use witness. Async addresses stop at
-  // the reached prefix immediately after those witnesses, before loaded data
-  // can affect admission. Requests and writes retain the complete final fire.
+  // Each argument has an actual required-use witness. An async read depends on
+  // exactly its own address witnesses and source path; unrelated earlier
+  // admission cannot feed its combinational address. Requests and writes
+  // retain the complete final fire.
   llvm::DenseSet<uint64_t> memoryWitnesses;
   for (const auto &proposal : view.memoryProposals) {
+    SourceCheckBudget::PhaseScope proposalPhase(
+        budget, "sampled memory proposal proof");
+    SourceCheckBudget::LocalScope proposalBudget(budget);
     auto actual = proof.normalize(proposal.path), raw = proof.normalize(proposal.rawPath);
     if (failed(actual) || failed(raw)) return failure();
     auto combine = actual->value.getDefiningOp<BitsBinaryOp>();
     if (!combine || combine.getOpcode() != "and")
       return view.rule->emitOpError() << "Memory proposal requires admission AND raw path";
     auto selected = proof.normalize(combine.getRhs());
-    auto prefix = proof.parse(combine.getLhs());
-    if (failed(selected) || failed(prefix) || !sameEndpoint(*selected, *raw))
+    if (failed(selected) || !sameEndpoint(*selected, *raw))
       return view.rule->emitOpError() << "Memory proposal raw path differs from its actual enable";
     auto rawFactors = factors(proposal.rawPath);
     if (failed(rawFactors)) return failure();
@@ -49,56 +52,64 @@
         lastControl = requirement.control;
       }
       if (!matches) continue;
-      Prefix expected, full;
-      bool read = proposal.kind.getValue() == "read", anyControlFalse = false;
+      bool read = proposal.kind.getValue() == "read";
+      uint64_t begin = read ? start.control : 0;
       uint64_t count = read ? lastControl + 1 : view.controls.size();
-      SmallVector<uint8_t, 0> omittable;
       if (read) {
-        if (failed(charge(budget, view.rule, count, sizeof(uint8_t)))) return failure();
-        omittable.resize(count, false);
-      }
-      for (uint64_t index = 0; index < count; ++index) {
-        if (read) {
-          // Keep the common selector's knownness check. Only controls inside
-          // an independently opposite source arm can leave the address-demand
-          // prefix; their original reached diagnostic paths stay untouched.
-          auto ancestry = view.controls[index].executionPath;
-          while (ancestry.selectionControl) {
-            uint64_t branch = *ancestry.selectionControl;
-            if (failed(budget.debit(1, view.rule))) return failure();
-            if (!omittable[branch]) {
-              auto selector = normalizedControl(branch);
-              if (failed(selector)) return failure();
-              for (const auto &factor : rawFactors->atoms) {
-                if (failed(budget.debit(1, view.rule))) return failure();
-                if (sameEndpoint(factor.value, *selector) && factor.positive != ancestry.whenTrue)
-                  omittable[index] = true;
-              }
-            }
-            ancestry = view.controls[branch].executionPath;
+        Value cursor = combine.getLhs();
+        bool exact = true;
+        for (uint64_t index = count; index > begin; --index) {
+          auto joined = cursor.getDefiningOp<BitsBinaryOp>();
+          if (!joined || joined.getOpcode() != "and") {
+            exact = false;
+            break;
           }
-          anyControlFalse |= acceptances[index].impossible;
-          if (!acceptances[index].impossible) {
-            auto all = proof.conjunction(full, acceptances[index], view.rule);
-            if (failed(all)) return failure();
-            full = std::move(*all);
+          auto actualAcceptance =
+              proof.parse(joined.getRhs(), PrefixMode::Acceptance);
+          if (failed(actualAcceptance))
+            return failure();
+          auto rawControl = normalizedControl(index - 1);
+          if (failed(rawControl))
+            return failure();
+          auto expectedAcceptance = proof.knownValue(
+              *rawControl,
+              view.controls[index - 1].kind ==
+                      SampledControlKind::BranchSelect
+                  ? KnownTest::Either
+                  : KnownTest::One,
+              view.rule);
+          if (failed(expectedAcceptance))
+            return failure();
+          auto same =
+              proof.same(*actualAcceptance, *expectedAcceptance, view.rule);
+          if (failed(same))
+            return failure();
+          if (!*same) {
+            exact = false;
+            break;
           }
-          if (omittable[index]) continue;
+          cursor = joined.getLhs();
         }
+        auto root = proof.normalize(cursor);
+        auto rootValue = failed(root)
+                             ? FailureOr<std::optional<bool>>(failure())
+                             : literal(*root, analysis, budget);
+        if (failed(rootValue))
+          return failure();
+        if (!exact || !rootValue->value_or(false))
+          continue;
+      }
+      Prefix expected;
+      for (uint64_t index = begin; index < count; ++index) {
         auto next = proof.conjunction(expected, acceptances[index], view.rule);
         if (failed(next)) return failure();
         expected = std::move(*next);
       }
-      if (failed(budget.debit(1 + prefix->atoms.size() + expected.atoms.size() + full.atoms.size(), view.rule))) return failure();
-      if (!read && (prefix->impossible != expected.impossible || prefix->atoms != expected.atoms)) continue;
-      // Prefix atoms are canonical sorted conjunctions. The exact original
-      // prefix remains legal; removing any control requires the witness above.
-      // Acceptance factories produce one atom (or a closed constant) per
-      // control, so these bounds cannot authorize partial control omission.
-      if (read && ((expected.impossible && !prefix->impossible) ||
-          (prefix->impossible && !anyControlFalse) ||
-          !std::includes(prefix->atoms.begin(), prefix->atoms.end(), expected.atoms.begin(), expected.atoms.end()) ||
-          !std::includes(full.atoms.begin(), full.atoms.end(), prefix->atoms.begin(), prefix->atoms.end()))) continue;
+      if (!read) {
+        auto prefix = proof.parse(combine.getLhs());
+        if (failed(prefix) || failed(proof.equal(*prefix, expected, view.rule)))
+          continue;
+      }
       for (uint64_t ordinal = 0; ordinal < proposal.arguments.size(); ++ordinal) {
         if (failed(charge(budget, view.rule, 1, sizeof(uint64_t) * 3))) return failure();
         memoryWitnesses.insert(first + ordinal);
@@ -109,6 +120,9 @@
       return view.rule->emitOpError() << "Memory proposal differs from exact argument witnesses or reached/atomic admission";
   }
   for (auto [ordinal, requirement] : llvm::enumerate(view.requirements)) {
+    SourceCheckBudget::PhaseScope requirementPhase(
+        budget, "sampled memory witness coverage proof");
+    SourceCheckBudget::LocalScope requirementBudget(budget);
     if (failed(budget.debit(1, view.rule))) return failure();
     if (requirement.kind.getValue() == "memory_argument" && !memoryWitnesses.contains(ordinal))
       return view.rule->emitOpError() << "Memory argument witness lacks its exact issue proposal";

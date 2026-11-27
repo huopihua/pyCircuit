@@ -201,7 +201,8 @@ HardwareAnalysis::verifyInstance(InstanceOp instance,
     auto constraint = instance->getAttr("ac.payload_constraint");
     if (!constraint || failed(detail::verifySourceCallHardwareConstraint(
             constraint, layout->payloadType, *this, instance->getParentOp(),
-            instance, "source Memory payload")))
+            instance, "source Memory payload",
+            detail::SourceCallWidthMode::SymbolicFixedBits)))
       return failure();
     for (StringRef flag : {"ac.source_unbound_push", "ac.source_unbound_pop"})
       if (instance->hasAttr(flag))

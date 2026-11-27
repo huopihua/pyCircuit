@@ -115,6 +115,7 @@ nav:
       - Physical RTL Export: development/physical-rtl-export.md
       - Transactional Resource IR: development/transactional-resource-ir.md
       - Compiler Benchmark Delivery: development/compiler-benchmark-delivery.md
+      - Issue 431 Compiler Baseline: development/issue-431-baseline.md
       - Implementation Guide: development/implementation-guide.md
       - Contributing: development/contributing-workflow.md
       - Testing: development/testing-and-gates.md

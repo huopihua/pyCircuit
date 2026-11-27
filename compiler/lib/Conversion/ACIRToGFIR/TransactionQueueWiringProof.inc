@@ -29,7 +29,8 @@
           pending.push_back(queue.getInputs()[4]);
       }
       if (queueIndex != definition.queueIndices.size()) return reject("original queue allocation inventory differs");
-      uint64_t input = definition.sourceInputs + 2 * definition.downward.size();
+      uint64_t input = definition.sourceInputs + 2 * definition.downward.size() +
+                       2 * definition.memoryReadOutputs.size();
       for (const auto &route : definition.queueIncoming) {
         NamedAttrList row;
         row.append("queue", b.getDictionaryAttr({b.getNamedAttr("owner", b.getDictionaryAttr({
@@ -115,7 +116,9 @@
         if (!child) continue;
         const auto &routing = prepared.definitions[prepared.definitionIndex.lookup(child)];
         auto instance = cast<ac::InstanceOp>(candidate.packageMap.lookup(original.operator->()));
-        uint64_t start = original->getNumOperands() + 2 * routing.downward.size();
+        uint64_t start = original->getNumOperands() +
+                         2 * routing.downward.size() +
+                         2 * routing.memoryReadOutputs.size();
         for (uint64_t i = 0; i < queueInputCount(routing); ++i)
           pending.push_back(instance->getOperand(start + i));
       }

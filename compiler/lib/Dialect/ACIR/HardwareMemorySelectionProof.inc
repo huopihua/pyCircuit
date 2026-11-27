@@ -7,6 +7,24 @@
     SmallVector<Attribute, 0> path;
     for (unsigned depth = 0; depth <= 128; ++depth) {
       if (failed(step(module))) return failure();
+      // Nominal and Table pin selections are compacted as one ValueMerge at
+      // the aggregate root.  Incoming-route discovery needs the root path/data
+      // pair, not an arbitrary first packed leaf.  Reuse the complete compact
+      // selection proof so counting and the later physical-pin proof recognize
+      // exactly the same generated shape.
+      if (isa<StructType, EnumType, TableType>(leaf.resolvedType)) {
+        if (auto merge = leaf.value.getDefiningOp<ValueMergeOp>()) {
+          if (merge->getNumOperands() != 3)
+            return std::optional<MemorySelection>();
+          auto condition = normal(merge->getOperand(1), leaf.scope);
+          auto payload = normal(merge->getOperand(2), leaf.scope);
+          if (failed(condition) || failed(payload)) return failure();
+          auto fallback = peelSelection(leaf, *condition, *payload);
+          if (failed(fallback)) return failure();
+          return std::optional<MemorySelection>(
+              MemorySelection{*condition, *payload, *fallback});
+        }
+      }
       if (auto structure = dyn_cast<StructType>(leaf.resolvedType)) {
         auto create = leaf.value.getDefiningOp<StructCreateOp>();
         auto declaration = analysis.lookupStruct(structure);

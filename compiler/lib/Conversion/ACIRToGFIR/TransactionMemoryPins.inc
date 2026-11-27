@@ -89,6 +89,89 @@ public:
         }
       }
     }
+    for (auto [channelId, channel] :
+         llvm::enumerate(prepared.memoryReadChannels)) {
+      if (channelId >= candidate.memoryReadInstances.size())
+        return failure();
+      auto memory = candidate.memoryReadInstances[channelId];
+      auto original = channel.allocation;
+      OpBuilder builder(memory);
+      for (unsigned operand = 0; operand < memory.getNumOperands(); ++operand) {
+        if (operand == 2)
+          continue;
+        auto canonical = cast<ac::InstanceOp>(
+            candidate.packageMap.lookup(original.operator->()));
+        memory->setOperand(operand, canonical.getOperand(operand));
+      }
+      auto transaction = prepared.transactions[channel.transaction];
+      auto proposal = llvm::find_if(
+          transaction.memoryProposals, [&](const auto &candidate) {
+            return candidate.access == channel.access;
+          });
+      if (proposal == transaction.memoryProposals.end() ||
+          !proposal->readChannel || *proposal->readChannel != channelId)
+        return failure();
+      auto rule = candidate.transactions[channel.transaction].rule;
+      Value address = rule->getResult(proposal->argumentResults.front());
+      Value path = rule->getResult(proposal->pathResult);
+      if (channel.path.empty()) {
+        candidate.memoryReadInputs.push_back({path, address});
+      } else {
+        Value routedPath = path, routedAddress = address;
+        for (auto edge : channel.path) {
+          auto allocation = cast<ac::InstanceOp>(
+              candidate.packageMap.lookup(edge.operator->()));
+          auto child = cast<ac::ModuleOp>(hardware.resolveCallee(edge));
+          const auto &routing = prepared.definitions[
+              prepared.definitionIndex.lookup(child.operator->())];
+          auto found = routing.memoryReadOutputIndex.find(channelId);
+          if (found == routing.memoryReadOutputIndex.end())
+            return failure();
+          uint64_t base = routing.sourceInputs + 2 * routing.downward.size() +
+                          2 * found->second;
+          Value oldPath = allocation->getOperand(base);
+          Value oldAddress = allocation->getOperand(base + 1);
+          allocation->setOperand(base, routedPath);
+          allocation->setOperand(base + 1, routedAddress);
+          if (auto result = dyn_cast<OpResult>(oldPath);
+              result && result.use_empty())
+            result.getOwner()->erase();
+          if (auto result = dyn_cast<OpResult>(oldAddress);
+              result && result.use_empty())
+            result.getOwner()->erase();
+          auto module = cast<ac::ModuleOp>(
+              candidate.packageMap.lookup(child.operator->()));
+          routedPath = module.getBody().front().getArgument(base);
+          routedAddress = module.getBody().front().getArgument(base + 1);
+        }
+      }
+      auto owner = original->getParentOfType<ac::ModuleOp>();
+      const auto &ownerRouting = prepared.definitions[
+          prepared.definitionIndex.lookup(owner.operator->())];
+      auto ownerRoute = ownerRouting.memoryReadOutputIndex.find(channelId);
+      if (ownerRoute != ownerRouting.memoryReadOutputIndex.end()) {
+        uint64_t base = ownerRouting.sourceInputs +
+                        2 * ownerRouting.downward.size() +
+                        2 * ownerRoute->second;
+        auto module = cast<ac::ModuleOp>(
+            candidate.packageMap.lookup(owner.operator->()));
+        path = module.getBody().front().getArgument(base);
+        address = module.getBody().front().getArgument(base + 1);
+      }
+      Value zero = bitsLiteral(address.getType(), original.getOccurrence(),
+                               original.getLoc(), false, builder);
+      ac::HardwareBindings bindings;
+      bindings.owner = original->getParentOfType<ac::ModuleOp>();
+      auto selected = materializeSelection(
+          original, bindings, path, address, zero,
+          address.getType(), builder, budget);
+      if (failed(selected))
+        return failure();
+      memory->setOperand(2, selected->value);
+      if (candidate.memoryReadSelections.size() != channelId)
+        return failure();
+      candidate.memoryReadSelections.push_back(std::move(*selected));
+    }
     return success();
   }
 private:
@@ -138,7 +221,11 @@ private:
       if (!payload) payload = bitsLiteral(*type, memory.getOccurrence(), location, true, builder);
       auto selected = materializeSelection(memory, bindings, proposal.path,
                                             payload, data, *type, builder, budget);
-      if (failed(selected) || !prepayAppend(budget, memory, record.selections)) return failure();
+      if (failed(selected))
+        return memory.emitOpError()
+               << "failed to materialize routed Memory pin selection for "
+               << "operand " << operand;
+      if (!prepayAppend(budget, memory, record.selections)) return failure();
       data = selected->value;
       record.selections.push_back(std::move(*selected));
       OperationState join(location, ac::BitsBinaryOp::getOperationName());

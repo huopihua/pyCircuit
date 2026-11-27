@@ -266,7 +266,7 @@ struct BranchEnvironment {
 // These are existing admission policies, not interchangeable source profiles.
 // Ordinary locals retain an inferred boundary and contextualize subsequent
 // RHS expressions; straight-line transaction assignments only declare boundaries
-// for annotations (branch entry separately seeds inferred capture boundaries).
+// for annotations (branch entry seeds inferred boundaries for its write set).
 enum class LocalBindingPolicy { Ordinary, Transaction };
 struct PreparedLocalBinding {
   StringRef name;
@@ -485,6 +485,8 @@ public:
   ArrayRef<ModuleDomainPlan> moduleDomains() const override {
     return domainPlans;
   }
+  void collectMetrics(
+      acir::metrics::CompilerPhaseMetrics &metrics) const override;
 
 private:
   struct HelperScope;
@@ -576,6 +578,7 @@ private:
                                 const AstNode &node, OpBuilder &at,
                                 FlatSymbolRefAttr symbol, bool preserveProjectionWitnesses);
   StringRef assignmentRoot(const AstNode &target) const;
+  FailureOr<llvm::ArrayRef<StringRef>> assignedRoots(const AstNode &node);
   AstNode indexedFieldTarget(const AstNode &target) const;
   bool plainAccessPath(const AstNode &node) const;
   FailureOr<DictionaryAttr> accessField(Type type, StringRef name);
@@ -839,8 +842,8 @@ private:
                                    const BranchEnvironment &yes,
                                    const BranchEnvironment &no);
   FailureOr<BranchEnvironment>
-  joinBranches(const NumericValue &condition, const BranchEnvironment &incoming,
-               const BranchEnvironment &yes, const BranchEnvironment &no,
+  joinBranches(const NumericValue &condition, BranchEnvironment incoming,
+               const BranchEnvironment &yes, const BranchEnvironment *no,
                const AstNode &node, OpBuilder &at, FlatSymbolRefAttr owner,
                ac::SourceBranchOp sourceBranch = {});
   LogicalResult propagateClosed(Value result, ac::detail::ValueOpcode opcode,
@@ -880,7 +883,8 @@ private:
   FailureOr<Value> unsignedBoundary(Value value, Type target,
                                     const AstNode &node, OpBuilder &at,
                                     FlatSymbolRefAttr symbol,
-                                    bool allowFixedWidening = true);
+                                    bool allowFixedWidening = true,
+                                    bool allowTemplateActual = false);
   LogicalResult normalizeFixedIntegerPeer(Value &lhs, Value &rhs,
                                           const AstNode &node, OpBuilder &at,
                                           FlatSymbolRefAttr symbol,
@@ -1126,6 +1130,8 @@ private:
   SmallVector<OwnerProposal> ownerProposals;
   std::unique_ptr<OwnerEnableProof> grantProof;
   TableQueryBudget queryBudget;
+  llvm::DenseMap<DictionaryAttr, SmallVector<StringRef, 0>>
+      branchAssignedRoots;
   // Nominal declarations are frozen before body emission. Successful
   // admissions belong to the exact source type and actual lexical Module.
   SmallVector<std::pair<std::pair<Type, Operation *>, Type>, 0>
@@ -1830,7 +1836,8 @@ FailureOr<Value> Importer::applyBindingBoundary(Value value,
                                                          : "Integer")
            << " source kind";
   if (contract.fixedBits)
-    return unsignedBoundary(value, contract.type, node, at, ownerSymbol);
+    return unsignedBoundary(value, contract.type, node, at, ownerSymbol,
+                            true, true);
   if (!contract.type)
     return value;
   if (contract.sourceKind == ValueKind::Integer) {
@@ -1886,37 +1893,50 @@ bool Importer::hasUnchangedIncomingBinding(StringRef name,
   auto originalBoundary = incoming.boundaries.find(name);
   auto aBoundary = yes.boundaries.find(name),
        cBoundary = no.boundaries.find(name);
-  return originalBoundary != incoming.boundaries.end() &&
-         aBoundary != yes.boundaries.end() &&
-         cBoundary != no.boundaries.end() &&
-         aBoundary->second.declared == originalBoundary->second.declared &&
+  bool originalHasBoundary = originalBoundary != incoming.boundaries.end();
+  bool aHasBoundary = aBoundary != yes.boundaries.end();
+  bool cHasBoundary = cBoundary != no.boundaries.end();
+  if (!originalHasBoundary && !aHasBoundary && !cHasBoundary)
+    return true;
+  if (!originalHasBoundary || !aHasBoundary || !cHasBoundary)
+    return false;
+  return aBoundary->second.declared == originalBoundary->second.declared &&
          cBoundary->second.declared == originalBoundary->second.declared &&
          sameBindingBoundary(aBoundary->second, originalBoundary->second) &&
          sameBindingBoundary(cBoundary->second, originalBoundary->second);
 }
 
 FailureOr<BranchEnvironment> Importer::joinBranches(
-    const NumericValue &condition, const BranchEnvironment &incoming,
-    const BranchEnvironment &yes, const BranchEnvironment &no,
+    const NumericValue &condition, BranchEnvironment incoming,
+    const BranchEnvironment &yes, const BranchEnvironment *no,
     const AstNode &node, OpBuilder &at, FlatSymbolRefAttr ownerSymbol,
     ac::SourceBranchOp sourceBranch) {
-  BranchEnvironment joined;
-  joined.boundaries = incoming.boundaries;
-  joined.ambient = incoming.ambient;
-  if (incoming.continuation) {
-    auto selected = select(condition.value, yes.continuation, no.continuation,
+  const BranchEnvironment &originalNo = no ? *no : incoming;
+  llvm::StringSet<> unchanged;
+  for (const auto &item : yes.values)
+    if (hasUnchangedIncomingBinding(item.first(), incoming, yes, originalNo))
+      unchanged.insert(item.first());
+
+  // The incoming environment is the frozen inventory for this occurrence.
+  // Reuse its maps and overwrite only joined bindings; arm environments remain
+  // independent snapshots while their source is lowered.
+  BranchEnvironment joined = std::move(incoming);
+  const BranchEnvironment &falseEnvironment = no ? *no : joined;
+  if (joined.continuation) {
+    auto selected = select(condition.value, yes.continuation,
+                           falseEnvironment.continuation,
                            node, at, ownerSymbol);
     if (failed(selected))
       return failure();
     auto continued =
-        checkAnd(incoming.continuation, *selected, node, at, ownerSymbol);
+        checkAnd(joined.continuation, *selected, node, at, ownerSymbol);
     if (failed(continued))
       return failure();
     joined.continuation = *continued;
   }
   // Declarations constrain every retained path, including a path without a
   // value. Inferred partial bindings do not survive the join.
-  for (const auto *branch : {&yes, &no})
+  for (const auto *branch : {&yes, &falseEnvironment})
     for (const auto &item : branch->boundaries) {
       if (!item.second.declared)
         continue;
@@ -1941,11 +1961,10 @@ FailureOr<BranchEnvironment> Importer::joinBranches(
     elseAt.emplace(OpBuilder::atBlockEnd(&sourceBranch.getElseRegion().front()));
   }
   auto joinBinding = [&](StringRef name, Value yesValue) -> LogicalResult {
-    auto opposite = no.values.find(name);
-    if (opposite == no.values.end())
+    auto opposite = falseEnvironment.values.find(name);
+    if (opposite == falseEnvironment.values.end())
       return success();
-    if (hasUnchangedIncomingBinding(name, incoming, yes, no)) {
-      joined.values[name] = incoming.values.lookup(name);
+    if (unchanged.contains(name)) {
       return success();
     }
     Value noValue = opposite->second;
@@ -2032,8 +2051,8 @@ FailureOr<BranchEnvironment> Importer::joinBranches(
     for (const auto &item : yes.values) {
       if (failed(chargeLoopDescriptorWork(node, "source join binding measurement")))
         return failure();
-      if (no.values.contains(item.first()) &&
-          !hasUnchangedIncomingBinding(item.first(), incoming, yes, no))
+      if (falseEnvironment.values.contains(item.first()) &&
+          !unchanged.contains(item.first()))
         ++resultCount;
     }
     constexpr uint64_t resultSlots = (sizeof(PreparedBranchJoin) + 7) / 8 + 5;
@@ -2050,9 +2069,9 @@ FailureOr<BranchEnvironment> Importer::joinBranches(
     prepared.reserve(resultCount);
     resultNames.reserve(resultCount);
     for (const auto &item : yes.values) {
-      if (!no.values.contains(item.first()))
+      if (!falseEnvironment.values.contains(item.first()))
         continue;
-      if (hasUnchangedIncomingBinding(item.first(), incoming, yes, no)) {
+      if (unchanged.contains(item.first())) {
         if (failed(joinBinding(item.first(), item.second)))
           return failure();
       } else {
@@ -2103,9 +2122,10 @@ FailureOr<BranchEnvironment> Importer::joinBranches(
       if (failed(joinBinding(item.first(), item.second)))
         return failure();
   }
-  for (const auto &item : incoming.writes) {
+  for (const auto &item : joined.writes) {
     auto value = select(condition.value, yes.writes.lookup(item.first()),
-                        no.writes.lookup(item.first()), node, at, ownerSymbol);
+                        falseEnvironment.writes.lookup(item.first()), node, at,
+                        ownerSymbol);
     if (failed(value))
       return failure();
     joined.writes[item.first()] = *value;
@@ -2291,6 +2311,11 @@ LogicalResult Importer::scanConstants() {
     if (statement.kind() == "AnnAssign" || statement.kind() == "AugAssign")
       return error() << "source constants require a plain literal assignment";
     if (statement.kind() != "Assign") continue;
+    auto assigned = statement.child("value");
+    if (assigned.kind() == "Call" &&
+        intrinsic(assigned.child("func"), "instance_ref"))
+      return error() << "instance_ref is unsupported at source top level; "
+                        "declare it as a direct Module-body assignment";
     auto target = statement.item("targets", 0);
     if (statement.array("targets").size() != 1 || target.kind() != "Name")
       return error() << "source constant requires exactly one Name target";
@@ -2302,7 +2327,7 @@ LogicalResult Importer::scanConstants() {
           "type", "bytes", "print", "pyc_clk", "pyc_rst"}, name))
       return error() << "source constant duplicates or shadows a protected binding '"
                      << name << "'";
-    auto rhs = statement.child("value");
+    auto rhs = assigned;
     bool negate = false;
     bool signedLiteral = rhs.kind() == "UnaryOp";
     if (signedLiteral) {
@@ -6351,6 +6376,29 @@ LogicalResult Importer::prepare() {
     return failure();
   return success(!diagnosticFailed);
 }
+
+void Importer::collectMetrics(
+    acir::metrics::CompilerPhaseMetrics &metrics) const {
+  metrics.work = queryBudget.used(TableQueryResource::Work);
+  metrics.slots = queryBudget.used(TableQueryResource::Slots);
+  metrics.occurrences = queryBudget.used(TableQueryResource::Occurrences);
+  metrics.definitions = modules.size();
+  metrics.calls = directCallSites.size() + structuralCallSites.size();
+  metrics.planEntries = modules.size() + memoryPlans.size() + domainPlans.size() +
+                        directCallSites.size() + structuralCallSites.size();
+  metrics.planBytes = sizeof(*this) +
+                      modules.capacity() * sizeof(ModuleDecl) +
+                      memoryPlans.capacity() * sizeof(MemoryCallPlan) +
+                      domainPlans.capacity() * sizeof(ModuleDomainPlan) +
+                      directCallSites.getMemorySize() +
+                      structuralCallSites.getMemorySize();
+  metrics.details["operations"] =
+      queryBudget.used(TableQueryResource::Operations);
+  metrics.details["payload_words"] =
+      queryBudget.used(TableQueryResource::PayloadWords);
+  metrics.details["constant_bytes"] =
+      queryBudget.used(TableQueryResource::ConstantBytes);
+}
 FailureOr<StringRef> Importer::fourStatePattern(const AstNode &node) {
   auto argument = node.item("args", 0);
   auto pattern = dyn_cast_or_null<StringAttr>(argument.get("value"));
@@ -6478,10 +6526,12 @@ class LowerPythonSourcePass
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerPythonSourcePass)
   LowerPythonSourcePass(DictionaryAttr owner,
-                        const SourceHeaderRegistry &headers)
-      : owner(owner), headers(&headers) {}
+                        const SourceHeaderRegistry &headers,
+                        acir::metrics::CompilerPhaseMetrics *metrics = nullptr)
+      : owner(owner), headers(&headers), metrics(metrics) {}
   LowerPythonSourcePass(const LowerPythonSourcePass &other)
-      : PassWrapper(other), owner(other.owner), headers(other.headers) {}
+      : PassWrapper(other), owner(other.owner), headers(other.headers),
+        metrics(other.metrics) {}
   StringRef getArgument() const final { return "ac-lower-python-source"; }
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<ac::ACIRDialect, func::FuncDialect, arith::ArithDialect, scf::SCFDialect>();
@@ -6490,8 +6540,13 @@ public:
     auto transport = getOperation();
     auto &bindings = getAnalysis<SourceMemoryBindingsAnalysis>();
     auto result = bindings.lower(owner, *headers);
-    if (failed(result) || failed(::acir::normalizeSourceControlFlow(**result)) ||
-        failed(verify(**result))) {
+    if (metrics)
+      bindings.collectMetrics(*metrics);
+    if (failed(result) || failed(::acir::normalizeSourceControlFlow(**result))) {
+      signalPassFailure();
+      return;
+    }
+    if (failed(verify(**result))) {
       signalPassFailure();
       return;
     }
@@ -6505,12 +6560,14 @@ public:
 private:
   DictionaryAttr owner;
   const SourceHeaderRegistry *headers;
+  acir::metrics::CompilerPhaseMetrics *metrics = nullptr;
 };
 } // namespace
 std::unique_ptr<Pass>
 createLowerPythonSourcePass(DictionaryAttr owner,
-                            const SourceHeaderRegistry &headers) {
-  return std::make_unique<LowerPythonSourcePass>(owner, headers);
+                            const SourceHeaderRegistry &headers,
+                            acir::metrics::CompilerPhaseMetrics *metrics) {
+  return std::make_unique<LowerPythonSourcePass>(owner, headers, metrics);
 }
 
 } // namespace acir::compiler::detail

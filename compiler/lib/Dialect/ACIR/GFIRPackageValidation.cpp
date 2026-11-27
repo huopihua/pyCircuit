@@ -10,12 +10,18 @@ using namespace mlir;
 
 namespace acir::ac {
 LogicalResult verifyRoutedPackage(mlir::ModuleOp package,
-                                  HardwareSourceCheckLimits limits) {
+                                  HardwareSourceCheckLimits limits,
+                                  acir::metrics::CompilerPhaseMetrics *metrics) {
   if (!package)
     return failure();
   HardwareAnalysis analysis(package);
-  return success(succeeded(detail::buildSourceCheckPlan(
-      analysis, limits, detail::PackageStagePolicy::routed())));
+  detail::SourceCheckBuildMetrics buildMetrics;
+  auto plan = detail::buildSourceCheckPlan(
+      analysis, limits, detail::PackageStagePolicy::routed(),
+      metrics ? &buildMetrics : nullptr);
+  if (metrics)
+    detail::publishSourceCheckMetrics(buildMetrics, *metrics);
+  return success(succeeded(plan));
 }
 } // namespace acir::ac
 

@@ -2,6 +2,9 @@
   if (memoryProposals && failed(charge(budget, rule, memoryProposals.size(),
                                        sizeof(SampledMemoryProposalView)))) return failure();
   if (memoryProposals) for (Attribute raw : memoryProposals) {
+    SourceCheckBudget::PhaseScope rowPhase(
+        budget, "sampled memory proposal parsing");
+    SourceCheckBudget::LocalScope rowBudget(budget);
     auto row = dyn_cast<DictionaryAttr>(raw);
     if (failed(exact(row, {"memory", "kind", "port", "occurrence", "location",
                            "raw_path", "path", "arguments"}, rule,

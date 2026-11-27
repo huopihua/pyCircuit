@@ -6,12 +6,15 @@
 #include "Compiler/FinalCppSourceParts.h"
 #include "Compiler/FinalSourceMap.h"
 #include "Compiler/FinalVerilogSourceParts.h"
+#include "Compiler/HardwareEmitCommon.h"
+#include "Compiler/HardwareEmitCppChecks.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
+#include "pycircuit/Analysis/CompilerPhaseMetrics.h"
 #include "pycircuit/Dialect/ACIR/ACIRDialect.h"
-#include "pycircuit/Dialect/GFIR/GFIRDialect.h"
 #include "pycircuit/Dialect/ACIR/HardwareAnalysis.h"
 #include "pycircuit/Dialect/ACIR/SourceUnitValidation.h"
+#include "pycircuit/Dialect/GFIR/GFIRDialect.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -56,7 +59,7 @@ int main(int argc, char **argv) {
         "{0}\n", llvm::json::Value(llvm::json::Object{{"path", path}}));
     return 0;
   }
-  StringRef target, format = "json", rtlMode = "managed";
+  StringRef target, format = "json", rtlMode = "managed", metricsOut;
   bool optionsValid = argc >= 4 && (argc % 2 == 0);
   for (int i = 2; optionsValid && i + 1 < argc; i += 2) {
     StringRef option(argv[i]);
@@ -66,6 +69,8 @@ int main(int argc, char **argv) {
       format = argv[i + 1];
     else if (option == "--rtl-mode")
       rtlMode = argv[i + 1];
+    else if (option == "--metrics-out" && metricsOut.empty())
+      metricsOut = argv[i + 1];
     else
       optionsValid = false;
   }
@@ -74,7 +79,8 @@ int main(int argc, char **argv) {
       (rtlMode != "managed" && rtlMode != "physical") ||
       (target != "verilog" && rtlMode != "managed")) {
     llvm::errs() << "usage: pycircuit-emit FINAL.ac --target cpp|verilog "
-                    "[--format json|source] [--rtl-mode managed|physical]\n";
+                    "[--format json|source] [--rtl-mode managed|physical] "
+                    "[--metrics-out PATH]\n";
     return 2;
   }
   bool physical = rtlMode == "physical";
@@ -82,19 +88,38 @@ int main(int argc, char **argv) {
   if (!package || failed(mlir::verify(*package)))
     return 1;
   acir::ac::HardwareAnalysis analysis(*package);
-  if (failed(analysis.verify()))
+  const bool measure = !metricsOut.empty();
+  acir::metrics::CompilerMetricsReport metrics;
+  acir::metrics::CompilerPhaseMetrics *emissionMetrics = nullptr;
+  if (measure) {
+    metrics.inputPath = argv[1];
+    emissionMetrics = &metrics.phase("emission_planning", target);
+  }
+  acir::metrics::CompilerMetricsGuard metricsGuard(
+      metricsOut, metrics,
+      target == "cpp" ? acir::metrics::CompilerTimingKind::EmitCpp
+                      : acir::metrics::CompilerTimingKind::EmitVerilog,
+      emissionMetrics);
+  acir::compiler::HardwareEmitContext emitter(*package, analysis, physical,
+                                              emissionMetrics);
+  if (failed(emitter.prepareNativeChecks()))
     return 1;
   if (format == "source") {
     std::string text;
     llvm::raw_string_ostream stream(text);
-    LogicalResult status =
-        target == "cpp"
-            ? acir::compiler::emitCpp(*package, analysis, stream)
-            : acir::compiler::emitVerilog(*package, analysis, stream, physical);
-    if (failed(status))
-      return 1;
+    if (target == "cpp") {
+      auto parts = acir::compiler::emitPreparedCppSourceParts(emitter);
+      if (failed(parts))
+        return 1;
+      acir::compiler::renderCppSourceParts(*parts, stream);
+    } else {
+      auto parts = acir::compiler::emitPreparedVerilogSourceParts(emitter);
+      if (failed(parts))
+        return 1;
+      acir::compiler::renderVerilogSourceParts(*parts, stream);
+    }
     llvm::outs() << text;
-    return 0;
+    return metricsGuard.finish(true) ? 0 : 1;
   }
 
   auto system = *package->getOps<acir::ac::SystemOp>().begin();
@@ -102,7 +127,8 @@ int main(int argc, char **argv) {
   auto root =
       cast<acir::ac::ModuleOp>(analysis.lookupDefinition(callee.getValue()));
   auto logicalEntry = system.getEntry();
-  if (auto boundary = system->getAttrOfType<DictionaryAttr>("ac.entry_boundary"))
+  if (auto boundary =
+          system->getAttrOfType<DictionaryAttr>("ac.entry_boundary"))
     logicalEntry = boundary.getAs<DictionaryAttr>("logical_entry");
   auto logicalCallee = logicalEntry.getAs<FlatSymbolRefAttr>("callee");
   llvm::json::Array arguments;
@@ -112,9 +138,10 @@ int main(int argc, char **argv) {
         arguments.emplace_back(llvm::json::Object{
             {"kind", kind}, {"value", attributeText(value)}});
   llvm::json::Object result{
-      {"entry", llvm::json::Object{{"definition",
-                                    "@\"" + logicalCallee.getValue().str() + "\""},
-                                   {"arguments", std::move(arguments)}}},
+      {"entry",
+       llvm::json::Object{
+           {"definition", "@\"" + logicalCallee.getValue().str() + "\""},
+           {"arguments", std::move(arguments)}}},
       {"entry_source", sourceOwner(root.getSourceOwner())}};
   auto resetPolicy = acir::ac::getHardwareResetSemantics(*package);
   if (failed(resetPolicy))
@@ -122,13 +149,17 @@ int main(int argc, char **argv) {
   result["reset_semantics"] =
       *resetPolicy == acir::ac::HardwareResetSemantics::IfOne ? "if_one"
                                                               : "strict";
-  if (auto strategy = (*package)->getAttrOfType<StringAttr>("ac.execution_selection")) {
-    auto protocol = (*package)->getAttrOfType<StringAttr>("ac.execution_protocol");
-    auto publication = (*package)->getAttrOfType<StringAttr>("ac.execution_publication_field");
+  if (auto strategy =
+          (*package)->getAttrOfType<StringAttr>("ac.execution_selection")) {
+    auto protocol =
+        (*package)->getAttrOfType<StringAttr>("ac.execution_protocol");
+    auto publication =
+        (*package)->getAttrOfType<StringAttr>("ac.execution_publication_field");
     result["execution_model"] = llvm::json::Object{
         {"strategy", strategy.getValue()},
         {"protocol", protocol ? protocol.getValue() : StringRef()},
-        {"publication_field", publication ? publication.getValue() : StringRef()}};
+        {"publication_field",
+         publication ? publication.getValue() : StringRef()}};
     if (auto state =
             (*package)->getAttrOfType<IntegerAttr>("ac.execution_state_output"))
       result["execution_model"].getAsObject()->insert(
@@ -215,7 +246,7 @@ int main(int argc, char **argv) {
     memberships.push_back({unit.owner, {}});
   }
   if (target == "cpp") {
-    auto parts = acir::compiler::emitCppSourceParts(*package, analysis);
+    auto parts = acir::compiler::emitPreparedCppSourceParts(emitter);
     if (failed(parts))
       return 1;
     llvm::json::Array groups;
@@ -255,8 +286,7 @@ int main(int argc, char **argv) {
     result["port_availability"] = std::move(*ports);
     result["source_groups"] = std::move(groups);
   } else {
-    auto parts =
-        acir::compiler::emitVerilogSourceParts(*package, analysis, physical);
+    auto parts = acir::compiler::emitPreparedVerilogSourceParts(emitter);
     if (failed(parts))
       return 1;
     llvm::json::Array groups, standard;
@@ -302,5 +332,5 @@ int main(int argc, char **argv) {
   result["source_maps"] = std::move(rows);
   llvm::outs() << llvm::formatv("{0:2}\n",
                                 llvm::json::Value(std::move(result)));
-  return 0;
+  return metricsGuard.finish(true) ? 0 : 1;
 }

@@ -905,6 +905,8 @@ TEST_F(HardwareSampledAdmissionTest,
       capture([&] { return validation.prepare(definition, bindings); });
   ASSERT_TRUE(succeeded(prepared)) << diagnostics;
   ASSERT_NE(*prepared, nullptr);
+  EXPECT_EQ(validation.preparedContextCount(), 1u);
+  EXPECT_EQ(validation.sampledRuleParseCount(), 2u);
   for (auto candidate : {rule, second}) {
     auto view = capture([&] { return validation.verify(candidate, bindings); });
     ASSERT_TRUE(succeeded(view)) << diagnostics;
@@ -916,6 +918,8 @@ TEST_F(HardwareSampledAdmissionTest,
       capture([&] { return validation.prepare(definition, bindings); });
   ASSERT_TRUE(succeeded(repeatedPrepared)) << diagnostics;
   EXPECT_EQ(*repeatedPrepared, *prepared);
+  EXPECT_EQ(validation.preparedContextCount(), 1u);
+  EXPECT_EQ(validation.sampledRuleParseCount(), 2u);
   EXPECT_TRUE(succeeded(capture([&] {
     return validation.verifyInvocation(analysis, budget);
   }))) << diagnostics;
@@ -941,6 +945,32 @@ TEST_F(HardwareSampledAdmissionTest,
   EXPECT_TRUE(
       failed(capture([&] { return validation.verify(invalid, bindings); })));
   EXPECT_FALSE(diagnostics.empty());
+}
+
+TEST_F(HardwareSampledAdmissionTest,
+       PreparedFactsDoNotCacheProofVerdictAfterRuleBodyMutation) {
+  build();
+  ac::HardwareAnalysis analysis(*package);
+  ac::HardwareBindings bindings;
+  bindings.owner = definition;
+  detail::SourceCheckBudget budget({1 << 20});
+  detail::SampledAdmissionValidation validation(analysis, budget);
+  ASSERT_TRUE(succeeded(capture([&] {
+    return validation.verify(rule, bindings);
+  }))) << diagnostics;
+
+  auto *yield = rule.getBody().front().getTerminator();
+  ASSERT_GT(yield->getNumOperands(), 0u);
+  ASSERT_GT(rule.getBody().front().getNumArguments(), 2u);
+  yield->setOperand(0, rule.getBody().front().getArgument(2));
+
+  EXPECT_TRUE(failed(capture([&] {
+    return validation.verify(rule, bindings);
+  })));
+  EXPECT_NE(diagnostics.find(
+                "the Rule body or wiring may have changed"),
+            std::string::npos)
+      << diagnostics;
 }
 
 TEST_F(HardwareSampledAdmissionTest,
@@ -993,7 +1023,7 @@ TEST_F(HardwareSampledAdmissionTest,
   bindings.owner = definition;
   detail::SourceCheckBudget prepareBudget({1 << 20});
   auto prepared = capture([&] {
-    return detail::prepareSampledBoundaries(definition, analysis, bindings,
+    return detail::prepareSampledDefinition(definition, analysis, bindings,
                                             prepareBudget);
   });
   ASSERT_TRUE(succeeded(prepared)) << diagnostics;
@@ -1036,7 +1066,7 @@ TEST_F(HardwareSampledAdmissionTest,
     bindings.owner = definition;
     detail::SourceCheckBudget budget({1 << 20});
     auto prepared = capture([&] {
-      return detail::prepareSampledBoundaries(definition, analysis, bindings,
+      return detail::prepareSampledDefinition(definition, analysis, bindings,
                                               budget);
     });
     EXPECT_TRUE(failed(prepared));
@@ -1066,7 +1096,7 @@ TEST_F(HardwareSampledAdmissionTest,
   bindings.owner = definition;
   detail::SourceCheckBudget budget({1 << 20});
   auto prepared = capture([&] {
-    return detail::prepareSampledBoundaries(definition, analysis, bindings,
+    return detail::prepareSampledDefinition(definition, analysis, bindings,
                                             budget);
   });
   ASSERT_TRUE(succeeded(prepared)) << diagnostics;
@@ -1916,7 +1946,7 @@ TEST_F(HardwareSampledAdmissionTest,
 }
 
 TEST_F(HardwareSampledAdmissionTest,
-       EveryValidationQueryReparsesCurrentRuleMetadata) {
+       FrozenParsedFactsRejectPostPreparationMetadataMutation) {
   buildConditional();
   ac::HardwareAnalysis analysis(*package);
   ac::HardwareBindings bindings;
@@ -1929,6 +1959,11 @@ TEST_F(HardwareSampledAdmissionTest,
   changeRow("controls", 1, "kind", b.getStringAttr("unrecognized"));
   EXPECT_TRUE(
       failed(capture([&] { return validation.verify(rule, bindings); })));
+  EXPECT_NE(
+      diagnostics.find(
+          "prepared sampled admission differs from current Rule metadata"),
+      std::string::npos)
+      << diagnostics;
 }
 
 TEST_F(HardwareSampledAdmissionTest,
@@ -2063,7 +2098,7 @@ TEST_F(HardwareSampledAdmissionTest,
     bindings.owner = definition;
     detail::SourceCheckBudget budget({1 << 20});
     auto prepared = capture([&] {
-      return detail::prepareSampledBoundaries(definition, analysis, bindings,
+      return detail::prepareSampledDefinition(definition, analysis, bindings,
                                               budget);
     });
     ASSERT_TRUE(succeeded(prepared)) << diagnostics;
@@ -2151,7 +2186,8 @@ TEST_F(HardwareSampledAdmissionTest,
     detail::SourceCheckBudget budget({1 << 20});
     auto parsed = detail::parseSampledAdmission(rule, analysis, bindings, budget);
     ASSERT_TRUE(succeeded(parsed));
-    auto prepared = detail::prepareSampledBoundaries(definition, analysis, bindings, budget);
+    auto prepared = detail::prepareSampledDefinition(definition, analysis,
+                                                     bindings, budget);
     ASSERT_TRUE(succeeded(prepared));
     ASSERT_TRUE(prepared->has_value());
     detail::SampledQueueProposalView proposal;

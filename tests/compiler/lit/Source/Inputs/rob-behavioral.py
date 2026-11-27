@@ -301,7 +301,7 @@ def NegativeIndex() -> {"out": ac.u1}:
         ),
         "boolean-field": (
             text.replace("active: ac.u1", "active: bool"),
-            ("unsigned", "struct", "bits"),
+            ("boolean", "binding", "source", "kind"),
         ),
         "annotated-field": (
             text.replace(

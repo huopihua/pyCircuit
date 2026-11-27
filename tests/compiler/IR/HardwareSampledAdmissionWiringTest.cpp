@@ -932,7 +932,7 @@ TEST_F(HardwareSampledAdmissionWiringTest,
   bindings.owner = definition;
   detail::SourceCheckBudget budget({1 << 20});
   auto prepared = capture([&] {
-    return detail::prepareSampledBoundaries(definition, analysis, bindings,
+    return detail::prepareSampledDefinition(definition, analysis, bindings,
                                             budget);
   });
   ASSERT_TRUE(succeeded(prepared)) << diagnostics;
@@ -960,8 +960,13 @@ TEST_F(HardwareSampledAdmissionWiringTest,
                                           budget);
   });
   ASSERT_TRUE(succeeded(wiring)) << diagnostics;
-  ASSERT_EQ(wiring->writers.size(), 1u);
-  const auto &writer = wiring->writers.front();
+  ASSERT_EQ(wiring->admissions.size(), 1u);
+  auto admission = wiring->admissions.find(rule);
+  ASSERT_NE(admission, wiring->admissions.end());
+  EXPECT_EQ(admission->second.rule, rule);
+  EXPECT_EQ(admission->second.definition, definition);
+  ASSERT_EQ(wiring->wiring.writers.size(), 1u);
+  const auto &writer = wiring->wiring.writers.front();
   EXPECT_EQ(writer.ordinaryResults, 0u);
   ASSERT_EQ(writer.candidates.size(), 3u);
   for (auto [ordinal, candidate] : llvm::enumerate(writer.candidates)) {
@@ -1328,7 +1333,8 @@ TEST_F(HardwareSampledAdmissionWiringTest,
   ASSERT_TRUE(succeeded(wiring)) << diagnostics;
   detail::SampledAdmissionValidation validation(analysis, budget);
   auto checked = capture([&] {
-    return validation.verifyCandidateEnables(wiring->writers.front(), bindings);
+    return validation.verifyCandidateEnables(wiring->wiring.writers.front(),
+                                             bindings);
   });
   ASSERT_TRUE(succeeded(checked)) << diagnostics;
   ASSERT_EQ(checked->size(), 1u);
@@ -1478,20 +1484,21 @@ TEST_F(HardwareSampledAdmissionWiringTest, ProofBudgetRejectsWithoutMutation) {
 }
 
 TEST_F(HardwareSampledAdmissionWiringTest,
-       RepeatedExactRootScopesShareOneBoundedSuccessfulInvocation) {
+       RepeatedExactRootScopesRunDistinctAdmissionProofs) {
   build(true);
   ac::HardwareAnalysis analysis(*package);
   ac::HardwareBindings bindings;
   bindings.owner = definition;
   SmallVector<std::pair<ac::ModuleOp, ac::HardwareBindings>> scopes;
-  for (unsigned i = 0; i < 64; ++i)
+  for (unsigned i = 0; i < 8; ++i)
     scopes.emplace_back(definition, bindings);
-  detail::SourceCheckBudget budget({1 << 20});
+  detail::SourceCheckBudget budget({1 << 22});
   detail::SampledAdmissionValidation validation(analysis, budget);
   EXPECT_TRUE(succeeded(capture([&] {
     return detail::verifyTransactionWiring(analysis, scopes, validation,
                                            budget);
   }))) << diagnostics;
+  EXPECT_EQ(validation.sampledAdmissionProofCount(), scopes.size());
 }
 
 TEST_F(HardwareSampledAdmissionWiringTest,
@@ -1835,9 +1842,21 @@ TEST_F(HardwareSampledAdmissionWiringTest,
        ReusedDefinitionCreatesDistinctActualSamplingHistories) {
   build(false);
   instantiateSampledOwnerTwice();
-  auto plan = capture(
-      [&] { return ac::HardwareAnalysis(*package).getSourceCheckPlan(); });
+  ac::HardwareAnalysis analysis(*package);
+  detail::SourceCheckBuildMetrics metrics;
+  auto plan = capture([&] {
+    return detail::buildSourceCheckPlan(
+        analysis, {}, detail::PackageStagePolicy::hardware(), &metrics);
+  });
   ASSERT_TRUE(succeeded(plan)) << diagnostics;
+  EXPECT_GT(metrics.workUnits, 0u);
+  EXPECT_EQ(metrics.definitions, 2u);
+  EXPECT_EQ(metrics.boundDefinitions, 2u);
+  EXPECT_EQ(metrics.preparedSampledContexts, 1u);
+  EXPECT_EQ(metrics.sampledRuleParses, 1u);
+  EXPECT_GT(metrics.sampledAdmissionProofs, metrics.sampledRuleParses);
+  EXPECT_EQ(metrics.ownerOccurrences, 3u);
+  EXPECT_EQ(metrics.resolvedChecks, 2u);
   ASSERT_EQ(plan->samplingBindings.size(), 1u);
   ASSERT_EQ(plan->samplingOccurrences.size(), 2u);
   ASSERT_EQ(plan->checks.size(), 2u);

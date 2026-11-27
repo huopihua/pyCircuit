@@ -737,13 +737,13 @@ def module_header(header, symbol):
 
 
 def parameter_kinds(header, symbol):
+    operation = module_header(header, symbol)
+    parameters = operation[operation.rfind("ac.parameters = ") :]
     return {
         json.loads(fields["name"]): dictionary(fields["constraint"][1:-1])[
             "source_kind"
         ]
-        for item in split_fields(
-            attribute(module_header(header, symbol), "ac.parameters")
-        )
+        for item in split_fields(attribute(parameters, "ac.parameters"))
         for fields in [dictionary(item[1:-1])]
     }
 
@@ -801,7 +801,7 @@ def assert_negative_diagnostic(name, diagnostic):
     if case in ("partial-index", "third-partial-match"):
         assert "unknown hardware value" in diagnostic, diagnostic
     if case == "owner-target":
-        assert "persistent owner formal" in diagnostic, diagnostic
+        assert "cannot write an owner" in diagnostic, diagnostic
     if case == "immutable-rebind":
         assert "shadow a binding" in diagnostic, diagnostic
     if case == "observe-producer":
@@ -980,10 +980,12 @@ assert [
 ] == FIELDS
 assert '"ac.bits.extract"' in body and '"ac.bits.binary"' in body
 assert all(f'"ac.{name}"' not in body for name in ("reg", "variable", "table"))
-assert (
-    attribute(module_header(header, "priority_probe.design.Top"), "ac.domain_inputs")
-    == ""
-)
+top_header = module_header(header, "priority_probe.design.Top")
+domain_inputs = top_header[top_header.rfind("ac.domain_inputs = ") :]
+assert dictionary(attribute(domain_inputs, "ac.domain_inputs")) == {
+    "clock": f"{len(WIDTHS)} : i64",
+    "reset": f"{len(WIDTHS) + 1} : i64",
+}
 (build / "source-body.ac").write_text(body)
 (build / "consumer.interface.ac").write_text(header)
 (build / "provider.interface.ac").write_text(provider_header)

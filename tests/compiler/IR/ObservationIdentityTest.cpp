@@ -1,5 +1,6 @@
 #include "Compiler/HardwareEmitCommon.h"
 #include "Dialect/ACIR/ACIRSourceContracts.h"
+#include "Dialect/ACIR/SourceCheckBudget.h"
 #include "Dialect/ACIR/HardwareSourceChecks.h"
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/IR/Builders.h"
@@ -255,6 +256,47 @@ protected:
                         f("ordinal", closed.get("ordinal"))}));
   }
 };
+
+TEST_F(ObservationIdentityTest,
+       HardwareEmissionPlanFreezesDefinitionInventoryAndReachability) {
+  beginPackage();
+  auto child = module("Child", "child.py");
+  finish(child);
+  auto root = module("Root", "root.py");
+  auto allocation = instance(root, child, 3, "child");
+  finish(root);
+  auto unused = module("Unused", "unused.py");
+  finish(unused);
+  system(root);
+
+  ac::HardwareAnalysis analysis(*package);
+  acir::compiler::HardwareEmitContext emitter(*package, analysis);
+  ASSERT_TRUE(succeeded(emitter.prepareNativeChecks())) << diagnostics;
+
+  auto rootId = emitter.definitionId(root);
+  auto childId = emitter.definitionId(child);
+  auto unusedId = emitter.definitionId(unused);
+  ASSERT_TRUE(rootId.has_value());
+  ASSERT_TRUE(childId.has_value());
+  ASSERT_TRUE(unusedId.has_value());
+  EXPECT_NE(*rootId, *childId);
+  EXPECT_NE(*rootId, *unusedId);
+
+  const auto &rootPlan = emitter.definitionPlan(*rootId);
+  ASSERT_EQ(rootPlan.children.size(), 1u);
+  EXPECT_EQ(rootPlan.children.front().occurrence, allocation.getOperation());
+  EXPECT_EQ(rootPlan.children.front().callee, child.getOperation());
+  ASSERT_TRUE(rootPlan.children.front().definition.has_value());
+  EXPECT_EQ(*rootPlan.children.front().definition, *childId);
+  ASSERT_EQ(rootPlan.dependencies.size(), 1u);
+  EXPECT_EQ(rootPlan.dependencies.front(), *childId);
+  EXPECT_TRUE(rootPlan.reachableFromRoot);
+  EXPECT_TRUE(emitter.definitionPlan(*childId).reachableFromRoot);
+  EXPECT_FALSE(emitter.definitionPlan(*unusedId).reachableFromRoot);
+  EXPECT_EQ(emitter.rootReachableDefinitions().size(), 2u);
+  ASSERT_EQ(rootPlan.independentWorkSubtrees.size(), 1u);
+  EXPECT_EQ(rootPlan.independentWorkSubtrees.front(), allocation.getOperation());
+}
 
 TEST_F(ObservationIdentityTest, ClosedIdentitySchemaAcceptsOnlyFiveFields) {
   auto valid = identity("Root", 1, "Root", 2, 3);
@@ -548,12 +590,12 @@ TEST_F(ObservationIdentityTest,
   widthTwo.integers["WIDTH"] =
       cast<ac::MathIntAttr>(parseAttribute("#ac.math_int<2>", &context));
   ac::HardwareAnalysis analysis(*package);
-  auto noCharge = [](uint64_t, Operation *) { return success(); };
   auto verifyScopes =
       [&](ArrayRef<std::pair<ac::ModuleOp, ac::HardwareBindings>> scopes) {
         return capture([&] {
+          ac::detail::SourceCheckBudget budget({});
           return ac::detail::verifySourceCheckDependencies(analysis, scopes,
-                                                           noCharge);
+                                                           budget);
         });
       };
   const std::pair<ac::ModuleOp, ac::HardwareBindings> valid{child, widthOne};
@@ -689,8 +731,10 @@ TEST_F(ObservationIdentityTest,
   ASSERT_TRUE(succeeded(plan())) << diagnostics;
   ac::HardwareAnalysis analysis(*package);
   acir::compiler::HardwareEmitContext emitter(*package, analysis);
-  ASSERT_TRUE(succeeded(emitter.prepareNativeChecks())) << diagnostics;
-  EXPECT_TRUE(failed(acir::compiler::observationEmissionPlan(emitter)));
+  EXPECT_TRUE(failed(capture([&] { return emitter.prepareNativeChecks(); })));
+  EXPECT_NE(diagnostics.find("binding-dependent observation geometry"),
+            std::string::npos)
+      << diagnostics;
 }
 
 TEST_F(ObservationIdentityTest, OwnerPathCannotCrossCollection) {

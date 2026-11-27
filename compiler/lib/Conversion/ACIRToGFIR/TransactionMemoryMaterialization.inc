@@ -14,7 +14,17 @@
       memoryReadPrefixes[id] = prefix;
     const auto &owner = plan.memoryOwners[found->owner];
     if (found->result) {
-      auto data = bound(owner.outputs[owner.layout.dataResult(found->port)]);
+      FailureOr<Value> data = failure();
+      auto proposal = llvm::find_if(
+          prepared.memoryProposals,
+          [&](const auto &candidate) { return candidate.access == id; });
+      if (found->kind == ac::TransactionMemoryAccessKind::Read &&
+          proposal != prepared.memoryProposals.end() &&
+          proposal->readChannel &&
+          *proposal->readChannel < memoryReadValues.size())
+        data = memoryReadValues[*proposal->readChannel];
+      else
+        data = bound(owner.outputs[owner.layout.dataResult(found->port)]);
       Value original = plan.values[*found->result].value;
       if (failed(data) || !prepayValueMapping(budget, operation, frames[frame], original)) return failure();
       frames[frame].map(original, *data);

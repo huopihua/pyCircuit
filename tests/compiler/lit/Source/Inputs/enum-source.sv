@@ -9,6 +9,7 @@ module tb;
   initial begin
 `ifdef ENUM_SOURCE_MANAGED
     pyc_7079635f636c6b=0;pyc_7079635f727374=0;
+    #1; // Let primitive initializers and combinational init pins settle.
     pyc_root_commit_ok=1;pyc_phase=4;#1;pyc_phase=2;#1;
     pyc_phase=0;pyc_root_commit_ok=0;#1;
 `elsif ENUM_SOURCE_STATE
@@ -35,6 +36,7 @@ module tb;
 `ifdef ENUM_SOURCE_STATE
         pyc_7079635f636c6b=next_clock;
 `ifdef ENUM_SOURCE_MANAGED
+        #1; // Settle the new clock pin before PREPARE samples it.
         pyc_root_commit_ok=0;pyc_phase=1;#1;
         pyc_root_commit_ok=1;pyc_phase=2;#1;
         pyc_phase=0;pyc_root_commit_ok=0;#1;

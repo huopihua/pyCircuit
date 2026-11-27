@@ -73,6 +73,19 @@
             if (reads) {
               Value value = call.getResult(0);
               Value committed = bound(owner.outputs[layout->dataResult(access.port)]);
+              if (kind == ac::TransactionMemoryAccessKind::Read) {
+                auto proposalIndex = memoryProposalByAccess[memoryIndex];
+                if (!proposalIndex ||
+                    *proposalIndex >= preparation.memoryProposals.size() ||
+                    !preparation.memoryProposals[*proposalIndex].readChannel)
+                  return reject("original Memory read channel is absent");
+                const auto &proposal =
+                    preparation.memoryProposals[*proposalIndex];
+                auto routedRead = memoryReadValue(
+                    preparation, rule, *proposal.readChannel);
+                if (failed(routedRead)) return failure();
+                committed = *routedRead;
+              }
               if (failed(replay.identify(*access.result, value, anchor, frame)) ||
                   failed(replay.assignValidity(*access.result, point())) ||
                   record.frames[frame].lookupOrNull(value) != committed)

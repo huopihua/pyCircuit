@@ -27,6 +27,7 @@ import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
+from ._metrics import publish_metrics
 from ._publication import (
     _publication_lock_set,
     _publication_owner_source_unit,
@@ -161,6 +162,7 @@ def _compile_source_unit(
     replace: bool = False,
     cancelled: Callable[[str], bool] | None = None,
     filesystem: _PublicationFileSystem | None = None,
+    metrics_out: str | Path | None = None,
 ) -> _SourceCompileResult:
     """Compile one source and atomically publish its source-unit directory."""
 
@@ -235,6 +237,7 @@ def _compile_source_unit(
             body_path = scratch / f"{stem}.ac.tmp"
             interface_path = scratch / f"{stem}.interface.ac.tmp"
             deps_path = scratch / "consumed.json"
+            metrics_path = scratch / "compile-metrics.json"
             command = [
                 str(compiler),
                 "--capture",
@@ -250,11 +253,15 @@ def _compile_source_unit(
                 "--deps-out",
                 str(deps_path),
             ]
+            if metrics_out is not None:
+                command.extend(("--metrics-out", str(metrics_path)))
             for header_path in header_paths:
                 command.extend(("--header", str(header_path)))
             completed = subprocess.run(
                 command, text=True, capture_output=True, check=False
             )
+            if metrics_out is not None:
+                publish_metrics(metrics_path, metrics_out)
             if completed.returncode != 0:
                 detail = completed.stderr.strip() or completed.stdout.strip()
                 raise _PublicationError(

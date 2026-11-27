@@ -105,14 +105,15 @@ FailureOr<OwningOpRef<mlir::ModuleOp>> materializeHardwareState(
 }
 
 LogicalResult verifyHardwareStateMaterialization(
-    mlir::ModuleOp routed, mlir::ModuleOp candidate, SourceCheckBudget &budget) {
+    mlir::ModuleOp routed, mlir::ModuleOp candidate, SourceCheckBudget &budget,
+    acir::metrics::CompilerPhaseMetrics *metrics) {
   budget.setPhase("routed hardware state correspondence proof");
   if (!candidate || failed(ac::verifyRoutedPackage(routed))) return failure();
   auto primitives = hardwareStatePrimitives(routed, budget);
   if (failed(primitives) ||
       failed(HardwareStateProof(routed, candidate, budget, *primitives).run()))
     return failure();
-  return ac::verifyHardwarePackage(candidate);
+  return ac::verifyHardwarePackage(candidate, metrics);
 }
 } // namespace detail
 
@@ -122,6 +123,12 @@ class LowerTransactionsPass
     : public PassWrapper<LowerTransactionsPass, OperationPass<mlir::ModuleOp>> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerTransactionsPass)
+  LowerTransactionsPass() = default;
+  explicit LowerTransactionsPass(
+      acir::metrics::CompilerPhaseMetrics *finalVerification)
+      : finalVerification(finalVerification) {}
+  LowerTransactionsPass(const LowerTransactionsPass &other)
+      : PassWrapper(other), finalVerification(other.finalVerification) {}
   void getDependentDialects(DialectRegistry &registry) const override {
     // Refinement consumes the routed GFIR state classes concretely.
     registry.insert<ac::ACIRDialect, acir::gfir::GFIRDialect>();
@@ -134,7 +141,12 @@ public:
     auto input = getOperation();
     auto stage = input->getAttrOfType<StringAttr>("ac.stage");
     if (stage && stage.getValue() == "final") {
-      if (failed(ac::verifyHardwarePackage(input))) signalPassFailure();
+      if (failed(ac::verifyHardwarePackage(input, finalVerification))) {
+        signalPassFailure();
+        return;
+      }
+      if (finalVerification)
+        finalVerification->status = "complete";
       return;
     }
     if (!stage || stage.getValue() != "routed") {
@@ -150,20 +162,27 @@ public:
     if (ac::detail::findUnloweredTransaction(input))
       limits.maxWorkUnits = 1024 * 1024;
     SourceCheckBudget budget(limits);
+    budget.setMetrics(finalVerification);
     auto candidate = detail::materializeHardwareState(input, budget);
     if (failed(candidate) || failed(detail::verifyHardwareStateMaterialization(
-                                 input, **candidate, budget))) {
+                                 input, **candidate, budget,
+                                 finalVerification))) {
       signalPassFailure();
       return;
     }
     acceptTransactionCandidate(input, **candidate);
+    if (finalVerification)
+      finalVerification->status = "complete";
   }
+private:
+  acir::metrics::CompilerPhaseMetrics *finalVerification = nullptr;
 };
 
 } // namespace
 
-std::unique_ptr<Pass> createLowerTransactionsPass() {
-  return std::make_unique<LowerTransactionsPass>();
+std::unique_ptr<Pass> createLowerTransactionsPass(
+    acir::metrics::CompilerPhaseMetrics *finalVerification) {
+  return std::make_unique<LowerTransactionsPass>(finalVerification);
 }
 
 } // namespace acir

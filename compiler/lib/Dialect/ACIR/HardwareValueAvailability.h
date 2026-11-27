@@ -5,6 +5,7 @@
 #include "llvm/ADT/DenseSet.h"
 
 namespace acir::ac::detail {
+class SourceCheckBudget;
 // Prove that selecting a row cannot change the existing availability plane.
 // This follows exact capture ordinals and uniform interface/storage producers;
 // row-dependent constructors/maps keep the selected-row proof path.
@@ -18,6 +19,11 @@ mlir::LogicalResult
 verifyHardwareValueAvailability(
     const HardwareAnalysis &analysis,
     const std::function<mlir::LogicalResult(uint64_t, mlir::Operation *)> &debit = {});
+/// The package planner overload bounds each independently replayable
+/// availability assertion while retaining immutable expression facts between
+/// assertions. A single indivisible assertion must still fit the same budget.
+mlir::LogicalResult verifyHardwareValueAvailability(
+    const HardwareAnalysis &analysis, SourceCheckBudget &budget);
 // These edges transport availability exclusively to checked companion ports
 // or require operands. A shared data use disqualifies the complete route.
 mlir::FailureOr<llvm::DenseSet<mlir::OpOperand *>>

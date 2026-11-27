@@ -68,6 +68,11 @@ ArrayRef<MemoryCallPlan> SourceMemoryBindingsAnalysis::memoryCalls() const {
 ArrayRef<ModuleDomainPlan> SourceMemoryBindingsAnalysis::moduleDomains() const {
   return valid ? declarations->moduleDomains() : ArrayRef<ModuleDomainPlan>();
 }
+void SourceMemoryBindingsAnalysis::collectMetrics(
+    acir::metrics::CompilerPhaseMetrics &metrics) const {
+  if (declarations)
+    declarations->collectMetrics(metrics);
+}
 FailureOr<OwningOpRef<ModuleOp>> SourceMemoryBindingsAnalysis::lower(
     DictionaryAttr owner, const SourceHeaderRegistry &headers) {
   if (!initialized || !valid || consumed || !matchesInputs(owner, headers))
@@ -84,8 +89,13 @@ public:
   InferSourceBindingsPass() = default;
   InferSourceBindingsPass(DictionaryAttr owner, const SourceHeaderRegistry &headers)
       : owner(owner), headers(&headers) {}
+  InferSourceBindingsPass(DictionaryAttr owner,
+                          const SourceHeaderRegistry &headers,
+                          acir::metrics::CompilerPhaseMetrics *metrics)
+      : owner(owner), headers(&headers), metrics(metrics) {}
   InferSourceBindingsPass(const InferSourceBindingsPass &other)
-      : PassWrapper(other), owner(other.owner), headers(other.headers) {}
+      : PassWrapper(other), owner(other.owner), headers(other.headers),
+        metrics(other.metrics) {}
   StringRef getArgument() const final { return "ac-infer-source-bindings"; }
   StringRef getDescription() const final {
     return "Resolve source allocation geometry, bindings and hidden domains";
@@ -129,8 +139,12 @@ public:
       admittedHeaders = &*standaloneRegistry;
     }
     auto &analysis = getAnalysis<SourceMemoryBindingsAnalysis>();
-    if (failed(analysis.initialize(admittedOwner, *admittedHeaders,
-                                  getAnalysis<SourceRuleWritesAnalysis>()))) {
+    auto initialized = analysis.initialize(
+        admittedOwner, *admittedHeaders,
+        getAnalysis<SourceRuleWritesAnalysis>());
+    if (metrics)
+      analysis.collectMetrics(*metrics);
+    if (failed(initialized)) {
       signalPassFailure();
       return;
     }
@@ -153,6 +167,7 @@ public:
 private:
   DictionaryAttr owner;
   const SourceHeaderRegistry *headers = nullptr;
+  acir::metrics::CompilerPhaseMetrics *metrics = nullptr;
   Option<std::string> package{*this, "package", llvm::cl::desc("Source package")};
   Option<std::string> sourcePath{*this, "source-path", llvm::cl::desc("Source owner path")};
   ListOption<std::string> headerFiles{*this, "headers", llvm::cl::desc("Published interface paths")};
@@ -160,8 +175,9 @@ private:
 };
 } // namespace
 std::unique_ptr<Pass> createInferSourceBindingsPass(
-    DictionaryAttr owner, const SourceHeaderRegistry &headers) {
-  return std::make_unique<InferSourceBindingsPass>(owner, headers);
+    DictionaryAttr owner, const SourceHeaderRegistry &headers,
+    acir::metrics::CompilerPhaseMetrics *metrics) {
+  return std::make_unique<InferSourceBindingsPass>(owner, headers, metrics);
 }
 void registerSourceBindingsPass() {
   registerPass([] { return std::make_unique<InferSourceBindingsPass>(); });

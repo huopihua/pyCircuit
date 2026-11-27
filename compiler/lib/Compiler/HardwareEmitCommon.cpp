@@ -748,6 +748,8 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
   auto root = rootBindings();
   if (failed(root))
     return failure();
+  if (failed(prepareDefinitionInventories()))
+    return failure();
   auto checkInteger = [&](Attribute value, Operation *site) -> LogicalResult {
     auto integer = dyn_cast<ac::MathIntAttr>(value);
     if (!integer)
@@ -890,34 +892,27 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
       if (failed(checkInteger(actual, module)))
         return failure();
     }
-    auto result = module.walk([&](Operation *op) {
+    const auto &definition = definitionPlan(module);
+    for (Operation *op : definition.operations) {
       for (auto attr : op->getAttrs())
         if (failed(inspect(attr.getValue(), bindings, op, false)))
-          return WalkResult::interrupt();
+          return failure();
       for (Type type : op->getResultTypes())
         if (failed(inspect(TypeAttr::get(type), bindings, op, false)))
-          return WalkResult::interrupt();
+          return failure();
       for (Type type : op->getOperandTypes())
         if (failed(inspect(TypeAttr::get(type), bindings, op, false)))
-          return WalkResult::interrupt();
-      return WalkResult::advance();
-    });
-    if (result.wasInterrupted())
-      return failure();
+          return failure();
+      for (Type type : op->getResultTypes())
+        if (failed(checkWidth(type, bindings, op, multiplicity)))
+          return failure();
+    }
     for (Type type : module.getFunctionType().getInputs())
       if (failed(checkWidth(type, bindings, module, multiplicity)))
         return failure();
     for (Type type : module.getFunctionType().getResults())
       if (failed(checkWidth(type, bindings, module, multiplicity)))
         return failure();
-    auto widths = module.walk([&](Operation *op) {
-      for (Type type : op->getResultTypes())
-        if (failed(checkWidth(type, bindings, op, multiplicity)))
-          return WalkResult::interrupt();
-      return WalkResult::advance();
-    });
-    if (widths.wasInterrupted())
-      return failure();
     for (auto &op : module.getBody().front()) {
       if (auto queue = dyn_cast<ac::InstanceOp>(op);
           queue && ac::isQueueInstance(queue)) {
@@ -1158,7 +1153,8 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
     physicalProjection_ = *projection;
   }
   sourceChecks_ = std::move(*checks);
-  if (failed(prepareDefinitionEmissionPlans(cast<ac::ModuleOp>(root->owner))))
+  if (failed(
+          completeDefinitionEmissionPlans(cast<ac::ModuleOp>(root->owner))))
     return failure();
   auto observation = buildObservationPlan(*this);
   if (failed(observation))
@@ -1170,7 +1166,7 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
   return success();
 }
 LogicalResult
-HardwareEmitContext::prepareDefinitionEmissionPlans(ac::ModuleOp root) {
+HardwareEmitContext::prepareDefinitionInventories() {
   auto definitions = analysis.getDefinitions();
   if (definitions.size() > std::numeric_limits<HardwareDefinitionId>::max())
     return package.emitOpError() << "too many hardware definitions to emit";
@@ -1181,9 +1177,20 @@ HardwareEmitContext::prepareDefinitionEmissionPlans(ac::ModuleOp root) {
     HardwareDefinitionEmissionPlan plan;
     plan.id = id;
     plan.definition = definition;
+    if (metrics_)
+      ++metrics_->irWalks;
+    definition.walk([&](Operation *operation) {
+      if (metrics_)
+        ++metrics_->visitedNodes;
+      plan.operations.push_back(operation);
+    });
     definitionPlans_.push_back(std::move(plan));
   }
+  return success();
+}
 
+LogicalResult
+HardwareEmitContext::completeDefinitionEmissionPlans(ac::ModuleOp root) {
   llvm::StringSet<> standardSources;
   auto addStandardSource = [&](std::string path) {
     if (standardSources.insert(path).second)
@@ -1191,20 +1198,16 @@ HardwareEmitContext::prepareDefinitionEmissionPlans(ac::ModuleOp root) {
   };
   for (auto &plan : definitionPlans_) {
     llvm::SmallDenseSet<HardwareDefinitionId, 8> dependencies;
-    if (metrics_)
-      ++metrics_->irWalks;
-    WalkResult scanned = plan.definition.walk([&](Operation *operation) {
+    for (Operation *operation : plan.operations) {
       if (operation == plan.definition.getOperation())
-        return WalkResult::advance();
-      if (metrics_)
-        ++metrics_->visitedNodes;
+        continue;
       bool topLevel =
           operation->getBlock() == &plan.definition.getBody().front();
       if (topLevel && isa<ac::SourceObserveOp>(operation))
         plan.observations.push_back(operation);
       if (auto splat = dyn_cast<ac::TableSplatOp>(operation)) {
         ++plan.tableSplats;
-        return WalkResult::advance();
+        continue;
       }
       if (isa<ac::TableMapOp, ac::TableMatchOp>(operation)) {
         ArrayAttr shape =
@@ -1218,10 +1221,10 @@ HardwareEmitContext::prepareDefinitionEmissionPlans(ac::ModuleOp root) {
                                ? HardwareTableRegionLowering::Procedural
                                : HardwareTableRegionLowering::Generated,
                            closedTableLaneCount(*this, shape, operation)});
-        return WalkResult::advance();
+        continue;
       }
       if (!topLevel || !isa<ac::InstanceOp, ac::CollectionOp>(operation))
-        return WalkResult::advance();
+        continue;
       Operation *callee =
           isa<ac::InstanceOp>(operation)
               ? analysis.resolveCallee(cast<ac::InstanceOp>(operation))
@@ -1237,7 +1240,7 @@ HardwareEmitContext::prepareDefinitionEmissionPlans(ac::ModuleOp root) {
         if (found == definitionIds_.end()) {
           operation->emitOpError()
               << "resolved child definition is absent from emission plan";
-          return WalkResult::interrupt();
+          return failure();
         }
         child.definition = found->second;
         if (dependencies.insert(*child.definition).second)
@@ -1246,10 +1249,7 @@ HardwareEmitContext::prepareDefinitionEmissionPlans(ac::ModuleOp root) {
       if (child.queue)
         addStandardSource("include/verilog/fifo.v");
       plan.children.push_back(std::move(child));
-      return WalkResult::advance();
-    });
-    if (scanned.wasInterrupted())
-      return failure();
+    }
     auto work = analysis.getIndependentWorkSubtrees(plan.definition);
     if (failed(work))
       return failure();
@@ -1293,10 +1293,12 @@ HardwareEmitContext::prepareDefinitionEmissionPlans(ac::ModuleOp root) {
         rootReachableDefinitions_.capacity() * sizeof(HardwareDefinitionId) +
         standardRtlSources_.capacity() * sizeof(std::string);
     for (const auto &plan : definitionPlans_) {
-      entries += plan.children.size() + plan.dependencies.size() +
+      entries += plan.operations.size() + plan.children.size() +
+                 plan.dependencies.size() +
                  plan.independentWorkSubtrees.size() +
                  plan.observations.size() + plan.tableRegions.size();
-      bytes += plan.children.capacity() * sizeof(HardwareEmissionChild) +
+      bytes += plan.operations.capacity() * sizeof(Operation *) +
+               plan.children.capacity() * sizeof(HardwareEmissionChild) +
                plan.dependencies.capacity() * sizeof(HardwareDefinitionId) +
                plan.independentWorkSubtrees.capacity() * sizeof(Operation *) +
                plan.observations.capacity() * sizeof(Operation *) +

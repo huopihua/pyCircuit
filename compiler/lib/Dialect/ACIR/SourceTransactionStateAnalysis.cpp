@@ -500,8 +500,7 @@ struct PackageInventory {
   llvm::DenseMap<Attribute, uint64_t> methodCosts;
   /// Definition-owned declaration index. A null value marks an ambiguous
   /// duplicate name so lookup preserves the old fail-closed diagnostic.
-  llvm::DenseMap<Operation *, llvm::DenseMap<StringAttr, Operation *>>
-      moduleStates;
+  llvm::DenseMap<Operation *, TransactionModuleStateIndex> moduleStates;
   llvm::DenseMap<Operation *, SmallVector<SourceMethodCallOp, 0>>
       moduleMethodCalls;
 };
@@ -560,6 +559,33 @@ LogicalResult buildDefinitionPlans(
           return failure();
         plan.branchSelections.try_emplace(branch, effectful);
       }
+      bool isCallable = operation == plan.callable;
+      for (auto [regionOrdinal, region] :
+           llvm::enumerate(operation->getRegions()))
+        for (Block &block : region) {
+          if (!isCallable && !isa<SourceBranchOp>(operation))
+            continue;
+          if (isCallable && regionOrdinal > 1)
+            continue;
+          if (!budget.chargeStorage<TransactionDefinitionBlockPlan>(operation,
+                                                                    1) ||
+              !budget.reserve(operation, plan.blocks, 1) ||
+              !budget.reserveMapInsert(operation, plan.blockIndex))
+            return failure();
+          TransactionDefinitionBlockPlan blockPlan;
+          blockPlan.block = &block;
+          for (Operation &statement : block.without_terminator()) {
+            if (!budget.chargeStorage<Operation *>(operation, 1) ||
+                !budget.reserve(operation, blockPlan.statements, 1))
+              return failure();
+            blockPlan.statements.push_back(&statement);
+          }
+          TransactionDefinitionBlockPlanId blockId = plan.blocks.size();
+          plan.blocks.push_back(std::move(blockPlan));
+          if (!plan.blockIndex.try_emplace(&block, blockId).second)
+            return operation->emitOpError()
+                   << "transaction definition block inventory is duplicated";
+        }
       if (effectful) {
         Operation *ancestor = operation;
         while ((ancestor = ancestor->getParentOp()) && ancestor != callable) {
@@ -616,6 +642,160 @@ LogicalResult buildDefinitionPlans(
       if (isa<SourceTransactionOp, SourceMethodOp>(operation) &&
           failed(append(&operation)))
         return failure();
+  return success();
+}
+
+LogicalResult authenticateFrozenDefinitionPlans(
+    mlir::ModuleOp package, StateAnalysisBudget &budget,
+    ArrayRef<TransactionDefinitionPlan> frozenPlans,
+    DenseMap<Operation *, TransactionDefinitionPlanId> &definitionIndex,
+    DenseMap<Operation *, TransactionDefinitionPlanId> &operationIndex,
+    uint64_t &summaryOperationVisits) {
+  uint64_t callableOrdinal = 0;
+  for (auto module : package.getOps<ModuleOp>())
+    for (Operation &operation : module.getBody().front()) {
+      if (!isa<SourceTransactionOp, SourceMethodOp>(operation))
+        continue;
+      if (!budget.charge(&operation) || callableOrdinal >= frozenPlans.size() ||
+          frozenPlans[callableOrdinal].callable != &operation)
+        return boundedError(&operation)
+               << "transaction source definition inventory differs";
+      ++callableOrdinal;
+    }
+  if (callableOrdinal != frozenPlans.size())
+    return boundedError(package)
+           << "transaction source definition inventory differs";
+
+  for (auto [id, frozen] : llvm::enumerate(frozenPlans)) {
+    Operation *callable = frozen.callable;
+    if (!callable ||
+        frozen.lexicalModule != callable->getParentOfType<ModuleOp>() ||
+        !budget.reserveTemporaryMapInsert(callable, definitionIndex) ||
+        !definitionIndex.try_emplace(callable, id).second)
+      return boundedError(callable ? callable : package.getOperation())
+             << "transaction source definition identity differs";
+    struct Visit {
+      Operation *operation;
+      unsigned depth;
+    };
+    SmallVector<Visit, 0> pending;
+    DenseSet<Operation *> effectfulBranches;
+    if (!budget.chargeTemporaryStorage<Visit>(callable, 1) ||
+        !budget.reserveTemporary(callable, pending, 1))
+      return failure();
+    pending.push_back({callable, 0});
+    uint64_t operationOrdinal = 0, blockOrdinal = 0;
+    uint64_t readCount = 0, writeCount = 0, formalWriteCount = 0, callCount = 0,
+             bodyCheckCount = 0, observationCount = 0, branchCount = 0,
+             branchResultCount = 0;
+    while (!pending.empty()) {
+      auto [operation, depth] = pending.pop_back_val();
+      ++summaryOperationVisits;
+      if (depth > maxDepth || !budget.charge(operation) ||
+          operationOrdinal >= frozen.operations.size() ||
+          frozen.operations[operationOrdinal++] != operation)
+        return boundedError(operation)
+               << "transaction source definition plan differs";
+      readCount += isa<SourceStateReadOp>(operation);
+      writeCount += isa<SourceStateWriteOp>(operation);
+      formalWriteCount += isa<SourceFormalWriteOp>(operation);
+      callCount += isa<SourceMethodCallOp>(operation);
+      bodyCheckCount += isa<SourceExpectOp>(operation);
+      observationCount += isa<SourceObserveOp>(operation);
+      if (auto branch = dyn_cast<SourceBranchOp>(operation)) {
+        ++branchCount;
+        branchResultCount += branch.getNumResults();
+        if (!frozen.needsSelection(branch))
+          return boundedError(operation)
+                 << "transaction source branch inventory differs";
+      }
+      bool effectful =
+          isa<SourceMethodCallOp, SourceExpectOp, SourceObserveOp,
+              SourceQueuePopOp, SourceQueuePeekOp, SourceQueuePushOp>(
+              operation) ||
+          operation->hasAttr("ac.loop_continuation");
+      if (effectful) {
+        Operation *ancestor = operation;
+        while ((ancestor = ancestor->getParentOp()) && ancestor != callable) {
+          if (!budget.charge(operation))
+            return failure();
+          if (auto branch = dyn_cast<SourceBranchOp>(ancestor)) {
+            auto expected = frozen.needsSelection(branch);
+            if (!expected || !*expected)
+              return boundedError(operation)
+                     << "transaction source branch-effect plan differs";
+            if (!effectfulBranches.contains(branch)) {
+              if (!budget.reserveTemporaryMapInsert(operation,
+                                                    effectfulBranches))
+                return failure();
+              effectfulBranches.insert(branch);
+            }
+          }
+        }
+      }
+      bool isCallable = operation == callable;
+      for (auto [regionOrdinal, region] :
+           llvm::enumerate(operation->getRegions()))
+        for (Block &block : region) {
+          if (!isCallable && !isa<SourceBranchOp>(operation))
+            continue;
+          if (isCallable && regionOrdinal > 1)
+            continue;
+          if (!budget.charge(operation) || blockOrdinal >= frozen.blocks.size())
+            return boundedError(operation)
+                   << "transaction source definition schedule differs";
+          const auto &expected = frozen.blocks[blockOrdinal++];
+          if (expected.block != &block ||
+              expected.statements.size() !=
+                  llvm::range_size(block.without_terminator()))
+            return boundedError(operation)
+                   << "transaction source definition schedule differs";
+          for (auto [statement, frozenStatement] :
+               llvm::zip_equal(block.without_terminator(), expected.statements))
+            if (&statement != frozenStatement)
+              return boundedError(operation)
+                     << "transaction source definition schedule differs";
+        }
+      for (Region &region : llvm::reverse(operation->getRegions()))
+        for (Block &block : llvm::reverse(region))
+          for (Operation &child : llvm::reverse(block)) {
+            if (!budget.chargeTemporaryStorage<Visit>(operation, 1) ||
+                !budget.reserveTemporary(operation, pending, 1))
+              return failure();
+            pending.push_back({&child, depth + 1});
+          }
+    }
+    if (operationOrdinal != frozen.operations.size() ||
+        blockOrdinal != frozen.blocks.size() || readCount != frozen.readCount ||
+        writeCount != frozen.writeCount ||
+        formalWriteCount != frozen.formalWriteCount ||
+        callCount != frozen.callCount ||
+        bodyCheckCount != frozen.bodyCheckCount ||
+        observationCount != frozen.observationCount ||
+        branchCount != frozen.branchCount ||
+        branchResultCount != frozen.branchResultCount ||
+        effectfulBranches.size() != frozen.selectionCount)
+      return boundedError(callable)
+             << "transaction source definition plan differs";
+    for (const auto &entry : frozen.branchSelections)
+      if (entry.second != effectfulBranches.contains(entry.first))
+        return boundedError(callable)
+               << "transaction source branch-effect plan differs";
+    for (Operation *operation : frozen.operations) {
+      if (!isa<SourceTransactionOp, SourceMethodOp, SourceBranchOp,
+               SourceMethodCallOp, SourceStateReadOp, SourceStateWriteOp,
+               SourceFormalWriteOp, SourceExpectOp, SourceObserveOp,
+               SourceQueuePopOp, SourceQueuePeekOp, SourceQueuePushOp>(
+              operation) &&
+          !operation->hasAttr("ac.loop_continuation"))
+        continue;
+      if (!budget.reserveTemporaryMapInsert(operation, operationIndex) ||
+          !operationIndex.try_emplace(operation, id).second)
+        return boundedError(operation)
+               << "transaction operation belongs to multiple definition "
+                  "plans";
+    }
+  }
   return success();
 }
 
@@ -3964,12 +4144,14 @@ void runTransactionStateAnalysis(
     Operation *op, SmallVector<TransactionDefinitionPlan, 0> &definitionPlans,
     DenseMap<Operation *, TransactionDefinitionPlanId> &definitionIndex,
     DenseMap<Operation *, TransactionDefinitionPlanId> &definitionOperationIndex,
+    DenseMap<Operation *, TransactionModuleStateIndex> &moduleStates,
     SmallVector<TransactionStatePlan, 0> &plans, uint64_t &analysisWork,
     uint64_t &definitionSummaryBuilds,
     uint64_t &definitionSummaryOperationVisits, uint64_t &irWalks,
     uint64_t &visitedNodes, bool &valid,
     std::optional<ArrayRef<const TransactionStatePlan *>> expected =
-        std::nullopt) {
+        std::nullopt,
+    ArrayRef<TransactionDefinitionPlan> expectedDefinitions = {}) {
   auto package = dyn_cast_or_null<mlir::ModuleOp>(op);
   if (!package) {
     if (op)
@@ -3985,12 +4167,20 @@ void runTransactionStateAnalysis(
   if (failed(mlir::verify(package)))
     return;
   visitedNodes += inventory.operationCosts.size();
-  budget.setPhase("definition plan construction");
-  if (failed(buildDefinitionPlans(package, budget, definitionPlans,
-                                  definitionIndex, definitionOperationIndex,
-                                  definitionSummaryBuilds,
-                                  definitionSummaryOperationVisits)))
-    return;
+  if (expectedDefinitions.empty()) {
+    budget.setPhase("definition plan construction");
+    if (failed(buildDefinitionPlans(package, budget, definitionPlans,
+                                    definitionIndex, definitionOperationIndex,
+                                    definitionSummaryBuilds,
+                                    definitionSummaryOperationVisits)))
+      return;
+  } else {
+    budget.setPhase("definition plan authentication");
+    if (failed(authenticateFrozenDefinitionPlans(
+            package, budget, expectedDefinitions, definitionIndex,
+            definitionOperationIndex, definitionSummaryOperationVisits)))
+      return;
+  }
   budget.setPhase("resolver preparation");
   if (failed(priceResolver(package, budget, inventory)))
     return;
@@ -4011,7 +4201,9 @@ void runTransactionStateAnalysis(
             &definition, package, &definition, publishWorkStorage)))
       return;
   TransactionStructuralFacts structuralFacts;
-  structuralFacts.definitions = definitionPlans;
+  structuralFacts.definitions = expectedDefinitions.empty()
+                                    ? ArrayRef(definitionPlans)
+                                    : expectedDefinitions;
   structuralFacts.definitionIndex = &definitionIndex;
   structuralFacts.definitionOperationIndex = &definitionOperationIndex;
   HardwareAnalysis hardware(package);
@@ -4521,6 +4713,7 @@ void runTransactionStateAnalysis(
     plans = std::move(completed);
   }
   analysisWork = budget.usedWork();
+  moduleStates = std::move(inventory.moduleStates);
   valid = true;
 }
 } // namespace
@@ -4528,24 +4721,48 @@ void runTransactionStateAnalysis(
 SourceTransactionStateAnalysis::SourceTransactionStateAnalysis(Operation *op) {
   runTransactionStateAnalysis(
       op, definitionPlans, definitionPlanIndex, definitionOperationIndex,
-      plans, analysisWork, definitionSummaryBuilds,
+      moduleStates, plans, analysisWork, definitionSummaryBuilds,
       definitionSummaryOperationVisits, irWalks, visitedNodes, valid);
 }
 
+TransactionDefinitionPlanStatistics TransactionDefinitionPlan::statistics() const {
+  TransactionDefinitionPlanStatistics result;
+  result.operations = operations.size();
+  result.branches = branchSelections.size();
+  result.blocks = blocks.size();
+  result.entries = saturatedAdd(
+      result.operations, saturatedAdd(result.branches, result.blocks));
+  result.bytes = saturatedAdd(
+      operations.capacity() * sizeof(Operation *),
+      saturatedAdd(branchSelections.getMemorySize(),
+                   saturatedAdd(blocks.capacity() *
+                                    sizeof(TransactionDefinitionBlockPlan),
+                                blockIndex.getMemorySize())));
+  for (const auto &block : blocks) {
+    result.statements = saturatedAdd(result.statements, block.statements.size());
+    result.entries = saturatedAdd(result.entries, block.statements.size());
+    result.bytes = saturatedAdd(
+        result.bytes, block.statements.capacity() * sizeof(Operation *));
+  }
+  return result;
+}
+
 FailureOr<uint64_t> SourceTransactionStateAnalysis::verifyOccurrences(
-    Operation *op, ArrayRef<const TransactionStatePlan *> expected) {
+    Operation *op, ArrayRef<const TransactionStatePlan *> expected,
+    ArrayRef<TransactionDefinitionPlan> expectedDefinitions) {
   SmallVector<TransactionStatePlan, 0> unused;
   SmallVector<TransactionDefinitionPlan, 0> definitions;
   DenseMap<Operation *, TransactionDefinitionPlanId> definitionIndex;
   DenseMap<Operation *, TransactionDefinitionPlanId> definitionOperationIndex;
+  DenseMap<Operation *, TransactionModuleStateIndex> moduleStates;
   uint64_t work = 0;
   uint64_t summaryBuilds = 0, summaryOperationVisits = 0;
   uint64_t walks = 0, visited = 0;
   bool valid = false;
   runTransactionStateAnalysis(op, definitions, definitionIndex,
-                              definitionOperationIndex, unused, work,
+                              definitionOperationIndex, moduleStates, unused, work,
                               summaryBuilds, summaryOperationVisits, walks,
-                              visited, valid, expected);
+                              visited, valid, expected, expectedDefinitions);
   if (!valid)
     return failure();
   return work;
@@ -4570,11 +4787,9 @@ void SourceTransactionStateAnalysis::collectMetrics(
       definitionPlanIndex.getMemorySize() +
       definitionOperationIndex.getMemorySize();
   for (const auto &definition : definitionPlans) {
-    metrics.planEntries +=
-        definition.operations.size() + definition.branchSelections.size();
-    metrics.planBytes +=
-        definition.operations.capacity() * sizeof(Operation *) +
-        definition.branchSelections.getMemorySize();
+    auto statistics = definition.statistics();
+    metrics.planEntries += statistics.entries;
+    metrics.planBytes += statistics.bytes;
   }
   for (const auto &plan : plans) {
     valueCount += plan.values.size();
@@ -4645,6 +4860,14 @@ SourceTransactionStateAnalysis::lookupDefinitionPlanId(
       found->second >= definitionPlans.size())
     return std::nullopt;
   return found->second;
+}
+
+const TransactionModuleStateIndex *
+SourceTransactionStateAnalysis::lookupModuleStates(Operation *module) const {
+  if (!valid || !module)
+    return nullptr;
+  auto found = moduleStates.find(module);
+  return found == moduleStates.end() ? nullptr : &found->second;
 }
 
 const TransactionStatePlan *

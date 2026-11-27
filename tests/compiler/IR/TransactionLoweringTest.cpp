@@ -2543,6 +2543,69 @@ TEST_F(TransactionLoweringTest,
 }
 
 TEST_F(TransactionLoweringTest,
+       FrozenSourceProofPlanRejectsPostPreparationDefinitionMutation) {
+  for (unsigned mutation = 0; mutation != 3; ++mutation) {
+    SCOPED_TRACE(mutation);
+    auto file = parse();
+    ASSERT_TRUE(file);
+    auto split = addBranchScenario(*file);
+    ASSERT_TRUE(mlir::succeeded(capture([&] { return mlir::verify(*file); })))
+        << diagnostics;
+    SourceTransactionStateAnalysis analysis(file->getOperation());
+    ASSERT_TRUE(analysis.isValid()) << diagnostics;
+    HardwareSourceCheckLimits limits;
+    detail::SourceCheckBudget preparationBudget(limits);
+    auto prepared = capture([&] {
+      return acir::detail::prepareTransactionLowering(*file, analysis,
+                                                      preparationBudget);
+    });
+    ASSERT_TRUE(mlir::succeeded(prepared)) << diagnostics;
+    ASSERT_FALSE((*prepared)->sourceProof.definitions.empty());
+    ASSERT_FALSE((*prepared)->sourceProof.modules.empty());
+    detail::SourceCheckBudget materializationBudget(limits);
+    auto materialized = capture([&] {
+      return acir::detail::materializeTransactionLowering(
+          *prepared, materializationBudget);
+    });
+    ASSERT_TRUE(mlir::succeeded(materialized)) << diagnostics;
+
+    if (mutation == 0) {
+      builder.setInsertionPoint(split);
+      mlir::OperationState literal(split.getLoc(),
+                                   BitsConstantOp::getOperationName());
+      literal.addTypes(split.getCondition().getType());
+      auto constant =
+          *owner(*file).getBody().front().getOps<BitsConstantOp>().begin();
+      literal.addAttribute("value", constant.getValue());
+      builder.create(literal);
+    } else if (mutation == 1) {
+      auto &thenBlock = split.getThenRegion().front();
+      auto *extra = thenBlock.begin()->clone();
+      thenBlock.getOperations().insert(thenBlock.getTerminator()->getIterator(),
+                                       extra);
+    } else {
+      auto state = *std::next(
+          owner(*file).getBody().front().getOps<SourceStateOp>().begin());
+      state->setAttr("instance_name", builder.getStringAttr("renamed"));
+    }
+    auto sourceBefore = identities(*file);
+    auto sourceText = print(file->getOperation());
+    auto candidateBefore = identities(*materialized->module);
+    auto candidateText = print(materialized->module->getOperation());
+    detail::SourceCheckBudget proofBudget(limits);
+    EXPECT_TRUE(mlir::failed(capture([&] {
+      return acir::detail::verifyTransactionMaterialization(
+          *prepared, *materialized, proofBudget);
+    })));
+    EXPECT_FALSE(diagnostics.empty());
+    unchanged(*file, sourceBefore);
+    EXPECT_EQ(sourceText, print(file->getOperation()));
+    unchanged(*materialized->module, candidateBefore);
+    EXPECT_EQ(candidateText, print(materialized->module->getOperation()));
+  }
+}
+
+TEST_F(TransactionLoweringTest,
        SourceReplayRejectsDuplicateAndInvalidBoundValueIdentities) {
   for (unsigned mutation = 0; mutation != 5; ++mutation) {
     SCOPED_TRACE(mutation);

@@ -38,8 +38,28 @@ using BranchId = uint32_t;
 using BranchResultId = uint32_t;
 using StateJoinId = uint32_t;
 using TransactionDefinitionPlanId = uint32_t;
+using TransactionDefinitionBlockPlanId = uint32_t;
+using TransactionModuleStateIndex =
+    llvm::DenseMap<mlir::StringAttr, mlir::Operation *>;
 /// Number of completed admission controls; zero is unconditional.
 using AdmissionPrefix = uint32_t;
+
+/// Direct statement schedule for one definition-owned source block. Nested
+/// branch blocks have their own entries, so occurrence replay follows stable
+/// definition-relative indices without rescanning block operation lists.
+struct TransactionDefinitionBlockPlan {
+  mlir::Block *block = nullptr;
+  llvm::SmallVector<mlir::Operation *, 0> statements;
+};
+
+struct TransactionDefinitionPlanStatistics {
+  uint64_t entries = 0;
+  uint64_t bytes = 0;
+  uint64_t operations = 0;
+  uint64_t branches = 0;
+  uint64_t blocks = 0;
+  uint64_t statements = 0;
+};
 
 /// Definition-local structure shared by every invocation and physical
 /// occurrence in one immutable analysis. Operations are inventoried once in
@@ -52,6 +72,8 @@ struct TransactionDefinitionPlan {
   ModuleOp lexicalModule;
   llvm::SmallVector<mlir::Operation *, 0> operations;
   llvm::DenseMap<mlir::Operation *, bool> branchSelections;
+  llvm::SmallVector<TransactionDefinitionBlockPlan, 0> blocks;
+  llvm::DenseMap<mlir::Block *, TransactionDefinitionBlockPlanId> blockIndex;
   uint64_t readCount = 0;
   uint64_t writeCount = 0;
   uint64_t formalWriteCount = 0;
@@ -68,6 +90,15 @@ struct TransactionDefinitionPlan {
       return std::nullopt;
     return found->second;
   }
+
+  const TransactionDefinitionBlockPlan *lookupBlock(mlir::Block *block) const {
+    auto found = blockIndex.find(block);
+    if (found == blockIndex.end() || found->second >= blocks.size())
+      return nullptr;
+    return &blocks[found->second];
+  }
+
+  TransactionDefinitionPlanStatistics statistics() const;
 };
 
 /// Full source-region ancestry, including branches with no admission control.
@@ -575,12 +606,16 @@ public:
   explicit SourceTransactionStateAnalysis(mlir::Operation *package);
   /// Independently verify the complete source occurrence inventory and routing
   /// identities. Fresh native admission and receiver/lifting checks always run;
-  /// lexical-only packages need no state/effect plan reconstruction. Lifted
-  /// packages retain complete canonical plan construction. This query publishes
-  /// no plans and returns its bounded verification work on success.
-  static mlir::FailureOr<uint64_t>
-  verifyOccurrences(mlir::Operation *package,
-                    llvm::ArrayRef<const TransactionStatePlan *> expected);
+  /// lexical-only packages need no state/effect plan reconstruction. A supplied
+  /// definition plan is authenticated against the current source and reused as
+  /// a read-only structural schedule; no occurrence or proof verdict is reused.
+  /// Lifted packages retain complete canonical occurrence reconstruction. This
+  /// query publishes no plans and returns its bounded verification work on
+  /// success.
+  static mlir::FailureOr<uint64_t> verifyOccurrences(
+      mlir::Operation *package,
+      llvm::ArrayRef<const TransactionStatePlan *> expected,
+      llvm::ArrayRef<TransactionDefinitionPlan> expectedDefinitions = {});
 
   bool isValid() const { return valid; }
   uint64_t getAnalysisWork() const { return analysisWork; }
@@ -592,6 +627,8 @@ public:
   lookupDefinitionPlan(mlir::Operation *callable) const;
   std::optional<TransactionDefinitionPlanId>
   lookupDefinitionPlanId(mlir::Operation *operation) const;
+  const TransactionModuleStateIndex *
+  lookupModuleStates(mlir::Operation *module) const;
   const TransactionStatePlan *lookup(SourceTransactionOp transaction) const;
   const TransactionStatePlan *lookup(SourceTransactionOp transaction,
                                      ModuleOp routingModule,
@@ -614,6 +651,7 @@ private:
   /// owner. This is a structural index, not a proof cache.
   llvm::DenseMap<mlir::Operation *, TransactionDefinitionPlanId>
       definitionOperationIndex;
+  llvm::DenseMap<mlir::Operation *, TransactionModuleStateIndex> moduleStates;
   llvm::SmallVector<TransactionStatePlan, 0> plans;
   uint64_t analysisWork = 0;
   uint64_t definitionSummaryBuilds = 0;

@@ -185,6 +185,26 @@ struct TransactionPreparation {
   mlir::ArrayAttr expectedRequiredChecks;
 };
 
+/// Definition-owned facts needed to replay original-source state accesses.
+/// Names and operation handles describe immutable source structure only; they
+/// carry no occurrence binding, value fact, or proof verdict.
+struct SourceProofModuleFacts {
+  ac::ModuleOp module;
+  llvm::DenseMap<mlir::StringAttr, mlir::Operation *> stateDeclarations;
+};
+
+/// Frozen source facts shared by every occurrence proof. Callable entries keep
+/// the definition-relative operation inventory and branch-effect summary built
+/// by transaction analysis. Module entries keep the state declaration index
+/// built while routing already inventories each module body. Verification
+/// independently authenticates these borrowed identities against the current
+/// source IR before any occurrence consumes them.
+struct FrozenSourceProofPlan {
+  llvm::SmallVector<ac::TransactionDefinitionPlan, 0> definitions;
+  llvm::SmallVector<SourceProofModuleFacts, 0> modules;
+  llvm::DenseMap<mlir::Operation *, unsigned> moduleIndex;
+};
+
 /// Mutable storage used only while routing facts are being prepared. Published
 /// consumers receive FrozenRoutingFacts instead of this builder representation.
 /// Borrowed source and analysis handles must outlive materialization and
@@ -198,6 +218,7 @@ struct PreparedTransactionLowering {
   llvm::SmallVector<uint64_t> transactionSchedule;
   llvm::SmallVector<DefinitionRouting, 0> definitions;
   llvm::DenseMap<mlir::Operation *, unsigned> definitionIndex;
+  FrozenSourceProofPlan sourceProof;
   bool valueAvailability = false;
 };
 
@@ -215,7 +236,6 @@ public:
   const PreparedTransactionLowering *operator->() const {
     return storage.get();
   }
-  const PreparedTransactionLowering &operator*() const { return *storage; }
   const PreparedTransactionLowering &facts() const { return *storage; }
   const std::shared_ptr<const PreparedTransactionLowering> &sharedFacts() const {
     return storage;

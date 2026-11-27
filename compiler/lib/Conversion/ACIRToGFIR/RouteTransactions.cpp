@@ -1458,7 +1458,11 @@ public:
       auto signature = module.getFunctionType();
       definitionIndex.try_emplace(module, definitions.size());
       DefinitionRouting definition;
+      detail::SourceProofModuleFacts proofModule;
       definition.module = module;
+      proofModule.module = module;
+      if (const auto *states = analysis.lookupModuleStates(module))
+        proofModule.stateDeclarations = *states;
       definition.sourceInputs = signature.getNumInputs();
       definition.sourceOutputs = signature.getNumResults();
       definitions.push_back(std::move(definition));
@@ -1483,7 +1487,28 @@ public:
           queues.push_back(queue);
         }
       }
+      if (!charge(budget, module,
+                  SourceCheckBudget::bytes(
+                      proofModule.stateDeclarations.getMemorySize())))
+        return failure();
+      sourceProof.moduleIndex.try_emplace(module, sourceProof.modules.size());
+      sourceProof.modules.push_back(std::move(proofModule));
     }
+    uint64_t sourceProofBytes = 0, sourceProofEntries = 0;
+    for (const auto &definition : analysis.getDefinitionPlans()) {
+      auto statistics = definition.statistics();
+      sourceProofBytes =
+          SourceCheckBudget::add(sourceProofBytes, statistics.bytes);
+      sourceProofEntries =
+          SourceCheckBudget::add(sourceProofEntries, statistics.entries);
+    }
+    if (!charge(
+            budget, package,
+            SourceCheckBudget::add(sourceProofEntries,
+                                   SourceCheckBudget::bytes(sourceProofBytes))))
+      return failure();
+    sourceProof.definitions.assign(analysis.getDefinitionPlans().begin(),
+                                   analysis.getDefinitionPlans().end());
     for (const auto &plan : analysis.getPlans()) {
       if (failed(admit(plan)) || !charge(budget, plan.transaction, 2))
         return failure();
@@ -5103,9 +5128,6 @@ public:
               &definition, prepared.original, &definition, publishWorkStorage)))
         return failure();
     }
-    budget.setPhase("transaction source definition inventory");
-    if (failed(buildReplayDefinitionInventory()))
-      return failure();
     budget.setPhase("transaction source definition proof");
     for (const auto &definition : prepared.definitions) {
       SourceCheckBudget::LocalScope definitionBudget(budget);
@@ -5357,92 +5379,9 @@ private:
       return reject(
           "original registration inventory differs from prepared schedule");
     auto work = ac::SourceTransactionStateAnalysis::verifyOccurrences(
-        prepared.original, occurrences);
+        prepared.original, occurrences, prepared.sourceProof.definitions);
     if (failed(work) || !charge(budget, prepared.original, *work))
       return failure();
-    return success();
-  }
-
-  /// Reconstruct source-only lookup facts once per immutable definition. These
-  /// indices carry no occurrence binding, availability fact or proof verdict;
-  /// transaction replay still authenticates every actual use independently.
-  LogicalResult buildReplayDefinitionInventory() {
-    struct Pending {
-      Operation *operation;
-      unsigned depth;
-    };
-    for (const auto &definition : prepared.definitions) {
-      auto module = definition.module;
-      DenseMap<StringAttr, Operation *> states;
-      for (Operation &operation : module.getBody().front()) {
-        if (!charge(budget, &operation))
-          return failure();
-        if (auto state = dyn_cast<ac::SourceStateOp>(operation)) {
-          auto [found, inserted] =
-              states.try_emplace(state.getInstanceNameAttr(), state);
-          if (!inserted)
-            found->second = nullptr;
-          if (failed(budget.debitPersistent(SourceCheckBudget::bytes(sizeof(
-                                                decltype(states)::value_type)),
-                                            state)))
-            return failure();
-        }
-        if (!isa<ac::SourceTransactionOp, ac::SourceMethodOp>(operation))
-          continue;
-        SmallVector<Pending, 0> pending;
-        if (!prepayAppend(budget, &operation, pending))
-          return failure();
-        pending.push_back({&operation, 0});
-        while (!pending.empty()) {
-          auto [nested, depth] = pending.pop_back_val();
-          if (depth > 128 || !charge(budget, nested))
-            return failure();
-          if (auto branch = dyn_cast<ac::SourceBranchOp>(nested)) {
-            if (!sourceBranchEffects.try_emplace(branch, false).second)
-              return reject(
-                  "original branch definition inventory is duplicated");
-            if (failed(budget.debitPersistent(
-                    SourceCheckBudget::bytes(
-                        sizeof(decltype(sourceBranchEffects)::value_type)),
-                    branch)))
-              return failure();
-          }
-          bool effectful =
-              isa<ac::SourceMethodCallOp, ac::SourceExpectOp,
-                  ac::SourceObserveOp, ac::SourceQueuePopOp,
-                  ac::SourceQueuePeekOp, ac::SourceQueuePushOp>(nested) ||
-              nested->hasAttr("ac.loop_continuation");
-          if (effectful) {
-            Operation *ancestor = nested;
-            while ((ancestor = ancestor->getParentOp()) &&
-                   ancestor != &operation) {
-              if (!charge(budget, nested))
-                return failure();
-              if (isa<ac::SourceBranchOp>(ancestor)) {
-                auto found = sourceBranchEffects.find(ancestor);
-                if (found == sourceBranchEffects.end())
-                  return reject(
-                      "original branch definition ancestry is absent");
-                found->second = true;
-              }
-            }
-          }
-          for (Region &region : llvm::reverse(nested->getRegions()))
-            for (Block &block : llvm::reverse(region))
-              for (Operation &child : llvm::reverse(block)) {
-                if (!prepayAppend(budget, nested, pending))
-                  return failure();
-                pending.push_back({&child, depth + 1});
-              }
-        }
-      }
-      if (failed(budget.debitPersistent(
-              SourceCheckBudget::bytes(
-                  sizeof(decltype(sourceStateDeclarations)::value_type)),
-              module)))
-        return failure();
-      sourceStateDeclarations.try_emplace(module, std::move(states));
-    }
     return success();
   }
 
@@ -7305,18 +7244,18 @@ private:
       const auto &owner = plan.owners[id];
       auto anchor = plan.frames[frame].anchor;
       auto module = plan.instances[anchor].definition;
-      auto definition = sourceStateDeclarations.find(module);
+      auto moduleIndex =
+          prepared.sourceProof.moduleIndex.find(module.operator->());
       auto stateName = effect->getAttrOfType<StringAttr>("state");
-      if (!charge(budget, effect,
-                  SourceCheckBudget::orderedLookupCost(
-                      definition == sourceStateDeclarations.end()
-                          ? 0
-                          : definition->second.size())))
+      if (!charge(budget, effect))
         return failure();
       Operation *declarationOp = nullptr;
-      if (definition != sourceStateDeclarations.end() && stateName) {
-        auto indexed = definition->second.find(stateName);
-        if (indexed != definition->second.end())
+      if (moduleIndex != prepared.sourceProof.moduleIndex.end() && stateName &&
+          moduleIndex->second < prepared.sourceProof.modules.size()) {
+        const auto &definition =
+            prepared.sourceProof.modules[moduleIndex->second];
+        auto indexed = definition.stateDeclarations.find(stateName);
+        if (indexed != definition.stateDeclarations.end())
           declarationOp = indexed->second;
       }
       auto declaration = dyn_cast_or_null<ac::SourceStateOp>(declarationOp);
@@ -7620,7 +7559,19 @@ private:
                root == "pycircuit.__builtins__.sync_mem_dp" ||
                root == "pycircuit.__builtins__.byte_mem";
       };
-      for (Operation &op : source.without_terminator()) {
+      if (frame >= plan.frames.size() ||
+          plan.frames[frame].definitionPlan >=
+              prepared.sourceProof.definitions.size())
+        return reject("original source replay definition identity differs");
+      const auto &definition =
+          prepared.sourceProof.definitions[plan.frames[frame].definitionPlan];
+      const auto *schedule = definition.lookupBlock(&source);
+      if (!schedule)
+        return reject("original source replay block schedule differs");
+      for (Operation *scheduled : schedule->statements) {
+        if (!scheduled || scheduled->getBlock() != &source)
+          return reject("original source replay statement owner differs");
+        Operation &op = *scheduled;
         // Statement replay is independently reproducible from the frozen
         // frame state. Preserve the evolving semantic environment, but bound
         // the proof work of each source statement instead of accumulating a
@@ -7888,10 +7839,14 @@ private:
           auto conditionFact = replay.fact(branch.condition, point());
           if (failed(conditionFact) || *conditionFact != branch.conditionFact)
             return reject("original branch predicate fact differs");
-          auto effect = sourceBranchEffects.find(split);
-          if (!charge(budget, split) || effect == sourceBranchEffects.end())
-            return failure();
-          bool effectful = effect->second;
+          if (branch.definitionPlan >= prepared.sourceProof.definitions.size())
+            return reject("original branch definition identity differs");
+          const auto &definition =
+              prepared.sourceProof.definitions[branch.definitionPlan];
+          auto effect = definition.needsSelection(split);
+          if (!charge(budget, split) || !effect)
+            return reject("original branch definition inventory differs");
+          bool effectful = *effect;
           if (bool(branch.selection) != effectful)
             return reject("original branch effect classification differs");
           if (effectful) {
@@ -9665,9 +9620,6 @@ private:
   BranchTypeAdmissionCache branchTypes;
   CandidateTerminalIndex candidateChecks;
   CandidateTerminalIndex candidateObservations;
-  DenseMap<Operation *, DenseMap<StringAttr, Operation *>>
-      sourceStateDeclarations;
-  DenseMap<Operation *, bool> sourceBranchEffects;
   // Node-stable storage keeps simultaneous ArrayRef results valid when another
   // transaction's independent closure is first queried.
   DenseSet<Operation *> operations, clones;
@@ -9979,24 +9931,58 @@ public:
       return;
     }
     if (metrics.routing) {
-      metrics.routing->definitions = prepared->facts().definitions.size();
-      metrics.routing->occurrences = prepared->facts().transactions.size();
+      const auto &facts = prepared->facts();
+      metrics.routing->definitions = facts.definitions.size();
+      metrics.routing->occurrences = facts.transactions.size();
       metrics.routing->planEntries =
-          prepared->facts().definitions.size() +
-          prepared->facts().transactions.size() +
-          prepared->facts().states.size() + prepared->facts().queues.size() +
-          prepared->facts().transactionSchedule.size();
+          facts.definitions.size() + facts.transactions.size() +
+          facts.states.size() + facts.queues.size() +
+          facts.transactionSchedule.size() +
+          facts.sourceProof.definitions.size() +
+          facts.sourceProof.modules.size();
       metrics.routing->planBytes =
           sizeof(detail::PreparedTransactionLowering) +
-          prepared->facts().definitions.capacity() *
-              sizeof(detail::DefinitionRouting) +
-          prepared->facts().transactions.capacity() *
+          facts.definitions.capacity() * sizeof(detail::DefinitionRouting) +
+          facts.transactions.capacity() *
               sizeof(detail::TransactionPreparation) +
-          prepared->facts().states.capacity() * sizeof(ac::SourceStateOp) +
-          prepared->facts().queues.capacity() * sizeof(ac::InstanceOp) +
-          prepared->facts().transactionSchedule.capacity() * sizeof(uint64_t) +
-          prepared->facts().definitionIndex.getMemorySize();
-      for (const auto &transaction : prepared->facts().transactions)
+          facts.states.capacity() * sizeof(ac::SourceStateOp) +
+          facts.queues.capacity() * sizeof(ac::InstanceOp) +
+          facts.transactionSchedule.capacity() * sizeof(uint64_t) +
+          facts.definitionIndex.getMemorySize() +
+          facts.sourceProof.definitions.capacity() *
+              sizeof(ac::TransactionDefinitionPlan) +
+          facts.sourceProof.modules.capacity() *
+              sizeof(detail::SourceProofModuleFacts) +
+          facts.sourceProof.moduleIndex.getMemorySize();
+      uint64_t sourceProofOperations = 0, sourceProofBranches = 0,
+               sourceProofBlocks = 0, sourceProofStatements = 0,
+               sourceProofStates = 0;
+      for (const auto &definition : facts.sourceProof.definitions) {
+        auto statistics = definition.statistics();
+        metrics.routing->planEntries += statistics.entries;
+        metrics.routing->planBytes += statistics.bytes;
+        sourceProofOperations += statistics.operations;
+        sourceProofBranches += statistics.branches;
+        sourceProofBlocks += statistics.blocks;
+        sourceProofStatements += statistics.statements;
+      }
+      for (const auto &module : facts.sourceProof.modules) {
+        metrics.routing->planEntries += module.stateDeclarations.size();
+        metrics.routing->planBytes += module.stateDeclarations.getMemorySize();
+        sourceProofStates += module.stateDeclarations.size();
+      }
+      metrics.routing->details["source_proof_definition_plans"] =
+          facts.sourceProof.definitions.size();
+      metrics.routing->details["source_proof_definition_operations"] =
+          sourceProofOperations;
+      metrics.routing->details["source_proof_branch_facts"] =
+          sourceProofBranches;
+      metrics.routing->details["source_proof_blocks"] = sourceProofBlocks;
+      metrics.routing->details["source_proof_replay_statements"] =
+          sourceProofStatements;
+      metrics.routing->details["source_proof_state_declarations"] =
+          sourceProofStates;
+      for (const auto &transaction : facts.transactions)
         if (transaction.plan) {
           metrics.routing->calls += transaction.plan->calls.size();
           metrics.routing->instances += transaction.plan->instances.size();

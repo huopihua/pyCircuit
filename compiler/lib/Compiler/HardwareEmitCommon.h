@@ -64,6 +64,9 @@ struct HardwareTableRegionEmissionPlan {
 struct HardwareDefinitionEmissionPlan {
   HardwareDefinitionId id = 0;
   ac::ModuleOp definition;
+  /// Stable preorder inventory shared by all definition-local emission
+  /// consumers. The definition operation itself is the first entry.
+  llvm::SmallVector<mlir::Operation *, 0> operations;
   llvm::SmallVector<HardwareEmissionChild, 0> children;
   llvm::SmallVector<HardwareDefinitionId, 0> dependencies;
   llvm::SmallVector<mlir::Operation *, 0> independentWorkSubtrees;
@@ -219,7 +222,8 @@ private:
     llvm::SmallVector<mlir::Block *, 0> successors;
   };
   void capturePreparedPackage();
-  mlir::LogicalResult prepareDefinitionEmissionPlans(ac::ModuleOp root);
+  mlir::LogicalResult prepareDefinitionInventories();
+  mlir::LogicalResult completeDefinitionEmissionPlans(ac::ModuleOp root);
   mlir::LogicalResult prepareImpl(bool allowSourceChecks);
   bool physical_ = false;
   acir::metrics::CompilerPhaseMetrics *metrics_ = nullptr;

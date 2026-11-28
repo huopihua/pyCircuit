@@ -556,6 +556,7 @@ def Top(value: ac.bits[{width}]{extra}) -> ac.bits[{width}]:
             "requires",
             "hardware type mismatch",
             "implicit narrowing",
+            "hardware static reference must name an integer formal",
             "unknown or repeated instance parameter",
             "missing required instance parameter",
             "unresolved hardware static expression",

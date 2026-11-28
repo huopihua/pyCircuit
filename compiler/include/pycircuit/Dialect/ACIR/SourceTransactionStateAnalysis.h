@@ -38,6 +38,7 @@ using BranchId = uint32_t;
 using BranchResultId = uint32_t;
 using StateJoinId = uint32_t;
 using TransactionDefinitionPlanId = uint32_t;
+using TransactionDefinitionOperationId = uint32_t;
 using TransactionDefinitionBlockPlanId = uint32_t;
 using TransactionModuleStateIndex =
     llvm::DenseMap<mlir::StringAttr, mlir::Operation *>;
@@ -49,7 +50,28 @@ using AdmissionPrefix = uint32_t;
 /// definition-relative indices without rescanning block operation lists.
 struct TransactionDefinitionBlockPlan {
   mlir::Block *block = nullptr;
-  llvm::SmallVector<mlir::Operation *, 0> statements;
+  llvm::SmallVector<TransactionDefinitionOperationId, 0> statements;
+};
+
+/// Lightweight semantic indices into the owning definition's sole operation
+/// inventory. Occurrence bindings, versions, effects and proof conclusions do
+/// not enter this shared object.
+struct TransactionDefinitionSemanticFacts {
+  llvm::DenseMap<TransactionDefinitionOperationId, bool> branchSelections;
+  uint64_t readCount = 0;
+  uint64_t writeCount = 0;
+  uint64_t formalWriteCount = 0;
+  uint64_t callCount = 0;
+  uint64_t bodyCheckCount = 0;
+  uint64_t observationCount = 0;
+  uint64_t branchCount = 0;
+  uint64_t branchResultCount = 0;
+  uint64_t selectionCount = 0;
+};
+
+struct TransactionDefinitionOperationRef {
+  TransactionDefinitionPlanId definition = 0;
+  TransactionDefinitionOperationId operation = 0;
 };
 
 struct TransactionDefinitionPlanStatistics {
@@ -71,24 +93,20 @@ struct TransactionDefinitionPlan {
   mlir::Operation *callable = nullptr;
   ModuleOp lexicalModule;
   llvm::SmallVector<mlir::Operation *, 0> operations;
-  llvm::DenseMap<mlir::Operation *, bool> branchSelections;
   llvm::SmallVector<TransactionDefinitionBlockPlan, 0> blocks;
   llvm::DenseMap<mlir::Block *, TransactionDefinitionBlockPlanId> blockIndex;
-  uint64_t readCount = 0;
-  uint64_t writeCount = 0;
-  uint64_t formalWriteCount = 0;
-  uint64_t callCount = 0;
-  uint64_t bodyCheckCount = 0;
-  uint64_t observationCount = 0;
-  uint64_t branchCount = 0;
-  uint64_t branchResultCount = 0;
-  uint64_t selectionCount = 0;
+  TransactionDefinitionSemanticFacts semanticFacts;
 
-  std::optional<bool> needsSelection(SourceBranchOp branch) const {
-    auto found = branchSelections.find(branch);
-    if (found == branchSelections.end())
-      return std::nullopt;
-    return found->second;
+  std::optional<bool>
+  needsSelection(TransactionDefinitionOperationId operation) const {
+    auto found = semanticFacts.branchSelections.find(operation);
+    return found == semanticFacts.branchSelections.end()
+               ? std::nullopt
+               : std::optional<bool>(found->second);
+  }
+
+  mlir::Operation *operation(TransactionDefinitionOperationId id) const {
+    return id < operations.size() ? operations[id] : nullptr;
   }
 
   const TransactionDefinitionBlockPlan *lookupBlock(mlir::Block *block) const {
@@ -386,6 +404,7 @@ struct TransactionBranch {
   /// Frozen identity of the definition that owns this source branch. This may
   /// differ from the dynamic frame during source-loop expansion.
   TransactionDefinitionPlanId definitionPlan = 0;
+  TransactionDefinitionOperationId definitionOperation = 0;
   InvocationFrameId frame;
   BoundValueId condition;
   TransactionPoint entry;
@@ -647,9 +666,9 @@ private:
   llvm::SmallVector<TransactionDefinitionPlan, 0> definitionPlans;
   llvm::DenseMap<mlir::Operation *, TransactionDefinitionPlanId>
       definitionPlanIndex;
-  /// Every operation inventoried by a definition plan maps directly to its
-  /// owner. This is a structural index, not a proof cache.
-  llvm::DenseMap<mlir::Operation *, TransactionDefinitionPlanId>
+  /// Semantic operations map to their owner and stable offset in that owner's
+  /// sole operation inventory. This is a structural index, not a proof cache.
+  llvm::DenseMap<mlir::Operation *, TransactionDefinitionOperationRef>
       definitionOperationIndex;
   llvm::DenseMap<mlir::Operation *, TransactionModuleStateIndex> moduleStates;
   llvm::SmallVector<TransactionStatePlan, 0> plans;

@@ -68,7 +68,7 @@ LogicalResult detail::verifyHardwarePackageStage(
        marker.getValue() != (boundary ? 5 : 4)))
     return package.emitOpError()
            << "unsupported or missing ac.routed_contract; regenerate the routed artifact";
-  auto closed = package.walk([&](Operation *operation) {
+  for (Operation *operation : analysis.getPackageOperations()) {
     // HWIR rejects every routed logical-state interface unconditionally,
     // including retained dead regions; source state forms stay rejected by
     // their own declaration contract.
@@ -78,7 +78,7 @@ LogicalResult detail::verifyHardwarePackageStage(
             acir::LogicalStateUpdateOpInterface>(operation)) {
       operation->emitOpError()
           << "logical state cannot cross into executable final hardware";
-      return WalkResult::interrupt();
+      return failure();
     }
     // A reference denotes a source allocation, never a runtime payload or an
     // inert annotation on a closed hardware graph. Routing must consume both
@@ -90,7 +90,7 @@ LogicalResult detail::verifyHardwarePackageStage(
             << "unresolved source reference or callable order cannot cross "
                "the routed/final boundary: "
             << name;
-        return WalkResult::interrupt();
+        return failure();
       }
     }
     if (operation->hasAttr("ac.anchor_provenance") &&
@@ -98,11 +98,11 @@ LogicalResult detail::verifyHardwarePackageStage(
          operation != package.getOperation())) {
       operation->emitOpError()
           << "ac.anchor_provenance belongs only to the top-level final package";
-      return WalkResult::interrupt();
+      return failure();
     }
     if (operation != package.getOperation() && operation->hasAttr("ac.routed_contract")) {
       operation->emitOpError() << "ac.routed_contract belongs only to the top-level package";
-      return WalkResult::interrupt();
+      return failure();
     }
     if (policy.rejectUnloweredInstanceBindings && isa<InstanceOp>(operation) &&
         (operation->hasAttr("ac.source_unbound_push") ||
@@ -110,7 +110,7 @@ LogicalResult detail::verifyHardwarePackageStage(
          operation->hasAttr("ac.source_memory") ||
          operation->hasAttr("ac.payload_constraint"))) {
       operation->emitOpError() << "unlowered source resource binding cannot cross the routed boundary";
-      return WalkResult::interrupt();
+      return failure();
     }
     if (!policy.admitRoutedLogicalStateByName ||
         operation == package.getOperation() ||
@@ -118,7 +118,7 @@ LogicalResult detail::verifyHardwarePackageStage(
             CollectionOp, RuleOp, YieldOp, SourceExpectOp,
             SourceObserveOp>(operation) ||
         isCombinationalHardwareOperation(operation))
-      return WalkResult::advance();
+      continue;
     // Closed routed admission: exactly the two concrete operations the GFIR
     // dialect registers (see GFIROps.td). Generic construction can build
     // unregistered raw IR with a forged gfir.* name, so the registered
@@ -129,11 +129,11 @@ LogicalResult detail::verifyHardwarePackageStage(
     if (name.isRegistered() &&
         (name.getStringRef() == "gfir.state" ||
          name.getStringRef() == "gfir.state.update"))
-      return WalkResult::advance();
+      continue;
     operation->emitOpError() << "operation outside closed routed hardware package";
-    return WalkResult::interrupt();
-  });
-  return failure(closed.wasInterrupted());
+    return failure();
+  }
+  return success();
 }
 LogicalResult detail::verifyHardwarePackageEnvelope(
     const HardwareAnalysis &analysis, const PackageStagePolicy &policy,
@@ -146,42 +146,37 @@ LogicalResult detail::verifyHardwarePackageEnvelope(
   };
   if (failed(verifyEntryBoundary(analysis, false, debit)))
     return failure();
-  auto registrations = package.walk([&](Operation *operation) {
+  for (Operation *operation : analysis.getPackageOperations()) {
     if (!operation->hasAttr("ac.registration_path") &&
         !operation->hasAttr("ac.lexical_registration") &&
         !operation->hasAttr("ac.registration_owner"))
-      return WalkResult::advance();
+      continue;
     auto rule = dyn_cast<RuleOp>(operation);
     if (!rule) {
       operation->emitOpError()
           << "routed registration metadata requires a sampled Rule";
-      return WalkResult::interrupt();
+      return failure();
     }
-    return failed(verifyRoutedRegistration(analysis, rule, debit))
-               ? WalkResult::interrupt()
-               : WalkResult::advance();
-  });
-  if (registrations.wasInterrupted())
-    return failure();
+    if (failed(verifyRoutedRegistration(analysis, rule, debit)))
+      return failure();
+  }
   if (failed(verifyTransactionReturns(analysis, debit)))
     return failure();
-  auto layouts = package.walk([&](Operation *operation) {
+  for (Operation *operation : analysis.getPackageOperations()) {
     if (!operation->hasAttr("ac.internal_ports") &&
         !operation->hasAttr("ac.input_validity") &&
         !operation->hasAttr("ac.output_validity") &&
         !operation->hasAttr("ac.routed_output_validity"))
-      return WalkResult::advance();
+      continue;
     if (!isa<ModuleOp>(operation)) {
       operation->emitOpError()
           << "ac.internal_ports is permitted only on a real module "
              "in a routed or final package";
-      return WalkResult::interrupt();
+      return failure();
     }
-    return failed(getModulePortLayout(operation)) ? WalkResult::interrupt()
-                                                  : WalkResult::advance();
-  });
-  if (layouts.wasInterrupted())
-    return failure();
+    if (failed(getModulePortLayout(operation)))
+      return failure();
+  }
   if (policy.rejectUnloweredTransactions &&
       failed(verifyNoUnloweredTransactions(package)))
     return failure();

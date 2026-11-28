@@ -18,6 +18,10 @@ fi
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$(pyc_pythonpath)"
 pyc_set_public_helpers
+if [[ -n "${PYC_PYTHON_EXECUTABLE:-}" ]]; then
+  python_bin="$(cd -- "$(dirname -- "${PYC_PYTHON_EXECUTABLE}")" && pwd)"
+  export PATH="${python_bin}:${PATH}"
+fi
 cd "${PYC_ROOT_DIR}"
 # Reconfigure the existing native build; never create a second test toolchain.
 [[ -f "${PYC_BUILD_DIR}/CMakeCache.txt" ]] || pyc_die "build the CompilerDev testing profile first"
@@ -65,7 +69,10 @@ nightly_python_tests=(
   tests/system/test_publication_process_recovery.py
   tests/system/test_cmake_presets.py
 )
-cmake -S "${PYC_ROOT_DIR}" -B "${PYC_BUILD_DIR}" -DPYC_BUILD_TESTING=ON -DPYC_TEST_TIER="${tier}"
+cmake -S "${PYC_ROOT_DIR}" -B "${PYC_BUILD_DIR}" \
+  -DPYC_BUILD_TESTING=ON \
+  -DPYC_TEST_TIER="${tier}" \
+  -DPython3_EXECUTABLE="${PYC_PYTHON_EXECUTABLE:-$(command -v python3)}"
 if ((list_only)); then
   pyc_list_tests api "$tier" "${PYC_BUILD_DIR}"
   if [[ "$tier" == nightly ]]; then

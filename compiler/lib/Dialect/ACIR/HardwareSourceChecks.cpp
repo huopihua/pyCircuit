@@ -65,12 +65,16 @@ LogicalResult verifyObserverUses(const HardwareAnalysis &analysis,
     }
     return success();
   };
-  auto scan = definition.walk([&](Operation *operation) {
+  const auto *semantic = analysis.lookupDefinitionPlan(definition);
+  if (!semantic)
+    return definition.emitOpError()
+           << "observer proof lacks frozen operation inventory";
+  for (Operation *operation : semantic->operations) {
     if (failed(debit(1, operation)))
-      return WalkResult::interrupt();
+      return failure();
     auto marker = operation->getAttr("ac.verification_observer");
     if (!marker)
-      return WalkResult::advance();
+      continue;
     auto name = dyn_cast<StringAttr>(marker);
     auto compare = dyn_cast<BitsCompareOp>(operation);
     auto origin = operation->getAttrOfType<DictionaryAttr>("ac.origin");
@@ -81,13 +85,11 @@ LogicalResult verifyObserverUses(const HardwareAnalysis &analysis,
             origin, [&] { return operation->emitOpError(); }))) {
       operation->emitOpError() << "four-state observer requires authenticated "
                                   "source comparison provenance";
-      return WalkResult::interrupt();
+      return failure();
     }
-    return failed(results(operation)) ? WalkResult::interrupt()
-                                      : WalkResult::advance();
-  });
-  if (scan.wasInterrupted())
-    return failure();
+    if (failed(results(operation)))
+      return failure();
+  }
   auto reject = [](Operation *operation) -> LogicalResult {
     return operation->emitOpError()
            << "four-state observer is verification-only; its data or control "

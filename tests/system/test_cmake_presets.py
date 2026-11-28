@@ -85,6 +85,8 @@ def test_release_presets_configure_in_isolation_and_select_live_targets(
     environment = os.environ.copy()
     environment["LLVM_DIR"] = _cache_value(cache, "LLVM_DIR")
     environment["MLIR_DIR"] = _cache_value(cache, "MLIR_DIR")
+    environment["LLVM_EXTERNAL_LIT"] = _cache_value(cache, "LLVM_EXTERNAL_LIT")
+    environment["Python3_EXECUTABLE"] = _cache_value(cache, "Python3_EXECUTABLE")
     isolated_build = tmp_path / "preset configure build"
     isolated_install = tmp_path / "preset configure install"
     configured = _checked(
@@ -95,6 +97,8 @@ def test_release_presets_configure_in_isolation_and_select_live_targets(
             "-B",
             str(isolated_build),
             f"-DCMAKE_INSTALL_PREFIX={isolated_install}",
+            f"-DLLVM_EXTERNAL_LIT={environment['LLVM_EXTERNAL_LIT']}",
+            f"-DPython3_EXECUTABLE={environment['Python3_EXECUTABLE']}",
         ],
         cwd=ROOT,
         env=environment,

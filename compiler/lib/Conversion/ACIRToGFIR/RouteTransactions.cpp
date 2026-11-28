@@ -7568,7 +7568,8 @@ private:
       const auto *schedule = definition.lookupBlock(&source);
       if (!schedule)
         return reject("original source replay block schedule differs");
-      for (Operation *scheduled : schedule->statements) {
+      for (auto scheduledId : schedule->statements) {
+        Operation *scheduled = definition.operation(scheduledId);
         if (!scheduled || scheduled->getBlock() != &source)
           return reject("original source replay statement owner differs");
         Operation &op = *scheduled;
@@ -7843,7 +7844,7 @@ private:
             return reject("original branch definition identity differs");
           const auto &definition =
               prepared.sourceProof.definitions[branch.definitionPlan];
-          auto effect = definition.needsSelection(split);
+          auto effect = definition.needsSelection(branch.definitionOperation);
           if (!charge(budget, split) || !effect)
             return reject("original branch definition inventory differs");
           bool effectful = *effect;

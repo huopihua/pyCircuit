@@ -21,17 +21,103 @@ HardwareAnalysis::HardwareAnalysis(mlir::ModuleOp package) : package(package) {
   for (Operation &op : package.getBody()->getOperations()) {
     if (auto name = op.getAttrOfType<StringAttr>("sym_name"))
       symbols.try_emplace(name.getValue(), &op);
-    if (auto module = dyn_cast<ModuleOp>(op))
+    if (auto module = dyn_cast<ModuleOp>(op)) {
       definitions.push_back(module);
+      HardwareDefinitionPlanId id = definitionPlans.size();
+      definitionPlanIndex.try_emplace(&op, id);
+      HardwareDefinitionSemanticPlan plan;
+      plan.id = id;
+      plan.definition = module;
+      definitionPlans.push_back(std::move(plan));
+    }
     if (auto record = dyn_cast<StructOp>(op))
       structures.push_back(record);
   }
+  package.walk([&](Operation *operation) {
+    packageOperations.push_back(operation);
+    Operation *owner = operation;
+    while (owner && owner->getParentOp() != package.getOperation())
+      owner = owner->getParentOp();
+    if (!isa_and_nonnull<ModuleOp>(owner))
+      owner = nullptr;
+    auto found = definitionPlanIndex.find(owner);
+    if (found == definitionPlanIndex.end())
+      return;
+    definitionPlans[found->second].operations.push_back(operation);
+    definitionOperationIndex.try_emplace(operation, found->second);
+  });
 }
 SmallVector<ModuleOp> HardwareAnalysis::getDefinitions() const {
   return definitions;
 }
 SmallVector<StructOp> HardwareAnalysis::getStructs() const {
   return structures;
+}
+const HardwareDefinitionSemanticPlan *
+HardwareAnalysis::lookupDefinitionPlan(Operation *definition) const {
+  auto found = definitionPlanIndex.find(definition);
+  return found == definitionPlanIndex.end() ? nullptr
+                                             : &definitionPlans[found->second];
+}
+const HardwareDefinitionSemanticPlan *
+HardwareAnalysis::lookupOperationPlan(Operation *operation) const {
+  auto found = definitionOperationIndex.find(operation);
+  return found == definitionOperationIndex.end()
+             ? nullptr
+             : &definitionPlans[found->second];
+}
+HardwareSemanticPlanStatistics
+HardwareAnalysis::semanticPlanStatistics() const {
+  HardwareSemanticPlanStatistics statistics;
+  statistics.definitions = definitionPlans.size();
+  statistics.operations = packageOperations.size();
+  statistics.constructionWalks = package ? 1 : 0;
+  statistics.visitedNodes = packageOperations.size();
+  statistics.entries = packageOperations.size() + definitionPlans.size() +
+                       definitionPlanIndex.size() +
+                       definitionOperationIndex.size();
+  statistics.bytes =
+      packageOperations.capacity() * sizeof(Operation *) +
+      definitionPlans.capacity() * sizeof(HardwareDefinitionSemanticPlan) +
+      definitionPlanIndex.getMemorySize() +
+      definitionOperationIndex.getMemorySize();
+  for (const auto &plan : definitionPlans)
+    statistics.bytes += plan.operations.capacity() * sizeof(Operation *);
+  return statistics;
+}
+LogicalResult HardwareAnalysis::authenticateSemanticPlan() const {
+  if (!package)
+    return failure();
+  SmallVector<Operation *, 0> currentOperations;
+  package.walk(
+      [&](Operation *operation) { currentOperations.push_back(operation); });
+  if (!llvm::equal(packageOperations, currentOperations))
+    return package.emitOpError()
+           << "hardware semantic plan differs from current package";
+  SmallVector<size_t, 0> planOffsets(definitionPlans.size());
+  for (Operation *operation : currentOperations) {
+    Operation *owner = operation;
+    while (owner && owner->getParentOp() != package.getOperation())
+      owner = owner->getParentOp();
+    if (!isa_and_nonnull<ModuleOp>(owner))
+      owner = nullptr;
+    auto found = definitionPlanIndex.find(owner);
+    if (found == definitionPlanIndex.end())
+      continue;
+    auto id = found->second;
+    size_t &offset = planOffsets[id];
+    if (offset >= definitionPlans[id].operations.size() ||
+        definitionPlans[id].operations[offset++] != operation)
+      return package.emitOpError()
+             << "hardware semantic plan definition ownership differs from "
+                "current package";
+  }
+  for (auto [id, offset] : llvm::enumerate(planOffsets))
+    if (offset != definitionPlans[id].operations.size())
+      return package.emitOpError()
+             << "hardware semantic plan definition ownership differs from "
+                "current package";
+  return success();
 }
 Operation *HardwareAnalysis::lookupDefinition(StringRef name) const {
   auto found = symbols.find(name);

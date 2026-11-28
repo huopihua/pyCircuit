@@ -47,9 +47,12 @@ public:
     auto package = analysis.getPackage();
     if (!package)
       return failure();
+    if (failed(analysis.authenticateSemanticPlan()))
+      return failure();
     auto recordMetrics = [&] {
       if (!metrics)
         return;
+      auto semantic = analysis.semanticPlanStatistics();
       metrics->workUnits = budget.usedWorkUnits();
       metrics->definitions = definitionCount;
       metrics->boundDefinitions = nodes.size();
@@ -59,11 +62,16 @@ public:
           validation.sampledAdmissionProofCount();
       metrics->ownerOccurrences = plan.owners.size();
       metrics->resolvedChecks = plan.checks.size();
-      metrics->planEntries = plan.bindings.size() + plan.owners.size() +
+      metrics->irWalks = semantic.constructionWalks;
+      ++metrics->irWalks;
+      metrics->visitedNodes += semantic.visitedNodes;
+      metrics->visitedNodes += semantic.visitedNodes;
+      metrics->planEntries = semantic.entries + plan.bindings.size() +
+                             plan.owners.size() +
                              plan.checks.size() + plan.commits.size() +
                              plan.samplingBindings.size() +
                              plan.samplingOccurrences.size();
-      metrics->planBytes =
+      metrics->planBytes = semantic.bytes +
           plan.bindings.capacity() * sizeof(HardwareCheckBinding) +
           plan.owners.capacity() * sizeof(HardwareCheckOwnerOccurrence) +
           plan.checks.capacity() * sizeof(HardwareResolvedSourceCheck) +
@@ -1237,34 +1245,25 @@ private:
       return failure();
     Operation *lastDefinition = nullptr;
     RawDefinitionWork *lastWork = nullptr;
-    SmallVector<Operation *> *lastOperations = nullptr;
-    auto counted = analysis.getPackage().walk([&](Operation *op) {
+    auto count = [&](Operation *op) {
       // Raw operation structure is independently replayable into its owning
       // definition accumulator. Bound each operation's structural/metadata
       // inspection separately; the definition-level reserve below still
       // rejects an unaffordable aggregate plan.
       Budget::LocalScope operationBudget(budget);
       if (metrics) {
-        if (op == analysis.getPackage().getOperation())
-          ++metrics->irWalks;
         ++metrics->visitedNodes;
         metrics->instances += isa<InstanceOp, CollectionOp>(op);
         metrics->calls += isa<SourceMethodCallOp>(op);
       }
       if (failed(budget.debit(1, op)))
         return WalkResult::interrupt();
-      Operation *definition = isa<ModuleOp>(op) ? op : nullptr;
-      for (Operation *parent = op->getParentOp(); !definition && parent;
-           parent = parent->getParentOp()) {
-        if (failed(budget.debit(1, op)))
-          return WalkResult::interrupt();
-        if (isa<ModuleOp>(parent))
-          definition = parent;
-      }
+      const auto *semantic = analysis.lookupOperationPlan(op);
+      Operation *definition = semantic ? semantic->definition.operator->()
+                                       : nullptr;
       if (!definition) {
         lastDefinition = nullptr;
         lastWork = nullptr;
-        lastOperations = nullptr;
         return WalkResult::advance();
       }
       if (failed(budget.debit(1, op)))
@@ -1285,21 +1284,7 @@ private:
         }
         lastDefinition = definition;
         lastWork = &found->second;
-        auto inventory = definitionOperations.find(definition);
-        if (inventory == definitionOperations.end()) {
-          if (failed(budget.debit(
-                  Budget::bytes(
-                      sizeof(decltype(definitionOperations)::value_type) +
-                      2 * sizeof(void *)),
-                  op)))
-            return WalkResult::interrupt();
-          inventory = definitionOperations.try_emplace(definition).first;
-        }
-        lastOperations = &inventory->second;
       }
-      if (failed(budget.debit(2 * Budget::bytes(sizeof(Operation *)), op)))
-        return WalkResult::interrupt();
-      lastOperations->push_back(op);
       auto &local = *lastWork;
       local.operations = Budget::add(local.operations, 1);
       bool directRule = isa<RuleOp>(op) && op->getParentOp() == definition;
@@ -1393,9 +1378,10 @@ private:
         }
       }
       return WalkResult::advance();
-    });
-    if (counted.wasInterrupted())
-      return failure();
+    };
+    for (Operation *operation : analysis.getPackageOperations())
+      if (count(operation).wasInterrupted())
+        return failure();
     for (const auto &[definition, local] : work) {
       Budget::LocalScope definitionBudget(budget);
       if (failed(budget.debit(1, definition)))
@@ -1638,11 +1624,11 @@ private:
       // independent of instance bindings (r8 review fix): the tolerant
       // family entries re-run over every retained definition, so an
       // uninstantiated module cannot bypass the original rejection boundary.
-      auto operations = definitionOperations.find(definition);
-      if (operations == definitionOperations.end())
+      const auto *operations = analysis.lookupDefinitionPlan(definition);
+      if (!operations)
         return definition.emitOpError()
                << "source-check catalog lacks frozen operation inventory";
-      for (Operation *op : operations->second) {
+      for (Operation *op : operations->operations) {
         if (metrics)
           ++metrics->visitedNodes;
         LogicalResult result = success();
@@ -1750,11 +1736,11 @@ private:
                << "source check reset input must have width one";
       bound.reset = static_cast<unsigned>(*ordinal);
     }
-    auto operations = definitionOperations.find(definition);
-    if (operations == definitionOperations.end())
+    const auto *operations = analysis.lookupDefinitionPlan(definition);
+    if (!operations)
       return definition.emitOpError()
              << "bound source-check proof lacks frozen operation inventory";
-    for (Operation *op : operations->second) {
+    for (Operation *op : operations->operations) {
       if (metrics)
         ++metrics->visitedNodes;
       if (failed(budget.debit(1, op)))
@@ -2060,7 +2046,6 @@ private:
   llvm::DenseMap<std::pair<Value, Value>, uint64_t> samplingBindingBySignals;
   NativeSourceCheckScope::Definitions nativeChecks;
   llvm::DenseMap<Operation *, uint64_t> localValidationCost;
-  llvm::DenseMap<Operation *, SmallVector<Operation *>> definitionOperations;
   std::map<const void *, uint64_t> sampledAttributeCosts;
   llvm::DenseSet<Operation *> active;
   SmallVector<std::unique_ptr<BoundDefinition>> nodes;

@@ -63,14 +63,14 @@ FailureOr<bool> memoryReadCoveredBy(
       a.owner != b.owner || a.port != b.port || a.owner >= plan.memoryOwners.size() ||
       plan.memoryOwners[a.owner].layout.kind != "byte_mem" || a.arguments.size() != 1 || b.arguments.size() != 1 ||
       a.point.prefix > b.point.prefix) return false;
-  auto path = b.point.path;
-  bool dominates = !a.point.path.branch;
-  for (unsigned depth = 0; !dominates && path.branch && depth <= 128; ++depth) {
-    if (failed(pay(2)) || *path.branch >= plan.branches.size()) return failure();
-    dominates = path.branch == a.point.path.branch && path.whenTrue == a.point.path.whenTrue;
-    path = plan.branches[*path.branch].entry.path;
-  }
-  if (!dominates) return false;
+  // Resource-demand lowering may narrow the physical contribution of a read
+  // to the paths on which its value is actually consumed. Dominance of the
+  // source access alone therefore does not authorize a descendant access to
+  // reuse that contribution. Reuse only inside the exact source arm; distinct
+  // arms retain independent proposals and are merged by the pin materializer.
+  if (a.point.path.branch != b.point.path.branch ||
+      a.point.path.whenTrue != b.point.path.whenTrue)
+    return false;
   bool authored = a.pathFact && a.pathFact.getValue();
   if (!authored) {
     auto equal = same(a.authoredPath, b.authoredPath, b.point);

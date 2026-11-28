@@ -732,18 +732,18 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
   // shared gate stays closed for `ac.observe` because the Verilog target has no
   // observation channel yet, and a silently dropped observation is
   // exactly what the fail-closed contract forbids.
-  if (metrics_)
-    ++metrics_->irWalks;
-  auto unsupported = package.walk([&](Operation *op) {
+  bool unsupported = false;
+  for (Operation *op : analysis.getPackageOperations()) {
     if (metrics_)
       ++metrics_->visitedNodes;
     if ((allowSourceChecks || !isa<ac::SourceObserveOp>(op)) &&
         (allowSourceChecks || !isa<ac::SourceExpectOp>(op)))
-      return WalkResult::advance();
+      continue;
     op->emitOpError() << "hardware instrumentation emission is not implemented";
-    return WalkResult::interrupt();
-  });
-  if (unsupported.wasInterrupted())
+    unsupported = true;
+    break;
+  }
+  if (unsupported)
     return failure();
   auto root = rootBindings();
   if (failed(root))
@@ -1167,23 +1167,17 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
 }
 LogicalResult
 HardwareEmitContext::prepareDefinitionInventories() {
-  auto definitions = analysis.getDefinitions();
+  auto definitions = analysis.getDefinitionPlans();
   if (definitions.size() > std::numeric_limits<HardwareDefinitionId>::max())
     return package.emitOpError() << "too many hardware definitions to emit";
   definitionPlans_.reserve(definitions.size());
-  for (auto definition : definitions) {
+  for (const auto &semantic : definitions) {
     HardwareDefinitionId id = definitionPlans_.size();
-    definitionIds_.try_emplace(definition, id);
+    definitionIds_.try_emplace(semantic.definition, id);
     HardwareDefinitionEmissionPlan plan;
     plan.id = id;
-    plan.definition = definition;
-    if (metrics_)
-      ++metrics_->irWalks;
-    definition.walk([&](Operation *operation) {
-      if (metrics_)
-        ++metrics_->visitedNodes;
-      plan.operations.push_back(operation);
-    });
+    plan.definition = semantic.definition;
+    llvm::append_range(plan.operations, semantic.operations);
     definitionPlans_.push_back(std::move(plan));
   }
   return success();

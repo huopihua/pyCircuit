@@ -211,6 +211,26 @@ struct ModuleAnalysis {
   llvm::SmallVector<OutputDependency> dependencies;
 };
 
+using HardwareDefinitionPlanId = uint32_t;
+
+/// Frozen, definition-owned structural inventory built once for one immutable
+/// HardwareAnalysis view. Consumers may derive target- or proof-specific facts
+/// from these handles, but no verification conclusion is stored here.
+struct HardwareDefinitionSemanticPlan {
+  HardwareDefinitionPlanId id = 0;
+  ModuleOp definition;
+  llvm::SmallVector<mlir::Operation *, 0> operations;
+};
+
+struct HardwareSemanticPlanStatistics {
+  uint64_t entries = 0;
+  uint64_t bytes = 0;
+  uint64_t definitions = 0;
+  uint64_t operations = 0;
+  uint64_t constructionWalks = 0;
+  uint64_t visitedNodes = 0;
+};
+
 /// All facts refer to the one verified module package and its original SSA.
 /// The class is the binding-aware PackedWidthResolver: the packed-width core
 /// runs through these members, and the shared core lives in
@@ -223,6 +243,21 @@ public:
   mlir::ModuleOp getPackage() const override { return package; }
   llvm::SmallVector<ModuleOp> getDefinitions() const;
   llvm::SmallVector<StructOp> getStructs() const;
+  llvm::ArrayRef<mlir::Operation *> getPackageOperations() const {
+    return packageOperations;
+  }
+  llvm::ArrayRef<HardwareDefinitionSemanticPlan>
+  getDefinitionPlans() const {
+    return definitionPlans;
+  }
+  const HardwareDefinitionSemanticPlan *
+  lookupDefinitionPlan(mlir::Operation *definition) const;
+  const HardwareDefinitionSemanticPlan *
+  lookupOperationPlan(mlir::Operation *operation) const;
+  HardwareSemanticPlanStatistics semanticPlanStatistics() const;
+  /// Authenticate pointer order and definition ownership against the current
+  /// package. Consumers share structural facts, never this verdict.
+  mlir::LogicalResult authenticateSemanticPlan() const;
   mlir::Operation *lookupDefinition(llvm::StringRef name) const override;
   StructOp lookupStruct(StructType type) const override;
   EnumOp lookupEnum(EnumType type) const;
@@ -371,6 +406,12 @@ private:
   llvm::StringMap<mlir::Operation *> symbols;
   llvm::SmallVector<ModuleOp> definitions;
   llvm::SmallVector<StructOp> structures;
+  llvm::SmallVector<mlir::Operation *, 0> packageOperations;
+  llvm::SmallVector<HardwareDefinitionSemanticPlan, 0> definitionPlans;
+  llvm::DenseMap<mlir::Operation *, HardwareDefinitionPlanId>
+      definitionPlanIndex;
+  llvm::DenseMap<mlir::Operation *, HardwareDefinitionPlanId>
+      definitionOperationIndex;
   mutable llvm::DenseMap<mlir::Type, llvm::SmallVector<PackedLeaf>> layouts;
   mutable llvm::SmallVector<std::pair<mlir::Attribute, mlir::Operation *>>
       demandedStatic;

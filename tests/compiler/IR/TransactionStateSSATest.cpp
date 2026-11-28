@@ -512,8 +512,8 @@ TEST_F(TransactionStateSSATest, NestedSelectionUsesOneFrozenDefinitionSummary) {
   EXPECT_EQ(plan->selections.size(), depth);
   auto definition = nested->lookupDefinitionPlan(run);
   ASSERT_NE(definition, nullptr);
-  EXPECT_EQ(definition->branchSelections.size(), depth);
-  EXPECT_TRUE(llvm::all_of(definition->branchSelections,
+  EXPECT_EQ(definition->semanticFacts.branchSelections.size(), depth);
+  EXPECT_TRUE(llvm::all_of(definition->semanticFacts.branchSelections,
                            [](const auto &entry) { return entry.second; }));
   uint64_t nestedOperations = 0;
   for (const auto &entry : nested->getDefinitionPlans())

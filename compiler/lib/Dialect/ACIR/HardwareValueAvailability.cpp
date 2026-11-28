@@ -1393,63 +1393,65 @@ public:
         if (failed(matches(yielded[i], supplied, module)))
           return failure();
       }
-      auto result = module.walk([&](Operation *operation) {
+      const auto *semantic = analysis.lookupDefinitionPlan(module);
+      if (!semantic)
+        return module.emitOpError()
+               << "availability proof lacks frozen operation inventory";
+      for (Operation *operation : semantic->operations) {
         if (auto require = dyn_cast<ValueRequireOp>(operation))
-          return failed(matches(require.getPayload(), require.getAvailability(),
-                                require))
-                     ? WalkResult::interrupt()
-                     : WalkResult::advance();
+          if (failed(matches(require.getPayload(), require.getAvailability(),
+                             require)))
+            return failure();
         if (auto collection = dyn_cast<CollectionOp>(operation)) {
           auto *target = analysis.resolveCallee(collection);
           if (target && isa<ModuleImportOp>(target) &&
               target->hasAttr("ac.external_contract")) {
             for (Value output : collection.getOutputs())
               if (failed(provesAvailable(output)))
-                return WalkResult::interrupt();
+                return failure();
             // Result-free extern Collections still cannot bypass the current
             // total-input admission limitation.
             for (Value input : collection.getInputs())
               if (failed(provesTotal(input))) {
                 if (budgetFailed)
-                  return WalkResult::interrupt();
+                  return failure();
                 collection.emitOpError()
                     << "availability requires scalar instance routing for ordinary Collections";
-                return WalkResult::interrupt();
+                return failure();
               }
-            if (invalid) return WalkResult::interrupt();
+            if (invalid) return failure();
           }
         }
         auto instance = dyn_cast<InstanceOp>(operation);
         if (!instance)
-          return WalkResult::advance();
+          continue;
         auto *target = analysis.lookupDefinition(instance.getCallee());
         if (!target)
-          return WalkResult::interrupt();
+          return failure();
         if (!analysis.getPrimitiveKind(target).empty())
-          return WalkResult::advance();
+          continue;
         if (isa<ModuleImportOp>(target) && target->hasAttr("ac.external_contract")) {
           // An extern accepts partial inputs. Its outputs derive their own
           // all-input availability, including dead outputs and cycles.
           for (Value output : instance.getOutputs())
             if (failed(provesAvailable(output)))
-              return WalkResult::interrupt();
-          return invalid ? WalkResult::interrupt() : WalkResult::advance();
+              return failure();
+          if (invalid)
+            return failure();
+          continue;
         }
         auto layout = getModulePortLayout(target);
         if (failed(layout))
-          return WalkResult::interrupt();
+          return failure();
         for (unsigned i = 0; i < layout->sourceInputCount; ++i) {
           int64_t companion = layout->inputValidity[i];
           if (failed(matches(instance->getOperand(i),
                              companion < 0 ? Value()
                                            : instance->getOperand(companion),
                              instance)))
-            return WalkResult::interrupt();
+            return failure();
         }
-        return WalkResult::advance();
-      });
-      if (result.wasInterrupted())
-        return failure();
+      }
     }
     return failure(invalid);
   }
@@ -1568,26 +1570,27 @@ public:
           add(yield->getOpOperand(companion), true);
       for (auto [payload, companion] : layout->routedOutputValidity)
         add(yield->getOpOperand(companion), true);
-      auto walked = module.walk([&](Operation *operation) {
+      const auto *semantic = analysis.lookupDefinitionPlan(module);
+      if (!semantic)
+        return module.emitOpError()
+               << "availability-use proof lacks frozen operation inventory";
+      for (Operation *operation : semantic->operations) {
         if (auto require = dyn_cast<ValueRequireOp>(operation))
           add(require->getOpOperand(1), true);
         if (auto instance = dyn_cast<InstanceOp>(operation)) {
           auto *callee = analysis.resolveCallee(instance);
           if (!callee)
-            return WalkResult::interrupt();
+            return failure();
           auto ports = getModulePortLayout(callee);
           if (failed(ports))
-            return WalkResult::interrupt();
+            return failure();
           for (int64_t companion : ports->inputValidity)
             if (companion >= 0)
               add(instance->getOpOperand(companion), true);
           for (uint64_t companion : transactionReturnCompanions(callee))
             add(instance->getOpOperand(companion), true);
         }
-        return WalkResult::advance();
-      });
-      if (walked.wasInterrupted())
-        return failure();
+      }
     }
     while (!pending.empty()) {
       Value value = pending.pop_back_val()->get();
@@ -1646,35 +1649,39 @@ public:
         if (!allUsers(module.getBody().front().getArgument(companion)))
           return module.emitOpError()
                  << "transaction return availability has a data use";
-      auto walked = module.walk([&](InstanceOp instance) {
+      const auto *semantic = analysis.lookupDefinitionPlan(module);
+      if (!semantic)
+        return module.emitOpError()
+               << "availability-use proof lacks frozen operation inventory";
+      for (Operation *operation : semantic->operations) {
+        auto instance = dyn_cast<InstanceOp>(operation);
+        if (!instance)
+          continue;
         auto *callee = analysis.resolveCallee(instance);
         if (!callee)
-          return WalkResult::interrupt();
+          return failure();
         auto ports = getModulePortLayout(callee);
         if (failed(ports))
-          return WalkResult::interrupt();
+          return failure();
         for (int64_t companion : ports->outputValidity)
           if (companion >= 0 && !allUsers(instance->getResult(companion))) {
             instance.emitOpError() << "availability companion has a data use";
-            return WalkResult::interrupt();
+            return failure();
           }
         for (auto [payload, companion] : ports->routedOutputValidity)
           if (!allUsers(instance->getResult(companion))) {
             instance.emitOpError()
                 << "routed availability companion has a data use";
-            return WalkResult::interrupt();
+            return failure();
           }
-        return WalkResult::advance();
-      });
-      if (walked.wasInterrupted())
-        return failure();
+      }
     }
     return result;
   }
 };
 bool hasAvailabilityTransport(const HardwareAnalysis &analysis) {
   bool found = false;
-  analysis.getPackage().walk([&](Operation *operation) {
+  for (Operation *operation : analysis.getPackageOperations()) {
     auto sampled =
         operation->getAttrOfType<DictionaryAttr>("ac.sampled_admission");
     found |= isa<ValueRequireOp>(operation) ||
@@ -1684,7 +1691,7 @@ bool hasAvailabilityTransport(const HardwareAnalysis &analysis) {
              operation->hasAttr("ac.routed_output_validity") ||
              operation->hasAttr("ac.transaction_returns") ||
              (sampled && sampled.get("requirements"));
-  });
+  }
   return found;
 }
 } // namespace

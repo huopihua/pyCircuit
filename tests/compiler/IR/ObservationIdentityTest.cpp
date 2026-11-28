@@ -270,6 +270,21 @@ TEST_F(ObservationIdentityTest,
   system(root);
 
   ac::HardwareAnalysis analysis(*package);
+  ASSERT_TRUE(succeeded(analysis.authenticateSemanticPlan()));
+  auto semanticPlans = analysis.getDefinitionPlans();
+  ASSERT_EQ(semanticPlans.size(), 3u);
+  for (auto indexed : llvm::enumerate(semanticPlans)) {
+    size_t index = indexed.index();
+    const auto &semantic = indexed.value();
+    EXPECT_EQ(semantic.id, index);
+    ASSERT_FALSE(semantic.operations.empty());
+    EXPECT_EQ(llvm::count(semantic.operations,
+                          semantic.definition.operator->()),
+              1u);
+    EXPECT_EQ(analysis.lookupDefinitionPlan(semantic.definition), &semantic);
+    for (Operation *operation : semantic.operations)
+      EXPECT_EQ(analysis.lookupOperationPlan(operation), &semantic);
+  }
   acir::compiler::HardwareEmitContext emitter(*package, analysis);
   ASSERT_TRUE(succeeded(emitter.prepareNativeChecks())) << diagnostics;
 
@@ -296,6 +311,17 @@ TEST_F(ObservationIdentityTest,
   EXPECT_EQ(emitter.rootReachableDefinitions().size(), 2u);
   ASSERT_EQ(rootPlan.independentWorkSubtrees.size(), 1u);
   EXPECT_EQ(rootPlan.independentWorkSubtrees.front(), allocation.getOperation());
+  for (const auto &semantic : semanticPlans) {
+    auto id = emitter.definitionId(semantic.definition);
+    ASSERT_TRUE(id.has_value());
+    EXPECT_EQ(emitter.definitionPlan(*id).operations,
+              semantic.operations);
+  }
+
+  b.setInsertionPoint(root.getBody().front().getTerminator());
+  b.insert(allocation->clone());
+  EXPECT_TRUE(failed(capture(
+      [&] { return analysis.authenticateSemanticPlan(); })));
 }
 
 TEST_F(ObservationIdentityTest, ClosedIdentitySchemaAcceptsOnlyFiveFields) {

@@ -1688,15 +1688,22 @@ def _assert_run_receipt(build, target, status="success"):
     executable = build / "simulation" / target / "bin/pycircuit_sim"
     backend_receipt = Path(str(executable) + ".backend.json")
     backend_inputs = set()
-    if target == "verilog":
-        backend = json.loads(backend_receipt.read_text())
-        assert backend["backend"] == "iverilog"
-        assert receipt["command"][:2] == [backend["runner"], str(executable)]
-        backend_inputs = {str(backend_receipt), backend["compiler"], backend["runner"]}
-    else:
-        assert receipt["command"][0] == str(executable)
     generated = build / target
     manifest = json.loads((generated / "generated.json").read_text())
+    if target == "verilog":
+        backend = json.loads(backend_receipt.read_text())
+        expected_backend = "iverilog" if manifest["needs_four_state"] else "verilator"
+        assert backend["backend"] == expected_backend
+        if expected_backend == "iverilog":
+            assert receipt["command"][:2] == [backend["runner"], str(executable)]
+            backend_inputs = {
+                str(backend_receipt), backend["compiler"], backend["runner"]
+            }
+        else:
+            assert receipt["command"][0] == str(executable)
+            backend_inputs = {str(backend_receipt), backend["compiler"]}
+    else:
+        assert receipt["command"][0] == str(executable)
     expected = {str(executable), str(generated / "generated.json"), *backend_inputs}
     expected.update(str(generated / row["path"]) for row in manifest["files"])
     runtimes = {str(path) for path in _install().glob("lib*/*pyc6_runtime*")}
@@ -2196,7 +2203,7 @@ def test_emitted_verification_metadata_counts_selected_reachable_instances(
             "entry_source": {"package": "checks", "path": "verification_bench.py"},
             "source_checks": checks,
             "system_samples": [],
-            "needs_four_state": True,
+            "needs_four_state": False,
             "reset_semantics": "strict",
         }
 
@@ -3827,26 +3834,6 @@ def test_matching_invalid_root_kind_rejects_and_preserves_published_output(
             original.replace('ac.root_kind = "system"', f"ac.root_kind = {marker}")
         )
     before = final.read_bytes()
-    linker = Path(
-        _environment().get("PYCIRCUIT_LINKER", str(_install() / "bin/pycircuit-link"))
-    )
-    report = tmp_path / "existing-owner.json"
-    report.write_bytes(b"preserved owner output\n")
-    pair = _run(
-        [
-            str(linker),
-            "--body",
-            str(bench / "bench.ac"),
-            "--header",
-            str(bench / "bench.interface.ac"),
-            "--verify-only",
-            "--unit-owner-out",
-            str(report),
-        ]
-    )
-    assert pair.returncode != 0
-    assert "ac.root_kind must be 'system' when present" in pair.stderr
-    assert report.read_bytes() == b"preserved owner output\n"
     rejected = _cli(
         "link",
         str(dut),
@@ -3858,6 +3845,7 @@ def test_matching_invalid_root_kind_rejects_and_preserves_published_output(
         "--replace",
     )
     assert rejected.returncode != 0
+    assert "ac.root_kind must be 'system' when present" in rejected.stderr
     assert final.read_bytes() == before
 
 

@@ -47,9 +47,11 @@ LogicalResult verifyModuleSignature(Operation *op) {
   if (!sig || !inputs || !outputs || inputs.size() != sig.getNumInputs() ||
       outputs.size() != sig.getNumResults())
     return error() << "port name counts must match function signature";
-  auto rootKind = op->getAttrOfType<StringAttr>("ac.root_kind");
-  if (rootKind && rootKind.getValue() != "system")
-    return error() << "ac.root_kind must be 'system' when present";
+  if (Attribute rawRootKind = op->getAttr("ac.root_kind")) {
+    auto rootKind = dyn_cast<StringAttr>(rawRootKind);
+    if (!rootKind || rootKind.getValue() != "system")
+      return error() << "ac.root_kind must be 'system' when present";
+  }
   if (failed(getSystemSamples(op)))
     return failure();
   llvm::StringSet<> names;

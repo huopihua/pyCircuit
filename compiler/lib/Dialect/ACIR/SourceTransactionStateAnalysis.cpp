@@ -509,7 +509,8 @@ LogicalResult buildDefinitionPlans(
     mlir::ModuleOp package, StateAnalysisBudget &budget,
     SmallVectorImpl<TransactionDefinitionPlan> &plans,
     llvm::DenseMap<Operation *, TransactionDefinitionPlanId> &index,
-    llvm::DenseMap<Operation *, TransactionDefinitionPlanId> &operationIndex,
+    llvm::DenseMap<Operation *, TransactionDefinitionOperationRef>
+        &operationIndex,
     uint64_t &summaryBuilds, uint64_t &summaryOperationVisits) {
   auto append = [&](Operation *callable) -> LogicalResult {
     if (!budget.chargeStorage<TransactionDefinitionPlan>(callable, 1) ||
@@ -519,6 +520,7 @@ LogicalResult buildDefinitionPlans(
     TransactionDefinitionPlan plan;
     plan.callable = callable;
     plan.lexicalModule = callable->getParentOfType<ModuleOp>();
+    DenseMap<Operation *, TransactionDefinitionOperationId> operationIds;
     struct Visit {
       Operation *operation;
       unsigned depth;
@@ -536,18 +538,25 @@ LogicalResult buildDefinitionPlans(
                << "transaction definition plan depth budget exceeded";
       if (!budget.charge(operation) ||
           !budget.chargeStorage<Operation *>(operation, 1) ||
-          !budget.reserve(operation, plan.operations, 1))
+          !budget.reserve(operation, plan.operations, 1) ||
+          !budget.reserveTemporaryMapInsert(operation, operationIds))
         return failure();
+      if (plan.operations.size() >
+          std::numeric_limits<TransactionDefinitionOperationId>::max())
+        return boundedError(operation)
+               << "transaction definition operation inventory is too large";
+      TransactionDefinitionOperationId operationId = plan.operations.size();
       plan.operations.push_back(operation);
-      plan.readCount += isa<SourceStateReadOp>(operation);
-      plan.writeCount += isa<SourceStateWriteOp>(operation);
-      plan.formalWriteCount += isa<SourceFormalWriteOp>(operation);
-      plan.callCount += isa<SourceMethodCallOp>(operation);
-      plan.bodyCheckCount += isa<SourceExpectOp>(operation);
-      plan.observationCount += isa<SourceObserveOp>(operation);
+      operationIds.try_emplace(operation, operationId);
+      plan.semanticFacts.readCount += isa<SourceStateReadOp>(operation);
+      plan.semanticFacts.writeCount += isa<SourceStateWriteOp>(operation);
+      plan.semanticFacts.formalWriteCount += isa<SourceFormalWriteOp>(operation);
+      plan.semanticFacts.callCount += isa<SourceMethodCallOp>(operation);
+      plan.semanticFacts.bodyCheckCount += isa<SourceExpectOp>(operation);
+      plan.semanticFacts.observationCount += isa<SourceObserveOp>(operation);
       if (auto branch = dyn_cast<SourceBranchOp>(operation)) {
-        ++plan.branchCount;
-        plan.branchResultCount += branch.getNumResults();
+        ++plan.semanticFacts.branchCount;
+        plan.semanticFacts.branchResultCount += branch.getNumResults();
       }
       bool effectful =
           isa<SourceMethodCallOp, SourceExpectOp, SourceObserveOp,
@@ -555,10 +564,45 @@ LogicalResult buildDefinitionPlans(
               operation) ||
           operation->hasAttr("ac.loop_continuation");
       if (auto branch = dyn_cast<SourceBranchOp>(operation)) {
-        if (!budget.reserveMapInsert(operation, plan.branchSelections))
+        if (!budget.reserveMapInsert(
+                operation, plan.semanticFacts.branchSelections))
           return failure();
-        plan.branchSelections.try_emplace(branch, effectful);
+        plan.semanticFacts.branchSelections.try_emplace(operationId,
+                                                        effectful);
       }
+      if (effectful) {
+        Operation *ancestor = operation;
+        while ((ancestor = ancestor->getParentOp()) && ancestor != callable) {
+          if (!budget.charge(operation))
+            return failure();
+          if (auto branch = dyn_cast<SourceBranchOp>(ancestor)) {
+            auto branchId = operationIds.find(branch);
+            if (branchId == operationIds.end())
+              return failure();
+            auto found =
+                plan.semanticFacts.branchSelections.find(branchId->second);
+            if (found == plan.semanticFacts.branchSelections.end()) {
+              if (!budget.reserveMapInsert(
+                      operation, plan.semanticFacts.branchSelections))
+                return failure();
+              plan.semanticFacts.branchSelections.try_emplace(branchId->second,
+                                                               true);
+            } else {
+              found->second = true;
+            }
+          }
+        }
+      }
+      for (Region &region : llvm::reverse(operation->getRegions()))
+        for (Block &block : llvm::reverse(region))
+          for (Operation &child : llvm::reverse(block)) {
+            if (!budget.chargeStorage<Visit>(operation, 1) ||
+                !budget.reserve(operation, pending, 1))
+              return failure();
+            pending.push_back({&child, depth + 1});
+          }
+    }
+    for (Operation *operation : plan.operations) {
       bool isCallable = operation == plan.callable;
       for (auto [regionOrdinal, region] :
            llvm::enumerate(operation->getRegions()))
@@ -575,10 +619,13 @@ LogicalResult buildDefinitionPlans(
           TransactionDefinitionBlockPlan blockPlan;
           blockPlan.block = &block;
           for (Operation &statement : block.without_terminator()) {
-            if (!budget.chargeStorage<Operation *>(operation, 1) ||
+            auto statementId = operationIds.find(&statement);
+            if (statementId == operationIds.end() ||
+                !budget.chargeStorage<TransactionDefinitionOperationId>(
+                    operation, 1) ||
                 !budget.reserve(operation, blockPlan.statements, 1))
               return failure();
-            blockPlan.statements.push_back(&statement);
+            blockPlan.statements.push_back(statementId->second);
           }
           TransactionDefinitionBlockPlanId blockId = plan.blocks.size();
           plan.blocks.push_back(std::move(blockPlan));
@@ -586,34 +633,9 @@ LogicalResult buildDefinitionPlans(
             return operation->emitOpError()
                    << "transaction definition block inventory is duplicated";
         }
-      if (effectful) {
-        Operation *ancestor = operation;
-        while ((ancestor = ancestor->getParentOp()) && ancestor != callable) {
-          if (!budget.charge(operation))
-            return failure();
-          if (auto branch = dyn_cast<SourceBranchOp>(ancestor)) {
-            auto found = plan.branchSelections.find(branch);
-            if (found == plan.branchSelections.end()) {
-              if (!budget.reserveMapInsert(operation, plan.branchSelections))
-                return failure();
-              plan.branchSelections.try_emplace(branch, true);
-            } else {
-              found->second = true;
-            }
-          }
-        }
-      }
-      for (Region &region : llvm::reverse(operation->getRegions()))
-        for (Block &block : llvm::reverse(region))
-          for (Operation &child : llvm::reverse(block)) {
-            if (!budget.chargeStorage<Visit>(operation, 1) ||
-                !budget.reserve(operation, pending, 1))
-              return failure();
-            pending.push_back({&child, depth + 1});
-          }
     }
-    for (const auto &selection : plan.branchSelections)
-      plan.selectionCount += selection.second;
+    for (const auto &selection : plan.semanticFacts.branchSelections)
+      plan.semanticFacts.selectionCount += selection.second;
     TransactionDefinitionPlanId id = plans.size();
     for (Operation *operation : plan.operations) {
       // Static definition identity is queried only for semantic records and
@@ -628,7 +650,13 @@ LogicalResult buildDefinitionPlans(
         continue;
       if (!budget.reserveMapInsert(operation, operationIndex))
         return failure();
-      if (!operationIndex.try_emplace(operation, id).second)
+      auto operationId = operationIds.find(operation);
+      if (operationId == operationIds.end() ||
+          !operationIndex
+               .try_emplace(operation,
+                            TransactionDefinitionOperationRef{
+                                id, operationId->second})
+               .second)
         return operation->emitOpError()
                << "transaction operation belongs to multiple definition plans";
     }
@@ -649,7 +677,7 @@ LogicalResult authenticateFrozenDefinitionPlans(
     mlir::ModuleOp package, StateAnalysisBudget &budget,
     ArrayRef<TransactionDefinitionPlan> frozenPlans,
     DenseMap<Operation *, TransactionDefinitionPlanId> &definitionIndex,
-    DenseMap<Operation *, TransactionDefinitionPlanId> &operationIndex,
+    DenseMap<Operation *, TransactionDefinitionOperationRef> &operationIndex,
     uint64_t &summaryOperationVisits) {
   uint64_t callableOrdinal = 0;
   for (auto module : package.getOps<ModuleOp>())
@@ -680,6 +708,7 @@ LogicalResult authenticateFrozenDefinitionPlans(
     };
     SmallVector<Visit, 0> pending;
     DenseSet<Operation *> effectfulBranches;
+    DenseMap<Operation *, TransactionDefinitionOperationId> operationIds;
     if (!budget.chargeTemporaryStorage<Visit>(callable, 1) ||
         !budget.reserveTemporary(callable, pending, 1))
       return failure();
@@ -696,6 +725,13 @@ LogicalResult authenticateFrozenDefinitionPlans(
           frozen.operations[operationOrdinal++] != operation)
         return boundedError(operation)
                << "transaction source definition plan differs";
+      if (!budget.reserveTemporaryMapInsert(operation, operationIds) ||
+          !operationIds
+               .try_emplace(operation, TransactionDefinitionOperationId(
+                                           operationOrdinal - 1))
+               .second)
+        return boundedError(operation)
+               << "transaction source definition identity differs";
       readCount += isa<SourceStateReadOp>(operation);
       writeCount += isa<SourceStateWriteOp>(operation);
       formalWriteCount += isa<SourceFormalWriteOp>(operation);
@@ -705,7 +741,8 @@ LogicalResult authenticateFrozenDefinitionPlans(
       if (auto branch = dyn_cast<SourceBranchOp>(operation)) {
         ++branchCount;
         branchResultCount += branch.getNumResults();
-        if (!frozen.needsSelection(branch))
+        if (!frozen.needsSelection(
+                TransactionDefinitionOperationId(operationOrdinal - 1)))
           return boundedError(operation)
                  << "transaction source branch inventory differs";
       }
@@ -714,13 +751,24 @@ LogicalResult authenticateFrozenDefinitionPlans(
               SourceQueuePopOp, SourceQueuePeekOp, SourceQueuePushOp>(
               operation) ||
           operation->hasAttr("ac.loop_continuation");
+      if (effectful)
+        if (auto branch = dyn_cast<SourceBranchOp>(operation)) {
+          if (!budget.reserveTemporaryMapInsert(operation,
+                                                effectfulBranches))
+            return failure();
+          effectfulBranches.insert(branch);
+        }
       if (effectful) {
         Operation *ancestor = operation;
         while ((ancestor = ancestor->getParentOp()) && ancestor != callable) {
           if (!budget.charge(operation))
             return failure();
           if (auto branch = dyn_cast<SourceBranchOp>(ancestor)) {
-            auto expected = frozen.needsSelection(branch);
+            auto branchOperation = operationIds.find(branch);
+            if (branchOperation == operationIds.end())
+              return boundedError(operation)
+                     << "transaction source branch-effect plan differs";
+            auto expected = frozen.needsSelection(branchOperation->second);
             if (!expected || !*expected)
               return boundedError(operation)
                      << "transaction source branch-effect plan differs";
@@ -752,7 +800,7 @@ LogicalResult authenticateFrozenDefinitionPlans(
                    << "transaction source definition schedule differs";
           for (auto [statement, frozenStatement] :
                llvm::zip_equal(block.without_terminator(), expected.statements))
-            if (&statement != frozenStatement)
+            if (frozen.operation(frozenStatement) != &statement)
               return boundedError(operation)
                      << "transaction source definition schedule differs";
         }
@@ -766,22 +814,25 @@ LogicalResult authenticateFrozenDefinitionPlans(
           }
     }
     if (operationOrdinal != frozen.operations.size() ||
-        blockOrdinal != frozen.blocks.size() || readCount != frozen.readCount ||
-        writeCount != frozen.writeCount ||
-        formalWriteCount != frozen.formalWriteCount ||
-        callCount != frozen.callCount ||
-        bodyCheckCount != frozen.bodyCheckCount ||
-        observationCount != frozen.observationCount ||
-        branchCount != frozen.branchCount ||
-        branchResultCount != frozen.branchResultCount ||
-        effectfulBranches.size() != frozen.selectionCount)
+        blockOrdinal != frozen.blocks.size() ||
+        readCount != frozen.semanticFacts.readCount ||
+        writeCount != frozen.semanticFacts.writeCount ||
+        formalWriteCount != frozen.semanticFacts.formalWriteCount ||
+        callCount != frozen.semanticFacts.callCount ||
+        bodyCheckCount != frozen.semanticFacts.bodyCheckCount ||
+        observationCount != frozen.semanticFacts.observationCount ||
+        branchCount != frozen.semanticFacts.branchCount ||
+        branchResultCount != frozen.semanticFacts.branchResultCount ||
+        effectfulBranches.size() != frozen.semanticFacts.selectionCount)
       return boundedError(callable)
              << "transaction source definition plan differs";
-    for (const auto &entry : frozen.branchSelections)
-      if (entry.second != effectfulBranches.contains(entry.first))
+    for (const auto &entry : frozen.semanticFacts.branchSelections)
+      if (!frozen.operation(entry.first) ||
+          entry.second !=
+              effectfulBranches.contains(frozen.operation(entry.first)))
         return boundedError(callable)
                << "transaction source branch-effect plan differs";
-    for (Operation *operation : frozen.operations) {
+    for (auto [operationId, operation] : llvm::enumerate(frozen.operations)) {
       if (!isa<SourceTransactionOp, SourceMethodOp, SourceBranchOp,
                SourceMethodCallOp, SourceStateReadOp, SourceStateWriteOp,
                SourceFormalWriteOp, SourceExpectOp, SourceObserveOp,
@@ -790,7 +841,12 @@ LogicalResult authenticateFrozenDefinitionPlans(
           !operation->hasAttr("ac.loop_continuation"))
         continue;
       if (!budget.reserveTemporaryMapInsert(operation, operationIndex) ||
-          !operationIndex.try_emplace(operation, id).second)
+          !operationIndex
+               .try_emplace(operation,
+                            TransactionDefinitionOperationRef{
+                                TransactionDefinitionPlanId(id),
+                                TransactionDefinitionOperationId(operationId)})
+               .second)
         return boundedError(operation)
                << "transaction operation belongs to multiple definition "
                   "plans";
@@ -800,7 +856,8 @@ LogicalResult authenticateFrozenDefinitionPlans(
 }
 
 LogicalResult preflight(mlir::ModuleOp package, StateAnalysisBudget &budget,
-                        PackageInventory &inventory) {
+                        PackageInventory &inventory,
+                        AttributeTypePreflight &subelements) {
   // Bound nesting and growth before invoking native recursive verifiers.
   struct Pending {
     Operation *operation;
@@ -808,7 +865,6 @@ LogicalResult preflight(mlir::ModuleOp package, StateAnalysisBudget &budget,
     unsigned depth;
   };
   SmallVector<Pending> pending;
-  AttributeTypePreflight subelements(budget, package.getContext());
   Operation *scopeOwner = nullptr;
   llvm::DenseMap<Type, bool> scopedTypes;
   uint64_t nativeTypeCapacity = 0;
@@ -1035,7 +1091,7 @@ struct TransactionStructuralFacts {
   ArrayRef<TransactionDefinitionPlan> definitions;
   const llvm::DenseMap<Operation *, TransactionDefinitionPlanId>
       *definitionIndex = nullptr;
-  const llvm::DenseMap<Operation *, TransactionDefinitionPlanId>
+  const llvm::DenseMap<Operation *, TransactionDefinitionOperationRef>
       *definitionOperationIndex = nullptr;
 };
 
@@ -1044,15 +1100,14 @@ public:
   TransactionPlanBuilder(mlir::ModuleOp package, StateAnalysisBudget &budget,
                          const PackageInventory &inventory,
                          SourceReceiverProofContext &receiverProof,
-                         TransactionStructuralFacts &facts)
+                         TransactionStructuralFacts &facts,
+                         HardwareAnalysis &hardware)
       : closedLayoutMemo(facts.layouts), closedBranchTypes(facts.branches),
         definitionPlans(facts.definitions),
         definitionIndex(*facts.definitionIndex),
         definitionOperationIndex(*facts.definitionOperationIndex),
-        package(package),
-        hardware(package), budget(budget), inventory(inventory),
-        receiverProof(receiverProof),
-        subelements(budget, package.getContext()) {}
+        package(package), hardware(hardware), budget(budget), inventory(inventory),
+        receiverProof(receiverProof) {}
 
   // Verify declaration calls under an existing occurrence without creating an
   // invocation, effects or registration. Unselected noncontextual declarations
@@ -1339,8 +1394,6 @@ private:
   FailureOr<bool> sourcePathDominates(TransactionSourcePath definition,
                                       TransactionSourcePath use,
                                       Operation *site) {
-    if (!budget.charge(site, 2))
-      return failure();
     if ((!definition.branch && definition.whenTrue) ||
         (!use.branch && use.whenTrue) ||
         (definition.branch && *definition.branch >= plan.branches.size()) ||
@@ -1509,7 +1562,7 @@ private:
   ArrayRef<TransactionDefinitionPlan> definitionPlans;
   const llvm::DenseMap<Operation *, TransactionDefinitionPlanId>
       &definitionIndex;
-  const llvm::DenseMap<Operation *, TransactionDefinitionPlanId>
+  const llvm::DenseMap<Operation *, TransactionDefinitionOperationRef>
       &definitionOperationIndex;
   FailureOr<bool> closedLayout(Type type, Operation *site, unsigned depth = 0) {
     if (!budget.charge(site) || depth > maxDepth)
@@ -1887,7 +1940,7 @@ private:
       auto found = definitionOperationIndex.find(operation);
       if (found == definitionOperationIndex.end())
         return failure();
-      definition = found->second;
+      definition = found->second.definition;
     }
     return definition;
   }
@@ -2119,9 +2172,6 @@ private:
     auto path = useValue(operation.getPath(), anchor, frame, operation);
     if (failed(condition) || failed(path) || failed(truePath(*path, operation)))
       return failure();
-    if (!subelements.check(operation, operation.getCondition().getType()) ||
-        !subelements.check(operation, operation.getPath().getType()))
-      return failure();
     auto occurrence = operation->getAttrOfType<DictionaryAttr>("occurrence");
     if (!budget.charge(operation, 8))
       return failure();
@@ -2141,8 +2191,6 @@ private:
     auto path = useValue(operation.getPath(), anchor, frame, operation);
     if (failed(path) || failed(truePath(*path, operation)))
       return failure();
-    if (!subelements.check(operation, operation.getPath().getType()))
-      return failure();
     SmallVector<BoundValueId, 0> values;
     if (!budget.charge(operation, 8) ||
         !budget.chargeStorage<BoundValueId>(operation,
@@ -2151,7 +2199,7 @@ private:
       return failure();
     for (Value original : operation.getValues()) {
       auto bound = useValue(original, anchor, frame, operation);
-      if (failed(bound) || !subelements.check(operation, original.getType()))
+      if (failed(bound))
         return failure();
       values.push_back(*bound);
     }
@@ -2540,8 +2588,6 @@ private:
     pending.push_back(operation);
     while (!pending.empty()) {
       Operation *op = pending.pop_back_val();
-      if (!budget.charge(op, 1 + op->getNumOperands() + op->getNumResults()))
-        return failure();
       if (!isa<YieldOp>(op) && !detail::isCombinationalHardwareOperation(op))
         return op->emitOpError()
                << "transaction state plan cannot omit an unrepresented "
@@ -2619,11 +2665,11 @@ private:
     // frame, so consume the frozen operation index instead of parent chasing.
     auto indexed = definitionOperationIndex.find(branch);
     if (indexed == definitionOperationIndex.end() ||
-        indexed->second >= definitionPlans.size())
+        indexed->second.definition >= definitionPlans.size())
       return branch.emitOpError()
              << "branch references an invalid transaction definition plan";
-    const auto &definition = definitionPlans[indexed->second];
-    auto effectful = definition.needsSelection(branch);
+    const auto &definition = definitionPlans[indexed->second.definition];
+    auto effectful = definition.needsSelection(indexed->second.operation);
     if (!effectful)
       return branch.emitOpError()
              << "branch is absent from its frozen transaction definition plan";
@@ -2670,10 +2716,11 @@ private:
     branchRecord.operation = operation;
     auto definition = definitionOperationIndex.find(operation);
     if (definition == definitionOperationIndex.end() ||
-        definition->second >= definitionPlans.size())
+        definition->second.definition >= definitionPlans.size())
       return operation.emitOpError()
              << "branch has no frozen transaction definition plan";
-    branchRecord.definitionPlan = definition->second;
+    branchRecord.definitionPlan = definition->second.definition;
+    branchRecord.definitionOperation = definition->second.operation;
     branchRecord.frame = frame;
     branchRecord.condition = *condition;
     branchRecord.entry = entryPoint;
@@ -2938,30 +2985,30 @@ private:
     if (!budget.charge(function) || failed(sameDomain(domain, function)))
       return failure();
     const auto &definition = definitionPlans[plan.frames[frame].definitionPlan];
+    const auto &facts = definition.semanticFacts;
     if (failed(verifyDefinitionIdentity(frame, function)))
       return failure();
     // Every source arm is expanded, so these are exact per-invocation lower
     // bounds. Reserve them as one page before appending records; dynamic joins,
     // owner discovery and Method-vs-native call deltas still grow separately.
     uint64_t baseEvents =
-        2 + definition.readCount + definition.writeCount +
-        definition.formalWriteCount + definition.callCount +
-        definition.bodyCheckCount + definition.observationCount +
-        6 * definition.branchCount + 2 * definition.selectionCount +
-        definition.branchResultCount;
-    if (!budget.reserve(function, plan.reads, definition.readCount) ||
-        !budget.reserve(function, plan.writes, definition.writeCount) ||
+        2 + facts.readCount + facts.writeCount + facts.formalWriteCount +
+        facts.callCount + facts.bodyCheckCount + facts.observationCount +
+        6 * facts.branchCount + 2 * facts.selectionCount +
+        facts.branchResultCount;
+    if (!budget.reserve(function, plan.reads, facts.readCount) ||
+        !budget.reserve(function, plan.writes, facts.writeCount) ||
         !budget.reserve(function, plan.formalWrites,
-                        definition.formalWriteCount) ||
-        !budget.reserve(function, plan.bodyChecks, definition.bodyCheckCount) ||
+                        facts.formalWriteCount) ||
+        !budget.reserve(function, plan.bodyChecks, facts.bodyCheckCount) ||
         !budget.reserve(function, plan.observations,
-                        definition.observationCount) ||
-        !budget.reserve(function, plan.branches, definition.branchCount) ||
+                        facts.observationCount) ||
+        !budget.reserve(function, plan.branches, facts.branchCount) ||
         !budget.reserve(function, plan.branchResults,
-                        definition.branchResultCount) ||
-        !budget.reserve(function, plan.selections, definition.selectionCount) ||
+                        facts.branchResultCount) ||
+        !budget.reserve(function, plan.selections, facts.selectionCount) ||
         !budget.reserve(function, plan.controls,
-                        1 + definition.selectionCount) ||
+                        1 + facts.selectionCount) ||
         !budget.reserve(function, plan.events, baseEvents))
       return failure();
     SmallVector<StateVersionId> saved;
@@ -3110,7 +3157,8 @@ private:
         return invalid();
       auto branchDefinition = definitionOperationIndex.find(branch.operation);
       if (branchDefinition == definitionOperationIndex.end() ||
-          branchDefinition->second != branch.definitionPlan)
+          branchDefinition->second.definition != branch.definitionPlan ||
+          branchDefinition->second.operation != branch.definitionOperation)
         return invalid();
       if (branch.selection) {
         if (*branch.selection >= plan.selections.size())
@@ -3238,7 +3286,8 @@ private:
         return invalid();
       auto callDefinition = definitionOperationIndex.find(call.operation);
       if (callDefinition == definitionOperationIndex.end() ||
-          callDefinition->second != plan.frames[call.caller].definitionPlan)
+          callDefinition->second.definition !=
+              plan.frames[call.caller].definitionPlan)
         return invalid();
       const auto &frame = plan.frames[call.callee];
       if (frame.parent != call.caller || frame.call != call.operation)
@@ -3579,11 +3628,10 @@ private:
   }
 
   mlir::ModuleOp package;
-  HardwareAnalysis hardware;
+  HardwareAnalysis &hardware;
   StateAnalysisBudget &budget;
   const PackageInventory &inventory;
   SourceReceiverProofContext &receiverProof;
-  AttributeTypePreflight subelements;
   TransactionStatePlan plan;
   llvm::DenseMap<ValueKey, BoundValueId> values;
   SmallVector<uint8_t, 0> validityAssigned;
@@ -4143,7 +4191,8 @@ namespace {
 void runTransactionStateAnalysis(
     Operation *op, SmallVector<TransactionDefinitionPlan, 0> &definitionPlans,
     DenseMap<Operation *, TransactionDefinitionPlanId> &definitionIndex,
-    DenseMap<Operation *, TransactionDefinitionPlanId> &definitionOperationIndex,
+    DenseMap<Operation *, TransactionDefinitionOperationRef>
+        &definitionOperationIndex,
     DenseMap<Operation *, TransactionModuleStateIndex> &moduleStates,
     SmallVector<TransactionStatePlan, 0> &plans, uint64_t &analysisWork,
     uint64_t &definitionSummaryBuilds,
@@ -4161,8 +4210,9 @@ void runTransactionStateAnalysis(
   }
   StateAnalysisBudget budget;
   PackageInventory inventory;
+  AttributeTypePreflight subelements(budget, package.getContext());
   ++irWalks;
-  if (failed(preflight(package, budget, inventory)))
+  if (failed(preflight(package, budget, inventory, subelements)))
     return;
   if (failed(mlir::verify(package)))
     return;
@@ -4356,7 +4406,7 @@ void runTransactionStateAnalysis(
         if (depth > maxDepth || !budget.charge(module))
           return failure();
         TransactionPlanBuilder builder(package, budget, inventory,
-                                       receiverProof, structuralFacts);
+                                       receiverProof, structuralFacts, hardware);
         if (failed(builder.verifyReceivers(module, root, path)))
           return failure();
         visitedNodes += inventory.moduleMethodCalls.lookup(module).size();
@@ -4388,7 +4438,7 @@ void runTransactionStateAnalysis(
         if (selected.contains(module))
           continue;
         TransactionPlanBuilder builder(package, budget, inventory,
-                                       receiverProof, structuralFacts);
+                                       receiverProof, structuralFacts, hardware);
         if (failed(builder.verifyReceivers(module, module, {})))
           return;
         visitedNodes += inventory.moduleMethodCalls.lookup(module).size();
@@ -4456,7 +4506,7 @@ void runTransactionStateAnalysis(
         !budget.reserve(transaction, completed, 1))
       return failure();
     TransactionPlanBuilder builder(package, budget, inventory, receiverProof,
-                                   structuralFacts);
+                                   structuralFacts, hardware);
     auto plan = builder.run(transaction, root, path);
     if (failed(plan))
       return failure();
@@ -4673,7 +4723,7 @@ void runTransactionStateAnalysis(
     if (prefix) {
       StateAnalysisBudget::LocalScope transactionBudget(budget);
       TransactionPlanBuilder builder(package, budget, inventory, receiverProof,
-                                     structuralFacts);
+                                     structuralFacts, hardware);
       auto fresh =
           builder.run(plan.transaction, root,
                       ArrayRef<InstanceOp>(registration).drop_front(prefix));
@@ -4728,13 +4778,13 @@ SourceTransactionStateAnalysis::SourceTransactionStateAnalysis(Operation *op) {
 TransactionDefinitionPlanStatistics TransactionDefinitionPlan::statistics() const {
   TransactionDefinitionPlanStatistics result;
   result.operations = operations.size();
-  result.branches = branchSelections.size();
+  result.branches = semanticFacts.branchSelections.size();
   result.blocks = blocks.size();
   result.entries = saturatedAdd(
       result.operations, saturatedAdd(result.branches, result.blocks));
   result.bytes = saturatedAdd(
       operations.capacity() * sizeof(Operation *),
-      saturatedAdd(branchSelections.getMemorySize(),
+      saturatedAdd(semanticFacts.branchSelections.getMemorySize(),
                    saturatedAdd(blocks.capacity() *
                                     sizeof(TransactionDefinitionBlockPlan),
                                 blockIndex.getMemorySize())));
@@ -4742,7 +4792,8 @@ TransactionDefinitionPlanStatistics TransactionDefinitionPlan::statistics() cons
     result.statements = saturatedAdd(result.statements, block.statements.size());
     result.entries = saturatedAdd(result.entries, block.statements.size());
     result.bytes = saturatedAdd(
-        result.bytes, block.statements.capacity() * sizeof(Operation *));
+        result.bytes,
+        block.statements.capacity() * sizeof(TransactionDefinitionOperationId));
   }
   return result;
 }
@@ -4753,7 +4804,8 @@ FailureOr<uint64_t> SourceTransactionStateAnalysis::verifyOccurrences(
   SmallVector<TransactionStatePlan, 0> unused;
   SmallVector<TransactionDefinitionPlan, 0> definitions;
   DenseMap<Operation *, TransactionDefinitionPlanId> definitionIndex;
-  DenseMap<Operation *, TransactionDefinitionPlanId> definitionOperationIndex;
+  DenseMap<Operation *, TransactionDefinitionOperationRef>
+      definitionOperationIndex;
   DenseMap<Operation *, TransactionModuleStateIndex> moduleStates;
   uint64_t work = 0;
   uint64_t summaryBuilds = 0, summaryOperationVisits = 0;
@@ -4857,9 +4909,9 @@ SourceTransactionStateAnalysis::lookupDefinitionPlanId(
     return std::nullopt;
   auto found = definitionOperationIndex.find(operation);
   if (found == definitionOperationIndex.end() ||
-      found->second >= definitionPlans.size())
+      found->second.definition >= definitionPlans.size())
     return std::nullopt;
-  return found->second;
+  return found->second.definition;
 }
 
 const TransactionModuleStateIndex *
